@@ -102,6 +102,8 @@ Each wallet is analysed across multiple behavioural dimensions.
 * **Snipers**: Detects wallets entering during the first seconds of a launch and tracks how much of their position remains.
 * **Deployer behaviour**: Analyses what the token creator still holds, how much was sold, and how the deployer's position affects overall concentration.
 
+![crawlscan](screen2.jpg)
+
 ### How wallets are linked
 
 Counting wallets individually is not enough.
