@@ -1,53 +1,74 @@
+<div align="center">
+
+<img src="static/favicon.svg" width="96" alt="CRAWLSCAN">
+
 # CRAWLSCAN
 
-Crawlers that catch one wallet wearing many.
+**Crawlers that catch one wallet wearing many.**
 
-CRAWLSCAN is a read-only scanner for Pons V2 memecoins on Robinhood Chain. Paste a token address, and crawlers walk the top holders on-chain and answer one question: is this a crowd, or one person behind many wallets? The verdict comes in about 25 seconds: how many real operators stand behind the top 20 holders, and how much of the float the biggest one controls.
+[Website](https://crawlscan.fun) · [X](https://x.com/0x_Punisher)
 
-> 20 wallets → 4 operators, biggest holds 38% of float.
+[![live](https://img.shields.io/badge/live-crawlscan.fun-00c805?style=flat-square&labelColor=07090b)](https://crawlscan.fun)
+![Robinhood Chain](https://img.shields.io/badge/Robinhood_Chain-4663-9fd9ff?style=flat-square&labelColor=07090b)
+![read-only](https://img.shields.io/badge/read--only-no_keys-00c805?style=flat-square&labelColor=07090b)
+![python](https://img.shields.io/badge/python-3.12-9fd9ff?style=flat-square&labelColor=07090b)
+![runtime deps](https://img.shields.io/badge/runtime_deps-0-00c805?style=flat-square&labelColor=07090b)
+[![license](https://img.shields.io/badge/license-MIT-9fd9ff?style=flat-square&labelColor=07090b)](LICENSE)
 
-## What the crawlers check
+<img src="assets/hero.png" alt="CRAWLSCAN landing" width="100%">
 
-Everything starts from the token's full transfer history since launch. Infrastructure (the bonding curve, pool, locker, routers, burn address) is never counted as a holder, and all shares are measured against the real circulating float, not total supply.
+</div>
 
-For each of the top 20 holders:
+## What it does
 
-- **Entry**: bought on the market or received tokens by transfer. Buys are detected per transaction, so purchases through third-party bot routers still count as buys.
-- **History**: whether the wallet ever traded a token before this one (a virgin wallet), or only a handful.
-- **Timing**: sniper entries in the first seconds after launch.
-- **Size**: how much ETH went into the buy.
+Paste a Pons V2 memecoin address on Robinhood Chain. Six crawlers walk the top 20 holders on-chain and answer one question: is this a crowd, or one person behind many wallets? You get a verdict in seconds:
+
+> **20 wallets → 4 operators, biggest holds 38% of float**
+
+## How the crawlers work
+
+Everything comes from the token's full transfer history since launch. Curve, pool, locker and routers are never counted as holders, and every share is measured against the real circulating float.
+
+**What they check on each wallet**
+
+- **Bought vs received**: did the wallet buy on the market or get tokens by transfer.
+- **Virgin wallets**: never traded a token before this one.
+- **History depth**: how many tokens the wallet traded before entering.
+- **Snipers**: entries in the first seconds after launch.
 - **Deployer**: what the creator still holds and whether they sold.
 
-## How wallets are linked
+**How they link wallets**
 
-Wallets are merged into one operator when they share a hard on-chain tie:
+- **Proven links**: same buy transaction, tokens from the same ordinary wallet, or direct transfers between holders. Linked wallets merge into one operator.
+- **Packs**: fresh wallets buying in the same block with matching sizes. A behavioural link that counts with a lower weight.
+- Exchanges, distributors and contracts never link wallets.
 
-- they got their tokens in the same transaction;
-- they received tokens from the same ordinary wallet;
-- they moved tokens directly between each other.
+## Verdict
 
-A softer, behavioural link catches packs: several fresh wallets buying in the same block with similar sizes. Packs count with a lower weight than proven links.
+A score from **0 to 100** (100 = clean), built from five parts:
 
-Exchanges, distributors and contracts are never used to link wallets: thousands of unrelated users pass through them.
+| | |
+|---|---|
+| Operator | share of float held by the biggest operator |
+| Virgin | share of virgin wallets in the top |
+| Transfer | float received instead of bought |
+| Sniper | float still held by snipers |
+| Concentration | how much the top 20 hold |
 
-## Score
+Hard red flags force `DANGER`; any pack or multi-wallet operator caps the verdict at `RISKY`; too few holders gives `TOO EARLY`.
 
-A score from 0 to 100 (100 = clean), built from five parts:
-
-1. Share of float held by the biggest operator.
-2. Share of virgin wallets in the top holders.
-3. Share of float received by transfer instead of bought.
-4. Float still held by snipers.
-5. Concentration of the top 20.
-
-Hard red flags (one dominant operator, a top made of virgin wallets, a large bundle) force `DANGER`. A pack or a multi-wallet operator caps the verdict at `RISKY`. Tokens with too few holders get `TOO EARLY` instead of a score.
+<div align="center">
+<img src="assets/scan.png" alt="CRAWLSCAN scan result" width="100%">
+</div>
 
 ## Tech
 
-- Python standard library only, no third-party dependencies.
-- Read-only: no keys, no signing, no transactions.
-- On-chain data via an Alchemy RPC endpoint for Robinhood Chain; market data from GeckoTerminal.
-- Single-page frontend served by the same Python process.
+- **Python standard library**: zero runtime dependencies.
+- **Read-only**: no keys, no signing, no transactions.
+- **Alchemy RPC** for Robinhood Chain, GeckoTerminal for market data.
+- **Transaction-level trade classification**: buys through third-party bot routers still count as buys.
+- **Parallel crawl** under a hard time budget: slow wallets never block the verdict.
+- **Live event stream**: the page plays the crawl step by step as it happens.
 
 ## Run locally
 
@@ -56,12 +77,19 @@ echo "CRAWLER_RPC=https://robinhood-mainnet.g.alchemy.com/v2/<your-key>" > .env
 python3 server.py
 ```
 
-Open http://localhost:8000 and paste a token address, or go straight to `http://localhost:8000/?ca=0x...`.
+Open http://localhost:8000, or go straight to `http://localhost:8000/?ca=0x...`.
 
-`PORT` and `CRAWLER_RPS` (requests per second to the RPC) can be set in the environment.
+## Roadmap
 
-Tests: `python3 -m unittest discover -s tests`.
+- [ ] Telegram bot
+- [ ] Operator memory across launches
+- [ ] Launch radar
+- [ ] Wallet profiler
+- [ ] Watchlists & alerts
+- [ ] Multichain
+- [ ] Track record
+- [ ] Browser extension
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+[MIT](LICENSE)
