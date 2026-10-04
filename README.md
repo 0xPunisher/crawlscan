@@ -31,6 +31,8 @@ CRAWLSCAN crawls the token's on-chain history, analyses its top holders, follows
 
 The goal is to make a complex on-chain investigation understandable in seconds without requiring users to manually inspect hundreds of transactions.
 
+![crawlscan](screen1.jpg)
+
 ### The core idea
 
 Paste a Pons V2 memecoin address on Robinhood Chain.
