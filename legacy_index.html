@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rh-crawler</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #070807;
+    --panel: #0d0f0d;
+    --line: #1c221c;
+    --text: #c8d3c8;
+    --dim: #6b786b;
+    --green: #39ff14;
+    --green2: #8be36b;
+    --amber: #ffb000;
+    --red: #ff3b3b;
+    --grey: #4a524a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 var(--mono); }
+  body { min-height: 100vh; display: flex; flex-direction: column; }
+  button, input { font: inherit; }
+
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .logo { color: var(--green); font-weight: 700; letter-spacing: .5px; white-space: nowrap; }
+  .logo::before { content: "> "; color: var(--dim); }
+  .ca { flex: 1 1 340px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .row { display: flex; gap: 8px; }
+  #ca { flex: 1; min-width: 0; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; outline: none; }
+  #ca:focus { border-color: var(--green); }
+  #go { background: transparent; color: var(--green); border: 1px solid var(--green); border-radius: 4px; padding: 8px 16px; cursor: pointer; }
+  #go:hover:not(:disabled) { background: var(--green); color: var(--bg); }
+  #go:disabled { opacity: .45; cursor: default; }
+  #err { color: var(--red); min-height: 1.2em; font-size: 12px; overflow-wrap: anywhere; }
+
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 360px; min-height: 0; }
+  .left { display: flex; flex-direction: column; min-width: 0; }
+  #stage { position: relative; height: calc(100vh - 66px); min-height: 420px; }
+  #web { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #hint { position: absolute; left: 16px; bottom: 12px; color: var(--dim); font-size: 12px; pointer-events: none; }
+  #log { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 10px 12px; height: calc(100vh - 66px); font-size: 12px; }
+  .ln { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .ln .ts { color: var(--dim); }
+  .ln.stage { color: var(--green); }
+  .ln.err { color: var(--red); }
+  .ln.warn { color: var(--amber); }
+  .ln.dim { color: var(--dim); }
+
+  #verdict { display: none; border-top: 1px solid var(--line); padding: 16px; gap: 18px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  #verdict.show { display: grid; }
+  .big { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  #score { font-size: 56px; font-weight: 700; line-height: 1; }
+  #band { font-size: 20px; font-weight: 700; letter-spacing: 1px; }
+  #headline { margin-top: 10px; color: var(--text); }
+  #reason { margin-top: 4px; color: var(--dim); }
+  .hdr { margin-top: 14px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .kv { border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; min-width: 0; }
+  .kv b { display: block; color: var(--dim); font-weight: 400; font-size: 11px; }
+  .kv span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  h3 { margin: 0 0 8px; font-size: 12px; font-weight: 400; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
+  .part { display: grid; grid-template-columns: 150px minmax(0, 1fr) 64px; gap: 8px; align-items: center; margin-bottom: 6px; }
+  .bar { height: 8px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  .bar i { display: block; height: 100%; }
+  .pts { text-align: right; color: var(--dim); }
+  .op { border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; margin-bottom: 6px; }
+  .op .w { color: var(--dim); overflow-wrap: anywhere; font-size: 12px; }
+  #copy { margin-top: 12px; background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 6px 12px; cursor: pointer; }
+  #copy:hover { border-color: var(--green); color: var(--green); }
+
+  @media (max-width: 820px) {
+    main { grid-template-columns: minmax(0, 1fr); }
+    #stage { height: 62vh; min-height: 320px; }
+    #log { border-left: 0; border-top: 1px solid var(--line); height: 220px; order: 3; }
+    .left { order: 1; }
+    #verdict { grid-template-columns: minmax(0, 1fr); }
+    #score { font-size: 44px; }
+    .hdr { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .part { grid-template-columns: 120px minmax(0, 1fr) 56px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">rh-crawler</div>
+  <div class="ca">
+    <div class="row">
+      <input id="ca" placeholder="token CA 0x… (Pons V2, Robinhood Chain)" spellcheck="false" autocomplete="off">
+      <button id="go">crawl</button>
+    </div>
+    <div id="err"></div>
+  </div>
+</header>
+<main>
+  <div class="left">
+    <div id="stage">
+      <canvas id="web"></canvas>
+      <div id="hint">вставь CA и нажми crawl</div>
+    </div>
+    <section id="verdict">
+      <div>
+        <div class="big"><div id="score">—</div><div id="band"></div></div>
+        <div id="headline"></div>
+        <div id="reason"></div>
+        <div class="hdr" id="hdr"></div>
+        <button id="copy">copy link</button>
+      </div>
+      <div>
+        <h3>скор</h3>
+        <div id="parts"></div>
+        <h3 style="margin-top:14px">операторы</h3>
+        <div id="ops"></div>
+      </div>
+    </section>
+  </div>
+  <div id="log"></div>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const C = { green: "#39ff14", green2: "#8be36b", amber: "#ffb000", red: "#ff3b3b", grey: "#4a524a",
+            dim: "#6b786b", text: "#c8d3c8", line: "#1c221c", bg: "#070807" };
+const BAND_COLOR = { CLEAN: C.green, OK: C.green2, RISKY: C.amber, DANGER: C.red, TOO_EARLY_OR_LATE: C.dim };
+const PARTS = [["operator", "крупнейший оператор", 35], ["virgin", "девственные", 25],
+               ["transfer", "получено переводом", 20], ["sniper", "снайперы", 10],
+               ["concentration", "концентрация топ-20", 10]];
+const SPIDERS = 6, MAX_WALLETS = 20;
+const short = (a) => a ? a.slice(0, 6) + "…" + a.slice(-4) : "";
+const ADDR = /^0x[0-9a-fA-F]{40}$/;
+
+// ---------------- состояние скана ----------------
+let S = null;          // текущий скан
+let scanSeq = 0;       // номер скана: старые опросы/плееры выходят сами
+
+function freshState(ca) {
+  return {
+    ca, job: null, received: 0, queue: [], done: false, finished: false, ticker: ca.slice(0, 6) + "…",
+    nodes: new Map(),  // wallet -> node
+    order: [],         // порядок появления кошельков
+    links: [], clusters: [],
+    spiders: Array.from({ length: SPIDERS }, (_, i) => ({
+      x: 0, y: 0, path: [], heading: -Math.PI / 2 + i, phase: i, moving: false, frozen: false, thread: true })),
+  };
+}
+
+// ---------------- лог ----------------
+function log(text, cls = "", tms = null) {
+  const el = document.createElement("div");
+  el.className = "ln " + cls;
+  const t = tms == null ? "" : `[${(tms / 1000).toFixed(2).padStart(6, " ")}s] `;
+  el.innerHTML = `<span class="ts">${t}</span>`;
+  el.appendChild(document.createTextNode(text));
+  const box = $("log");
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  box.appendChild(el);
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+function showErr(msg) { $("err").textContent = msg; log("error: " + msg, "err"); }
+
+// ---------------- запуск ----------------
+async function startScan(ca) {
+  ca = (ca || "").trim();
+  $("err").textContent = "";
+  if (!ADDR.test(ca)) { showErr("not a token address"); return; }
+  ca = ca.toLowerCase();
+  const my = ++scanSeq;
+  S = freshState(ca);
+  $("ca").value = ca;
+  $("verdict").classList.remove("show");
+  $("hint").textContent = "";
+  $("log").innerHTML = "";
+  $("go").disabled = true;
+  history.replaceState(null, "", "?ca=" + ca);
+  log(`crawl ${ca}`, "stage");
+  let r;
+  try {
+    r = await fetch("/api/scan", { method: "POST", headers: { "content-type": "application/json" },
+                                   body: JSON.stringify({ token: ca }) });
+  } catch (e) { showErr("server unreachable"); $("go").disabled = false; return; }
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok || !body.job) { showErr(body.error || `http ${r.status}`); $("go").disabled = false; return; }
+  S.job = body.job;
+  poll(my);
+  play(my);
+}
+
+async function poll(my) {
+  while (my === scanSeq && !S.done) {
+    try {
+      const r = await fetch(`/api/events?job=${S.job}&after=${S.received}`);
+      const d = await r.json();
+      if (!r.ok) { showErr(d.error || `http ${r.status}`); S.done = true; break; }
+      for (const e of d.events) S.queue.push(e);
+      S.received += d.events.length;
+      if (d.done) { S.done = true; break; }
+    } catch (e) { /* сеть моргнула: пробуем дальше */ }
+    await sleep(300);
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DELAY = { stage: 60, spider_move: 150, wallet_flag: 150, link: 220, cluster: 400, done: 0, error: 0 };
+
+async function play(my) {
+  while (my === scanSeq) {
+    const e = S.queue.shift();
+    if (!e) {
+      if (S.done && !S.queue.length) { if (!S.finished) finishWithoutDone(); return; }
+      await sleep(50);
+      continue;
+    }
+    apply(e);
+    if (e.type === "done" || e.type === "error") { S.finished = true; }
+    await sleep(DELAY[e.type] ?? 150);
+  }
+}
+
+function finishWithoutDone() {
+  S.finished = true;
+  $("go").disabled = false;
+}
+
+// ---------------- события ----------------
+function nodeFor(w) {
+  let n = S.nodes.get(w);
+  if (n) return n;
+  const i = S.order.length;
+  const ang = -Math.PI / 2 + i * (2 * Math.PI / MAX_WALLETS);
+  const ring = i % 2 ? 0.80 : 0.94;
+  n = { w, i, ax: Math.cos(ang) * ring, ay: Math.sin(ang) * ring, x: 0, y: 0, born: now(),
+        share: null, color: C.grey, flash: 0, flags: [], kind: null };
+  n.x = n.ax; n.y = n.ay;
+  S.nodes.set(w, n); S.order.push(w);
+  return n;
+}
+
+function walletColor(e) {
+  const f = e.flags || [];
+  if (f.includes("unread")) return C.grey;
+  if (f.includes("virgin") || e.kind === "transfer") return C.red;
+  if (f.includes("short_history") || f.includes("sniper")) return C.amber;
+  return C.green;
+}
+
+function spiderTo(i, target) { S.spiders[((i % SPIDERS) + SPIDERS) % SPIDERS].path.push(target); }
+const hashSpider = (w) => parseInt(w.slice(2, 6), 16) % SPIDERS;
+
+function apply(e) {
+  switch (e.type) {
+    case "stage":
+      log(`stage ${e.detail}`, "stage", e.t);
+      break;
+    case "spider_move": {
+      const n = nodeFor(e.wallet);
+      spiderTo(e.spider, { node: n.w });
+      log(`spider ${e.spider} → ${short(e.wallet)}`, "dim", e.t);
+      break;
+    }
+    case "wallet_flag": {
+      const n = nodeFor(e.wallet);
+      n.share = e.share; n.flags = e.flags || []; n.kind = e.kind;
+      n.color = walletColor(e); n.flash = 1;
+      const cls = n.color === C.red ? "err" : n.color === C.amber ? "warn" : "";
+      log(`${short(e.wallet)} ${(e.share * 100).toFixed(2)}% · ${e.detail}`, cls, e.t);
+      break;
+    }
+    case "link": {
+      nodeFor(e.wallet); nodeFor(e.b);
+      const sp = hashSpider(e.wallet);
+      spiderTo(sp, { node: e.wallet });
+      spiderTo(sp, { node: e.b });
+      S.links.push({ a: e.wallet, b: e.b, level: e.level, born: now() });
+      log(`link ${short(e.wallet)} — ${short(e.b)} ${e.kind} [${e.level}]`, e.level === "proven" ? "err" : "warn", e.t);
+      break;
+    }
+    case "cluster": {
+      const ws = (e.wallets || []).filter((w) => S.nodes.has(w));
+      if (ws.length) {
+        // оператор переезжает плотной группой внутрь кольца, по направлению среднего угла своих кошельков
+        const sx = avg(ws.map((w) => S.nodes.get(w).ax)), sy = avg(ws.map((w) => S.nodes.get(w).ay));
+        const ang = Math.atan2(sy, sx) + S.clusters.length * 0.9;   // разные группы — в разные стороны
+        const gx = Math.cos(ang) * 0.44, gy = Math.sin(ang) * 0.44, gr = Math.min(0.2, 0.07 + ws.length * 0.026);
+        ws.forEach((w, k) => {
+          const n = S.nodes.get(w), a = ang + Math.PI / 2 + k * 2 * Math.PI / ws.length;
+          n.ax = gx + Math.cos(a) * gr; n.ay = gy + Math.sin(a) * gr;
+        });
+        S.clusters.push({ wallets: ws, level: e.level, label: `оператор: ${ws.length} кошельков, ${(e.share * 100).toFixed(1)}% оборота`, born: now() });
+      }
+      log(`cluster ${e.detail} [${e.level}]`, e.level === "proven" ? "err" : "warn", e.t);
+      break;
+    }
+    case "done":
+      S.spiders.forEach((s, i) => { s.path = [{ center: true, slot: i }]; s.frozen = true; });
+      log(`done score=${e.score ?? "—"} ${e.band} · ${e.headline}`, "stage", e.t);
+      log(e.detail, "", null);
+      loadResult();
+      break;
+    case "error":
+      showErr(e.detail);
+      $("go").disabled = false;
+      break;
+  }
+}
+const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+
+// ---------------- вердикт ----------------
+async function loadResult() {
+  const my = scanSeq;
+  let d = null;
+  for (let k = 0; k < 20 && my === scanSeq; k++) {
+    try {
+      const r = await fetch(`/api/result?job=${S.job}`);
+      d = await r.json();
+      if (d.done) break;
+    } catch (e) {}
+    await sleep(300);
+  }
+  $("go").disabled = false;
+  if (my !== scanSeq || !d) return;
+  if (d.error) { showErr(d.error); return; }
+  renderVerdict(d.result);
+}
+
+const money = (v) => v == null ? "—" : "$" + (v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "k" : v.toFixed(0));
+const age = (h) => h == null ? "—" : h < 48 ? h.toFixed(1) + " ч" : (h / 24).toFixed(1) + " дн";
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function renderVerdict(r) {
+  const h = r.header || {};
+  if (h.ticker) S.ticker = h.ticker;
+  const col = BAND_COLOR[r.band] || C.text;
+  $("score").textContent = r.score ?? "—";
+  $("score").style.color = col;
+  $("band").textContent = r.band === "TOO_EARLY_OR_LATE" ? "TOO EARLY / LATE" : r.band;
+  $("band").style.color = col;
+  $("headline").textContent = r.headline;
+  $("reason").textContent = r.reason;
+  $("hdr").innerHTML = [["имя", h.name], ["тикер", h.ticker], ["mcap", money(h.mcap_usd)],
+                        ["liquidity", money(h.liquidity_usd)], ["vol 24h", money(h.vol24h_usd)], ["возраст", age(h.age_h)]]
+    .map(([k, v]) => `<div class="kv"><b>${k}</b><span>${esc(v ?? "—")}</span></div>`).join("");
+  $("parts").innerHTML = r.parts && Object.keys(r.parts).length
+    ? PARTS.map(([k, name, w]) => {
+        const v = r.parts[k] ?? 0, f = v / w;
+        const c = f >= 0.75 ? C.green : f >= 0.4 ? C.amber : C.red;
+        return `<div class="part"><span>${name}</span><div class="bar"><i style="width:${(f * 100).toFixed(0)}%;background:${c}"></i></div><span class="pts">${v}/${w}</span></div>`;
+      }).join("")
+    : `<div class="op w">скор не считается: меньше 10 холдеров</div>`;
+  const ops = (r.operators || []).filter((o) => o.wallets.length > 1);
+  $("ops").innerHTML = ops.length
+    ? ops.map((o) => `<div class="op"><span style="color:${o.level === "proven" ? C.red : C.amber}">${o.level === "proven" ? "доказанный" : "стая"}</span> · ${o.wallets.length} кошельков · ${(o.share * 100).toFixed(1)}% оборота (${(o.share_supply * 100).toFixed(1)}% сапплая)<div class="w">${o.wallets.map(short).join(", ")}</div></div>`).join("")
+    : `<div class="op w">групп не найдено</div>`;
+  $("verdict").classList.add("show");
+  $("verdict").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+$("copy").addEventListener("click", async () => {
+  const url = location.href;
+  try { await navigator.clipboard.writeText(url); }
+  catch (e) {
+    const t = document.createElement("textarea"); t.value = url; document.body.appendChild(t);
+    t.select(); try { document.execCommand("copy"); } catch (_) {} t.remove();
+  }
+  $("copy").textContent = "copied";
+  setTimeout(() => ($("copy").textContent = "copy link"), 1200);
+});
+$("go").addEventListener("click", () => startScan($("ca").value));
+$("ca").addEventListener("keydown", (e) => { if (e.key === "Enter") startScan($("ca").value); });
+
+// ---------------- canvas ----------------
+const cv = $("web"), ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+const now = () => performance.now();
+
+function resize() {
+  const r = $("stage").getBoundingClientRect();
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = r.width; H = r.height;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+}
+new ResizeObserver(resize).observe($("stage"));
+resize();
+
+const center = () => ({ x: W / 2, y: H / 2 });
+const R = () => Math.max(60, Math.min(W, H) * 0.40);
+function px(n) { const c = center(), r = R(); return { x: c.x + n.x * r, y: c.y + n.y * r }; }
+const K = () => Math.max(0.55, Math.min(1, R() / 300));   // масштаб узлов/подписей под размер паутины
+function nodeRadius(n) {
+  if (n.share == null) return 4;
+  return Math.max(4, Math.min(26, 4 + Math.sqrt(n.share) * 48) * K());
+}
+function targetPx(t) {
+  if (t.center) {
+    const c = center();
+    if (t.slot == null) return c;
+    const a = -Math.PI / 2 + t.slot * 2 * Math.PI / SPIDERS;
+    return { x: c.x + Math.cos(a) * 52 * K(), y: c.y + Math.sin(a) * 52 * K() };
+  }
+  const n = S.nodes.get(t.node);
+  return n ? px(n) : center();
+}
+
+function step(dt) {
+  if (!S) return;
+  for (const n of S.nodes.values()) {         // подтяжка кластеров
+    n.x += (n.ax - n.x) * Math.min(1, dt * 3);
+    n.y += (n.ay - n.y) * Math.min(1, dt * 3);
+    n.flash = Math.max(0, n.flash - dt * 1.6);
+  }
+  const speed = Math.max(160, Math.min(W, H) * 0.9);   // px/с
+  const c = center();
+  for (const s of S.spiders) {
+    if (!s.init) { const h = targetPx({ center: true, slot: S.spiders.indexOf(s) }); s.x = h.x; s.y = h.y; s.init = true; }
+    if (!s.path.length) { s.moving = false; continue; }
+    const t = targetPx(s.path[0]);
+    const dx = t.x - s.x, dy = t.y - s.y, dist = Math.hypot(dx, dy);
+    const stop = s.path[0].center ? 0.5 : 2;
+    if (dist <= stop) { s.x = t.x; s.y = t.y; s.path.shift(); s.moving = s.path.length > 0; continue; }
+    const v = speed * (1 + Math.min(2, s.path.length * 0.25)) * dt;   // очередь длинная — бежит быстрее
+    const k = Math.min(1, v / dist);
+    s.x += dx * k; s.y += dy * k;
+    s.heading = Math.atan2(dy, dx);
+    s.phase += dt * 18;
+    s.moving = true;
+  }
+}
+
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const c = center(), r = R();
+  // фоновая сетка-паутина
+  ctx.strokeStyle = "rgba(57,255,20,0.05)"; ctx.lineWidth = 1;
+  for (const k of [0.3, 0.55, 0.8, 1.05]) { ctx.beginPath(); ctx.arc(c.x, c.y, r * k, 0, Math.PI * 2); ctx.stroke(); }
+  for (let i = 0; i < 12; i++) {
+    const a = i * Math.PI / 6;
+    ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(c.x + Math.cos(a) * r * 1.1, c.y + Math.sin(a) * r * 1.1); ctx.stroke();
+  }
+  if (!S) { drawToken(c, "?"); return; }
+
+  // кластеры: общий контур
+  for (const cl of S.clusters) {
+    const pts = cl.wallets.map((w) => px(S.nodes.get(w)));
+    const cx = avg(pts.map((p) => p.x)), cy = avg(pts.map((p) => p.y));
+    const rad = Math.max(...cl.wallets.map((w) => { const p = px(S.nodes.get(w)); return Math.hypot(p.x - cx, p.y - cy) + nodeRadius(S.nodes.get(w)); })) + 12;
+    const col = cl.level === "proven" ? C.red : C.amber;
+    const pulse = 0.5 + 0.5 * Math.sin(now() / 400);
+    ctx.save();
+    ctx.globalAlpha = 0.10 + 0.06 * pulse; ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.8; ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+    if (cl.level !== "proven") ctx.setLineDash([6, 5]);
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.globalAlpha = 1; ctx.fillStyle = col; ctx.font = (K() < 0.8 ? 9 : 11) + "px " + getComputedStyle(document.body).fontFamily;
+    const outward = cy >= c.y;                       // подпись — с внешней стороны контура, не на пауках
+    let ly = outward ? cy + rad + 14 : cy - rad - 6;
+    ly = Math.max(12, Math.min(H - 6, ly));
+    ctx.textAlign = "center"; ctx.fillText(cl.label, clampX(cx, cl.label), ly);
+    ctx.restore();
+  }
+
+  // нити от центра к пауку
+  ctx.lineWidth = 0.7;
+  for (const s of S.spiders) {
+    if (!s.init) continue;
+    ctx.strokeStyle = "rgba(200,211,200,0.18)";
+    ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(s.x, s.y); ctx.stroke();
+  }
+
+  // связи
+  for (const l of S.links) {
+    const a = S.nodes.get(l.a), b = S.nodes.get(l.b);
+    if (!a || !b) continue;
+    const pa = px(a), pb = px(b), k = Math.min(1, (now() - l.born) / 600);
+    ctx.strokeStyle = l.level === "proven" ? C.red : C.amber;
+    ctx.lineWidth = l.level === "proven" ? 1.8 : 1.3;
+    if (l.level !== "proven") ctx.setLineDash([5, 5]);
+    ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pa.x + (pb.x - pa.x) * k, pa.y + (pb.y - pa.y) * k); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // кошельки
+  const font = getComputedStyle(document.body).fontFamily;
+  for (const n of S.nodes.values()) {
+    const p = px(n), rr = nodeRadius(n), born = Math.min(1, (now() - n.born) / 300);
+    ctx.globalAlpha = born;
+    if (n.flash > 0) {
+      ctx.fillStyle = n.color; ctx.globalAlpha = born * n.flash * 0.35;
+      ctx.beginPath(); ctx.arc(p.x, p.y, rr + 14 * (1 - n.flash) + 4, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = born;
+    }
+    ctx.fillStyle = C.bg; ctx.strokeStyle = n.color; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(p.x, p.y, rr * born, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = n.color; ctx.globalAlpha = born * 0.35;
+    ctx.beginPath(); ctx.arc(p.x, p.y, rr * born * 0.65, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = born;
+    ctx.fillStyle = C.dim; ctx.font = (K() < 0.8 ? 8 : 10) + "px " + font; ctx.textAlign = "center";
+    const below = p.y >= c.y;
+    const label = short(n.w);
+    ctx.fillText(label, clampX(p.x, label), below ? p.y + rr + 12 : p.y - rr - 5);
+    ctx.globalAlpha = 1;
+  }
+
+  drawToken(c, S.ticker);
+  for (const s of S.spiders) if (s.init) drawSpider(s);
+}
+
+function clampX(x, text) {
+  const half = ctx.measureText(text).width / 2 + 4;
+  return Math.max(half, Math.min(W - half, x));
+}
+
+function drawToken(c, label) {
+  const font = getComputedStyle(document.body).fontFamily;
+  const text = String(label).slice(0, 10);
+  ctx.font = "bold 11px " + font;
+  const rad = Math.max(26 * K(), ctx.measureText(text).width / 2 + 7);
+  ctx.fillStyle = C.bg; ctx.strokeStyle = C.green; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(c.x, c.y, rad, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = C.green; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(text, c.x, c.y);
+  ctx.textBaseline = "alphabetic";
+}
+
+function drawSpider(s) {
+  const size = Math.max(3.5, Math.min(8, Math.min(W, H) / 90));
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.rotate(s.heading + Math.PI / 2);   // голова — вперёд по движению
+  const wig = s.moving ? 1 : 0.15;
+  ctx.strokeStyle = s.frozen && !s.moving ? C.dim : C.text;
+  ctx.lineWidth = 1.1;
+  for (let side = -1; side <= 1; side += 2) {
+    for (let k = 0; k < 4; k++) {
+      const base = (-0.9 + k * 0.6);                 // лапки от головы к брюшку
+      const sw = Math.sin(s.phase + k * 1.3 + (side > 0 ? Math.PI : 0)) * 0.35 * wig;
+      const a1 = base + sw;
+      const kx = side * size * 1.3, ky = size * 0.9 * Math.sin(a1);
+      const fx = side * size * 2.3, fy = size * 1.6 * Math.sin(a1 * 1.15) + (k - 1.5) * size * 0.25;
+      ctx.beginPath();
+      ctx.moveTo(side * size * 0.35, (k - 1.5) * size * 0.3);
+      ctx.quadraticCurveTo(kx, ky - size * 0.6, fx, fy);
+      ctx.stroke();
+    }
+  }
+  ctx.fillStyle = "#0f120f"; ctx.strokeStyle = s.frozen && !s.moving ? C.dim : C.green; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.ellipse(0, size * 0.9, size * 0.75, size * 1.1, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();  // брюшко
+  ctx.beginPath(); ctx.arc(0, -size * 0.45, size * 0.48, 0, Math.PI * 2); ctx.fill(); ctx.stroke();                     // голова
+  ctx.restore();
+}
+
+let last = now();
+function frame() {
+  const t = now(), dt = Math.min(0.05, (t - last) / 1000);
+  last = t;
+  step(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------------- автостарт по ?ca= ----------------
+const q = new URLSearchParams(location.search).get("ca");
+if (q) { $("ca").value = q; startScan(q); }
+</script>
+</body>
+</html>
