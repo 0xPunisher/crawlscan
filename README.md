@@ -13,7 +13,7 @@
 ![runtime deps](https://img.shields.io/badge/runtime_deps-0-00c805?style=flat-square\&labelColor=07090b)
 [![license](https://img.shields.io/badge/license-MIT-9fd9ff?style=flat-square\&labelColor=07090b)](LICENSE)
 
-<img src="assets/hero.png" alt="CRAWLSCAN landing" width="100%">
+![crawlscan](banner.jpg)
 
 </div>
 
