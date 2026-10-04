@@ -13,6 +13,7 @@
     снаружи и внутри страницы;
   - кнопка «try a sample» -> настоящий токен Pons V2;
   - ссылки X и GitHub -> реальные адреса, в новой вкладке (target="_blank" rel="noopener");
+  - роадмап: Multichain первым в NEXT с бейджем «in progress», Launch radar — в конец LATER;
   - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора.
 
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
@@ -174,6 +175,27 @@ rep('''  // Fake player. To go live: replace with e.g. new EventSource('/crawl?c
 rep("score:done?String(m.scoreShown):'—',", "score:done&&done.score!=null?String(m.scoreShown):'—',")
 # sample — настоящий токен Pons V2
 rep("this.startScan('0x4d3d8a71c02f5be9e6b14d07a3c9f1e28b5a9023');", "this.startScan('" + SAMPLE + "');")
+# роадмап: Multichain -> первым в NEXT с бейджем «in progress», Launch radar -> в конец LATER.
+# Карточка с бейджем собирается по образцу карточки Telegram bot, чтобы стиль совпадал с дизайном.
+ITEM = '              <div data-grip="1" style="padding:18px 0;border-bottom:1px solid #141b20;display:flex;flex-direction:column;gap:6px">'
+TITLE = '<span style="font-size:17px;font-weight:500;color:#eef1f3">'
+DESC = '<span style="font-size:14.5px;line-height:1.5;color:#8a959c;text-wrap:pretty">'
+mm = re.search(r'(<div style="display:flex;align-items:center;justify-content:space-between;gap:12px">)'
+               + re.escape(TITLE) + r'Telegram bot</span>(<span style="display:flex;align-items:center;gap:6px;flex-shrink:0;[^"]*">.*?in progress</span>)</div>', t)
+if not mm:
+    sys.exit("design.html: не найдена карточка Telegram bot с бейджем in progress — сборка остановлена")
+head_row, badge = mm.group(1), mm.group(2)
+telegram = ITEM + mm.group(0)
+multichain_old = ITEM + TITLE + 'Multichain</span>' + DESC + 'Solana, Base, BNB.</span></div>\n'
+radar = ITEM + TITLE + 'Launch radar</span>' + DESC + 'Crawlers scan every new launch automatically and post alerts.</span></div>\n'
+browser = ITEM + TITLE + 'Browser extension</span>' + DESC + 'Crawl any token straight from Dexscreener.</span></div>\n'
+multichain_new = (ITEM + head_row + TITLE + 'Multichain</span>' + badge + '</div>'
+                  + DESC + 'Solana and other EVM chains.</span></div>\n')
+rep(multichain_old, '')
+rep(radar, '')
+rep(telegram, multichain_new + telegram)
+rep(browser, browser + radar)
+
 # соцсети: заглушки href="#" -> реальные ссылки в новой вкладке (X — в шапке и футере, GitHub — в футере)
 ext = lambda url: f'href="{url}" target="_blank" rel="noopener"'
 rep('<a href="#" data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">X</a>',

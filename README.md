@@ -275,6 +275,11 @@ CRAWLSCAN is being developed from a token scanner into a broader **on-chain inte
 
 ### 🟢 In progress
 
+* [ ] **Multichain: Solana and other EVM chains** ![in progress](https://img.shields.io/badge/-in_progress-00c805?style=flat-square&labelColor=07090b)
+  Expand the CRAWLSCAN engine beyond Robinhood Chain and make the same wallet intelligence available on Solana and other EVM networks.
+
+  The goal is to preserve the same core methodology, including holder analysis, operator detection, behavioural clustering and risk scoring, while adapting the crawler to each chain's infrastructure.
+
 * [ ] **Browser extension**
   The browser extension is already in development. It will bring CRAWLSCAN directly into the places where users discover and trade tokens, allowing them to analyse a token without leaving the page they are already using.
 
@@ -285,9 +290,6 @@ CRAWLSCAN is being developed from a token scanner into a broader **on-chain inte
 
 * [ ] **Operator memory across launches**
   Move beyond analysing wallets within a single token. Build persistent operator intelligence that can recognise wallet clusters and behavioural patterns across multiple launches.
-
-* [ ] **Launch radar**
-  Monitor new token launches and automatically surface tokens showing interesting, unusual or potentially dangerous holder behaviour.
 
 * [ ] **Wallet profiler**
   Turn individual wallet analysis into a dedicated intelligence layer showing trading history, behaviour, recurring patterns and relationships across tokens.
@@ -304,10 +306,8 @@ CRAWLSCAN is being developed from a token scanner into a broader **on-chain inte
 
 ### 🌐 Expansion
 
-* [ ] **Multichain**
-  Expand the CRAWLSCAN engine beyond Robinhood Chain and make the same wallet intelligence available across multiple EVM networks.
-
-  The goal is to preserve the same core methodology, including holder analysis, operator detection, behavioural clustering and risk scoring, while adapting the crawler to each chain's infrastructure.
+* [ ] **Launch radar**
+  Monitor new token launches and automatically surface tokens showing interesting, unusual or potentially dangerous holder behaviour.
 
 ## Vision
 
