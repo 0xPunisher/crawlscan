@@ -134,6 +134,8 @@ These relationships are treated as **behavioural signals** rather than definitiv
 
 Infrastructure contracts, exchanges, distributors and other non-holder entities are deliberately excluded from wallet-to-wallet linking.
 
+![crawlscan](screen5.jpg)
+
 ## Verdict
 
 All of the collected signals are combined into a single score from **0 to 100**.
