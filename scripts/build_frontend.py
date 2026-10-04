@@ -12,6 +12,7 @@
   - <title>CRAWLSCAN</title> и ссылки на иконки (/favicon.svg, /favicon.png, /apple-touch-icon.png)
     снаружи и внутри страницы;
   - кнопка «try a sample» -> настоящий токен Pons V2;
+  - ссылки X и GitHub -> реальные адреса, в новой вкладке (target="_blank" rel="noopener");
   - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора.
 
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
@@ -24,6 +25,8 @@ import json, os, re, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC, OUT = os.path.join(ROOT, "design.html"), os.path.join(ROOT, "index.html")
 SAMPLE = "0xb4bb188e2d0e82ef9dba8b31ffe41855a2feac0f"   # токен для «try a sample»
+X_URL = "https://x.com/0x_Punisher"
+GITHUB_URL = "https://github.com/0xPunisher/crawlscan"
 ICON_LINKS = "\n".join([                               # иконки отдаёт server.py из static/
     '<link rel="icon" type="image/svg+xml" href="/favicon.svg">',
     '<link rel="icon" type="image/png" href="/favicon.png">',
@@ -171,6 +174,12 @@ rep('''  // Fake player. To go live: replace with e.g. new EventSource('/crawl?c
 rep("score:done?String(m.scoreShown):'—',", "score:done&&done.score!=null?String(m.scoreShown):'—',")
 # sample — настоящий токен Pons V2
 rep("this.startScan('0x4d3d8a71c02f5be9e6b14d07a3c9f1e28b5a9023');", "this.startScan('" + SAMPLE + "');")
+# соцсети: заглушки href="#" -> реальные ссылки в новой вкладке (X — в шапке и футере, GitHub — в футере)
+ext = lambda url: f'href="{url}" target="_blank" rel="noopener"'
+rep('<a href="#" data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">X</a>',
+    f'<a {ext(X_URL)} data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">X</a>', count=2)
+rep('<a href="#" data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">GitHub</a>',
+    f'<a {ext(GITHUB_URL)} data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">GitHub</a>')
 
 enc = encode(t)
 TITLE_OLD = '<title>Bundled Page</title>'
