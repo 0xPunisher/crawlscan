@@ -90,6 +90,8 @@ CRAWLSCAN reconstructs the relevant holder and transaction activity directly fro
 
 Every ownership percentage is measured against the **real circulating float**, rather than blindly using raw token balances.
 
+![crawlscan](screen4.jpg)
+
 ### What CRAWLSCAN checks
 
 Each wallet is analysed across multiple behavioural dimensions.
