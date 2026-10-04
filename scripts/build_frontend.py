@@ -2,14 +2,15 @@
 
 Страница лежит JSON-строкой в <script type="__bundler/template">. Скрипт её раскодирует,
 применяет правки и кодирует обратно тем же способом (json.dumps(ensure_ascii=False),
-"</" -> "<\\u002F"); остальной файл не трогается, кроме <title> и favicon в обёртке.
+"</" -> "<\\u002F"); остальной файл не трогается, кроме <title> и иконок в обёртке.
 
 Правки:
   - startFeed/stopFeed: живой скан через API (POST /api/scan, опрос /api/events каждые 300 мс,
     очередь с интервалом props.eventMs, после done — /api/result);
   - normalizeEvent/normalizeResult: формат engine/server -> формат дизайна
     (короткие адреса, флаги, доли в %, шапка токена);
-  - <title>CRAWLSCAN</title> снаружи и внутри, пустой favicon;
+  - <title>CRAWLSCAN</title> и ссылки на иконки (/favicon.svg, /favicon.png, /apple-touch-icon.png)
+    снаружи и внутри страницы;
   - кнопка «try a sample» -> настоящий токен Pons V2;
   - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора.
 
@@ -23,6 +24,11 @@ import json, os, re, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC, OUT = os.path.join(ROOT, "design.html"), os.path.join(ROOT, "index.html")
 SAMPLE = "0xb4bb188e2d0e82ef9dba8b31ffe41855a2feac0f"   # токен для «try a sample»
+ICON_LINKS = "\n".join([                               # иконки отдаёт server.py из static/
+    '<link rel="icon" type="image/svg+xml" href="/favicon.svg">',
+    '<link rel="icon" type="image/png" href="/favicon.png">',
+    '<link rel="apple-touch-icon" href="/apple-touch-icon.png">',
+])
 
 src = open(SRC, encoding="utf-8").read()
 m = re.search(r'<script type="__bundler/template">', src)
@@ -43,7 +49,7 @@ def rep(old, new, count=1):
 
 # <title> внутри страницы
 rep('<meta name="viewport" content="width=device-width, initial-scale=1">\n<script src="8e5b16f0',
-    '<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>CRAWLSCAN</title>\n<link rel="icon" href="data:,">\n<script src="8e5b16f0')
+    '<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>CRAWLSCAN</title>\n' + ICON_LINKS + '\n<script src="8e5b16f0')
 
 # полоса TOO EARLY
 rep("const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD};",
@@ -168,7 +174,7 @@ rep("this.startScan('0x4d3d8a71c02f5be9e6b14d07a3c9f1e28b5a9023');", "this.start
 
 enc = encode(t)
 TITLE_OLD = '<title>Bundled Page</title>'
-TITLE_NEW = '<title>CRAWLSCAN</title>\n  <link rel="icon" href="data:,">'
+TITLE_NEW = '<title>CRAWLSCAN</title>\n  ' + ICON_LINKS.replace('\n', '\n  ')
 prefix = src[:a]
 if prefix.count(TITLE_OLD) != 1:
     sys.exit("design.html: в обёртке нет <title>Bundled Page</title> — сборка остановлена")

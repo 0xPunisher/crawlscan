@@ -5,6 +5,7 @@ Read-only: скан идёт в фоне, браузер опрашивает с
   GET  /api/events?job=ID&after=N        -> {"events": [...], "done": bool}  (события с i >= N)
   GET  /api/result?job=ID                -> {"done", "result" | "error"}
   GET  /                                 -> index.html
+  GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
   GET  /health
 
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
@@ -20,6 +21,13 @@ CACHE_TTL = 600            # секунд: кэш результата по то
 MAX_CONCURRENT = 3         # одновременных сканов
 JOB_TTL = 3600             # секунд: старые задачи удаляются из памяти
 ROOT = os.path.dirname(os.path.abspath(__file__))
+ICONS = {                  # путь -> (файл в static/, content-type); .ico отдаёт тот же PNG
+    "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    "/favicon.png": ("favicon.png", "image/png"),
+    "/apple-touch-icon.png": ("favicon.png", "image/png"),
+    "/favicon.ico": ("favicon.png", "image/png"),
+}
+ICON_CACHE = "public, max-age=86400"
 
 JOBS = {}                  # job_id -> {"token", "events", "done", "result", "error", "ts"}
 BY_TOKEN = {}              # token -> job_id последнего скана
@@ -74,12 +82,12 @@ def start_scan(token):
 
 
 class H(BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", cache="no-store"):
         b = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("content-type", ctype)
         self.send_header("content-length", str(len(b)))
-        self.send_header("cache-control", "no-store")
+        self.send_header("cache-control", cache)
         self.end_headers()
         self.wfile.write(b)
 
@@ -125,6 +133,13 @@ class H(BaseHTTPRequestHandler):
                 if job["error"]:
                     return self._send(200, {"done": True, "error": job["error"]})
                 return self._send(200, {"done": True, "result": job["result"]})
+        if u.path in ICONS:
+            name, ctype = ICONS[u.path]
+            try:
+                with open(os.path.join(ROOT, "static", name), "rb") as f:
+                    return self._send(200, f.read(), ctype, ICON_CACHE)
+            except FileNotFoundError:
+                return self._send(404, {"error": "not found"})
         if u.path in ("/", "/index.html"):
             try:
                 with open(os.path.join(ROOT, "index.html"), "rb") as f:
