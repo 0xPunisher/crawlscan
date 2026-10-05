@@ -15,16 +15,16 @@ Read-only: ни ключей, ни подписи, ни отправки тра�
   переводов токена тут нет: её дорого читать). Каждая нога: кто отдал/получил
   (владельцы, по pre/postTokenBalances транзакции), сколько, подпись, слот.
 
-Чем Solana-поток отличается от Robinhood (учесть при подключении к engine):
+Чем Solana-поток отличается от Robinhood (движок получает всё через token_facts):
 - балансы и оборот берутся не из переводов, а из supply_base(token, launch)
-  (getTokenLargestAccounts): та же форма, что у detect.supply_base;
+  (getTokenLargestAccounts): та же форма, что у detect.supply_base, отдаётся в facts["base"];
   holders_total — нижняя оценка (Alchemy не отдаёт getProgramAccounts по mint);
   точное число, если аккаунтов меньше 20;
-- get_token_transfers(token, from_block, wallets) — нужен список холдеров;
 - excluded_addresses/market_addresses дополняются PDA, найденными по ходу скана
   (пулы, хранилища, локеры), поэтому их зовут после supply_base/get_token_transfers;
 - classify_entries для кошелька без найденного входа отдаёт kind=None, unread=True;
-- wallet_distinct_tokens отдаёт None, если в лимит чтения не уложились (не угадываем).
+- wallet_distinct_tokens отдаёт None, если в лимит чтения не уложились (не угадываем);
+- стая — покупки в пределах PACK_WINDOW слотов, а не в одном блоке.
 Фандинг не реализован (USE_FUNDING = False): eth_inflows/outgoing_count — NotImplementedError.
 """
 import base64, hashlib, json, os, random, sys, threading, time, urllib.error, urllib.request
@@ -37,6 +37,8 @@ load_dotenv()
 RPC = os.environ.get("SOLANA_RPC")
 RPS = int(os.environ.get("SOLANA_RPS", "8"))  # потолок HTTP-запросов/сек глобально
 USE_FUNDING = False
+CHAIN = "solana"
+PACK_WINDOW = 2            # окно стаи (detect.find_packs): до 2 слотов от первого покупателя
 
 # --- программы и аккаунты ---
 PUMP = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"            # pump.fun (бондинг-кривые)
@@ -84,6 +86,7 @@ HOLDER_TX_CAP = 30         # транзакций токен-аккаунта ч
 HISTORY_TX_CAP = 100       # транзакций кошелька до входа читаем для wallet_distinct_tokens
 HISTORY_CHUNK = 25         # ... кусками, с ранним выходом
 TX_BATCH = 50              # getTransaction в одном HTTP
+TX_CACHE_MAX = 50_000      # транзакций в кэше процесса
 BUY_MATCH = 0.06           # допуск сверки: рынок отдал ≈ кошелёк получил (комиссии, налог)
 TXOPT = {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}
 
@@ -263,6 +266,8 @@ def get_transactions(sigs):
         need = [s for s in dict.fromkeys(sigs) if s not in _TX]
     res = rpc_batch([("getTransaction", [s, TXOPT]) for s in need])
     with _TX_LOCK:
+        if len(_TX) > TX_CACHE_MAX:  # долгоживущий сервер: кэш не растёт бесконечно
+            _TX.clear()
         for s, tx in zip(need, res):
             if tx:
                 _TX[s] = tx
@@ -367,8 +372,9 @@ def get_launch(token):
     Запуск = самая старая транзакция бондинг-кривой (create). История кривой короткая
     (после миграции кривая не торгуется), поэтому до дна mint не листаем.
     deployer — получатель дев-бая в транзакции запуска; нет дев-бая — creator."""
-    if token in _LAUNCH:
-        return _LAUNCH[token]
+    _HOLDERS.pop(token, None)  # каждый скан начинается с get_launch: топ и истории аккаунтов читаем заново
+    for k in [k for k in _ACC_HIST if k[0] == token]:
+        del _ACC_HIST[k]
     curve = bonding_curve(token)
     mint_acc, curve_acc = rpc("getMultipleAccounts", [[token, curve], {"encoding": "base64"}])["value"]
     if not mint_acc or mint_acc["owner"] not in (TOKEN, TOKEN_2022) or not curve_acc or curve_acc["owner"] != PUMP:
@@ -469,6 +475,16 @@ def supply_base(token, launch):
         elif r["amount"] > 0:
             bal[r["owner"]] += r["amount"]
     return {"supply": supply, "circulating": supply - infra, "holders_total": len(bal), "balances": dict(bal)}
+
+
+def token_facts(token, launch):
+    """Факты о токене для движка (общий контракт сетей): {"supply", "transfers", "excluded",
+    "market", "base"}. base — балансы топ-20 (форма detect.supply_base); transfers — только
+    по токен-аккаунтам холдеров топ-20 (продажи, раздатчики, прямые переводы, входы)."""
+    base = supply_base(token, launch)
+    transfers = get_token_transfers(token, launch["block"])
+    return {"supply": base["supply"], "transfers": transfers, "excluded": excluded_addresses(launch["curve"]),
+            "market": market_addresses(launch["curve"]), "base": base}
 
 
 def market_addresses(curve):

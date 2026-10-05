@@ -3,7 +3,7 @@
 бесплатный тариф GT быстро отвечает 429, а в этом ответе уже есть всё для шапки."""
 import json, time, urllib.request, urllib.error
 
-GT = "https://api.geckoterminal.com/api/v2/networks/robinhood"
+GT = "https://api.geckoterminal.com/api/v2/networks"
 
 
 def _gt(path, tries=3, timeout=8):
@@ -25,11 +25,13 @@ def _gt(path, tries=3, timeout=8):
     raise last
 
 
-def fetch_market(token):
+def fetch_market(token, network="robinhood"):
     """{"name", "ticker", "price_usd", "mcap_usd", "liquidity_usd", "vol24h_usd"} или {} при ошибке.
-    mcap — market_cap_usd, если GT его знает, иначе fdv."""
+    mcap — market_cap_usd, если GT его знает, иначе fdv. network — сеть GT: "robinhood" | "solana"
+    (адреса Solana регистрозависимы, их не приводим к нижнему регистру)."""
+    tok = token.lower() if network == "robinhood" else token
     try:
-        a = _gt(f"/tokens/{token.lower()}").get("data", {}).get("attributes", {})
+        a = _gt(f"/{network}/tokens/{tok}").get("data", {}).get("attributes", {})
     except Exception:
         return {}
     f = lambda v: float(v) if v not in (None, "") else None

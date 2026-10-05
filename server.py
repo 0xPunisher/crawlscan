@@ -29,7 +29,7 @@ ICONS = {                  # путь -> (файл в static/, content-type); .i
 }
 ICON_CACHE = "public, max-age=86400"
 
-JOBS = {}                  # job_id -> {"token", "events", "done", "result", "error", "ts"}
+JOBS = {}                  # job_id -> {"token", "chain", "events", "done", "result", "error", "ts"}
 BY_TOKEN = {}              # token -> job_id последнего скана
 _lock = threading.Lock()
 _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
@@ -57,13 +57,14 @@ def _run(job_id, token):
             if err:
                 job["error"] = err
                 job["events"].append({"i": len(job["events"]), "t": int((time.time() - job["ts"]) * 1000),
-                                      "type": "error", "spider": None, "wallet": None, "detail": err})
+                                      "type": "error", "spider": None, "wallet": None, "detail": err,
+                                      "chain": job["chain"]})
             job["done"] = True
 
 
 def start_scan(token):
     """job_id: свежий кэш по токену или уже идущий скан того же токена, иначе новый."""
-    token = engine.validate(token)
+    chain, token = engine.chain_of(token)
     now = time.time()
     with _lock:
         for jid in [j for j, v in JOBS.items() if v["done"] and now - v["ts"] > JOB_TTL]:
@@ -75,7 +76,8 @@ def start_scan(token):
         if job and (not job["done"] or (job["result"] and now - job["ts"] < CACHE_TTL)):
             return jid
         jid = uuid.uuid4().hex[:12]
-        JOBS[jid] = {"token": token, "events": [], "done": False, "result": None, "error": None, "ts": now}
+        JOBS[jid] = {"token": token, "chain": chain, "events": [], "done": False, "result": None, "error": None,
+                     "ts": now}
         BY_TOKEN[token] = jid
     threading.Thread(target=_run, args=(jid, token), daemon=True).start()
     return jid

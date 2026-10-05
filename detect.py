@@ -80,11 +80,11 @@ def sellers(transfers, market):
 
 def wallet_signals(data, launch_ts, deployer):
     """Сигналы по кошелькам. data — {wallet: {
-        "kind": "buy" | "transfer",   # тип первого входа (adapter.classify_entries)
+        "kind": "buy" | "transfer" | None,  # тип первого входа (adapter.classify_entries); None — не найден
         "tx": str, "block": int,      # транзакция и блок первого входа
         "via": str,                   # от кого пришёл токен
         "eth_in": int | None,         # ETH на покупку, wei
-        "entry_ts": int,              # unix-время блока входа
+        "entry_ts": int | None,       # unix-время блока входа; None — вход не найден (Solana)
         "distinct_tokens": int | None,  # разных монет за всю историю до входа (cap > 3); None — не успели прочитать
         "inflows": [{"from", "block", "amount"}],  # входящие ETH до входа
         "sold": bool,                 # продавал ли токен (detect.sellers)
@@ -102,7 +102,7 @@ def wallet_signals(data, launch_ts, deployer):
             "short_history": n is not None and 0 < n <= SHORT_HISTORY_MAX,
             "unread": n is None,
             "one_shot_funded": len(d["inflows"]) == 1,
-            "sniper": d["entry_ts"] - launch_ts <= SNIPER_SECONDS,
+            "sniper": d["entry_ts"] is not None and d["entry_ts"] - launch_ts <= SNIPER_SECONDS,
             "eth_in": d["eth_in"],
             "is_deployer": w == deployer,
             "sold": d.get("sold", False),
@@ -144,7 +144,7 @@ def find_links(holders, transfers, signals, inflows, outgoing, contracts, exclud
     for w in hs:
         by_tx[signals[w]["tx"]].add(w)
     for tx, g in by_tx.items():
-        if len(g) > 1:
+        if tx and len(g) > 1:  # tx None — вход не найден, это не общая транзакция
             add(_star(g, "same_tx", tx))
 
     by_src = defaultdict(set)
@@ -171,14 +171,20 @@ def find_links(holders, transfers, signals, inflows, outgoing, contracts, exclud
     return links
 
 
-def find_packs(signals):
+def find_packs(signals, window=0):
     """Поведенческие стаи: [{"block", "wallets", "median_eth"}].
-    ≥ PACK_MIN кошельков купили в одном блоке, каждый virgin, eth_in каждого
-    в пределах ±PACK_SPREAD от медианы группы. Деплоер в стаю не входит."""
-    by_block = defaultdict(list)
-    for w, s in signals.items():
-        if s["kind"] == "buy" and s["virgin"] and s["eth_in"] and not s["is_deployer"]:
-            by_block[s["block"]].append(w)
+    ≥ PACK_MIN кошельков купили в одном окне блоков, каждый virgin, eth_in каждого
+    в пределах ±PACK_SPREAD от медианы группы. Деплоер в стаю не входит.
+    window — параметр сети: 0 = тот же блок (Robinhood), 2 = до 2 слотов от первого
+    покупателя группы (Solana); block стаи — блок первого покупателя."""
+    cand = sorted((s["block"], w) for w, s in signals.items()
+                  if s["kind"] == "buy" and s["virgin"] and s["eth_in"] and not s["is_deployer"])
+    by_block = {}
+    start = None
+    for b, w in cand:
+        if start is None or b - start > window:
+            start = b
+        by_block.setdefault(start, []).append(w)
     packs = []
     for b, ws in sorted(by_block.items()):
         if len(ws) < PACK_MIN:

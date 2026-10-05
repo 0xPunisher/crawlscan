@@ -12,6 +12,8 @@ load_dotenv()
 
 RPC = os.environ["CRAWLER_RPC"]  # Alchemy PAYG endpoint
 
+CHAIN = "robinhood"
+PACK_WINDOW = 0           # окно стаи (detect.find_packs): тот же блок
 FRESH_WINDOW = 1_000_000  # окно (блоков) для свежести кошелька
 FRESH_CAP    = 4          # считаем разные токены до стольких, дальше не нужно
 
@@ -299,6 +301,16 @@ def get_launch(token):
             break
     return {"block": int(launch["blockNumber"], 16), "curve": curve,
             "deployer": deployer, "tx": launch["transactionHash"]}
+
+
+def token_facts(token, launch):
+    """Факты о токене для движка (общий контракт сетей): {"supply", "transfers", "excluded",
+    "market", "base"}. base = None: балансы и оборот движок считает из переводов
+    (detect.supply_base) — здесь есть полная история переводов с запуска."""
+    transfers = get_token_transfers(token, launch["block"])
+    supply = token_supply(token)
+    return {"supply": supply, "transfers": transfers, "excluded": excluded_addresses(launch["curve"]),
+            "market": market_addresses(launch["curve"]), "base": None}
 
 
 def get_token_transfers(token, from_block):

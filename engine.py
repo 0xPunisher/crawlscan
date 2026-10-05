@@ -1,11 +1,14 @@
 """Дирижёр скана: идёт по шагам, вызывает адаптер и детекторы, на каждом шаге — emit(event).
 Жёсткий бюджет 25 секунд: кошельки, чью историю не успели прочитать, помечаются unread,
 скан их не ждёт: забираем только тех, кто успел до дедлайна, зависших не ждём.
+Сеть — по адресу: 0x + 40 hex → Robinhood (chains/robinhood.py), base58 → Solana
+(chains/solana.py, только при SOLANA_ENABLED=true). Оба адаптера отдают одинаковые факты.
 Запуск из кода: engine.scan("0x...", emit=print) -> result (dict)."""
-import re, threading, time
+import os, re, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _CFTimeout
 
 from chains import robinhood as ch
+from chains import solana as sol
 import detect as d
 import market
 
@@ -18,30 +21,50 @@ USE_FUNDING = False    # фандинг выключен: eth_inflows/outgoing_c
                        # связь "общий фандер" и сигнал one_shot_funded выключены
 
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+CHAINS = {"robinhood": ch, "solana": sol}
+NATIVE = {"robinhood": ("ETH", 10 ** 18), "solana": ("SOL", 10 ** 9)}   # единица eth_in
+NOT_LAUNCHPAD = {"robinhood": "not a Pons V2 token", "solana": "not a pump.fun token"}
+GT_NETWORK = {"robinhood": "robinhood", "solana": "solana"}
 
 
 class ScanError(Exception):
-    """Понятная пользователю ошибка скана (плохой адрес, не Pons V2)."""
+    """Понятная пользователю ошибка скана (плохой адрес, не Pons V2 / pump.fun, Solana выключена)."""
+
+
+def solana_enabled():
+    return os.environ.get("SOLANA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+
+def chain_of(token):
+    """CA → (сеть, нормализованный адрес) или ScanError.
+    0x + 40 hex → robinhood (нижний регистр); base58 32 байта → solana (регистр сохраняется);
+    Solana при выключенном SOLANA_ENABLED → "Solana support is coming soon"."""
+    token = (token or "").strip() if isinstance(token, str) or token is None else ""
+    if ADDR_RE.match(token):
+        return "robinhood", token.lower()
+    if sol.is_address(token):
+        if not solana_enabled():
+            raise ScanError("Solana support is coming soon")
+        return "solana", token
+    raise ScanError("not a token address")
 
 
 def validate(token):
-    """CA → нижний регистр или ScanError("not a token address")."""
-    token = (token or "").strip()
-    if not ADDR_RE.match(token):
-        raise ScanError("not a token address")
-    return token.lower()
+    """CA → нормализованный адрес или ScanError (см. chain_of)."""
+    return chain_of(token)[1]
 
 
 _HIST, _HIST_LOCK = {}, threading.Lock()  # (wallet, before_block) -> монет до входа
 
-def _history(wallet, before_block, token):
+def _history(a, wallet, before_block, token):
     key = (wallet, before_block)
     with _HIST_LOCK:
         if key in _HIST:
             return _HIST[key]
-    n = ch.wallet_distinct_tokens(wallet, before_block, token, window=None, cap=HIST_CAP)
-    with _HIST_LOCK:
-        _HIST[key] = n
+    n = a.wallet_distinct_tokens(wallet, before_block, token, window=None, cap=HIST_CAP)
+    if n is not None:  # None — адаптер не уложился в лимит чтения: в следующий раз читаем заново
+        with _HIST_LOCK:
+            _HIST[key] = n
     return n
 
 
@@ -75,44 +98,48 @@ def _reason(sc, base):
 
 def scan(token, emit=lambda e: None):
     """Полный скан токена. emit(event) — события в формате README. Возвращает result (dict).
-    ScanError — понятная ошибка (адрес, не Pons V2); прочие исключения — сбой."""
+    ScanError — понятная ошибка (адрес, не Pons V2 / pump.fun, Solana выключена); прочие исключения — сбой.
+    Факты о токене адаптер сети отдаёт в общей форме (token_facts): переводы, сапплай,
+    исключённые адреса, рынок и, если сеть знает балансы напрямую (Solana), base."""
     t0 = time.time()
     deadline = t0 + BUDGET
-    r0 = ch.REQUESTS[0]
+    chain, token = chain_of(token)
+    a = CHAINS[chain]
+    r0 = a.REQUESTS[0]
     seq = [0]
 
     def ev(type_, detail="", wallet=None, spider=None, **extra):
         e = {"i": seq[0], "t": int((time.time() - t0) * 1000), "type": type_,
-             "spider": spider, "wallet": wallet, "detail": detail} | extra
+             "spider": spider, "wallet": wallet, "detail": detail, "chain": chain} | extra
         seq[0] += 1
         emit(e)
 
-    token = validate(token)
     mkt_box = {}
-    mkt_thread = threading.Thread(target=lambda: mkt_box.update(market.fetch_market(token)), daemon=True)
+    mkt_thread = threading.Thread(target=lambda: mkt_box.update(market.fetch_market(token, GT_NETWORK[chain])),
+                                  daemon=True)
     mkt_thread.start()
 
     ev("stage", "launch")
-    launch = ch.get_launch(token)
+    launch = a.get_launch(token)
     if launch is None:
-        raise ScanError("not a Pons V2 token")
+        raise ScanError(NOT_LAUNCHPAD[chain])
 
     ev("stage", "transfers")
-    transfers = ch.get_token_transfers(token, launch["block"])
-    supply = ch.token_supply(token)
-    excluded = ch.excluded_addresses(launch["curve"])
-    mkt = ch.market_addresses(launch["curve"])
-    base = d.supply_base(transfers, supply, excluded)
+    facts = a.token_facts(token, launch)
+    transfers, supply, excluded, mkt = facts["transfers"], facts["supply"], facts["excluded"], facts["market"]
+    base = facts["base"] or d.supply_base(transfers, supply, excluded)
     holders = d.top_holders(base)
-    hs = [a for a, _, _ in holders]
+    hs = [w for w, _, _ in holders]
     ratio = base["circulating"] / supply if supply else 0.0
 
     ev("stage", "entries")
-    entries = ch.classify_entries(token, transfers, hs)
-    ts = ch.block_timestamps([launch["block"]] + [e["block"] for e in entries.values()])
+    entries = a.classify_entries(token, transfers, hs)
+    ts = a.block_timestamps([launch["block"]] + [e["block"] for e in entries.values() if e["block"] is not None])
     sold = d.sellers(transfers, mkt)
-    data = {w: entries[w] | {"entry_ts": ts[entries[w]["block"]], "inflows": [], "sold": w in sold,
+    # вход не найден (Solana: kind None) — без времени входа и без чтения истории: unread, не девственный
+    data = {w: entries[w] | {"entry_ts": ts.get(entries[w]["block"]), "inflows": [], "sold": w in sold,
                              "distinct_tokens": None} for w in hs}
+    unit, scale = NATIVE[chain]
 
     ev("stage", "wallets")
     spider = {w: i % SPIDERS for i, w in enumerate(hs)}
@@ -120,13 +147,14 @@ def scan(token, emit=lambda e: None):
     for w in hs:
         ev("spider_move", "to wallet", wallet=w, spider=spider[w])
     ex = ThreadPoolExecutor(max_workers=WORKERS)
-    futs = {ex.submit(_history, w, entries[w]["block"], token): w for w in hs}
+    futs = {ex.submit(_history, a, w, entries[w]["block"], token): w for w in hs if entries[w]["kind"] is not None}
 
     def flag(w):
         s = d.wallet_signals({w: data[w]}, ts[launch["block"]], launch["deployer"])[w]
-        eth = "" if s["eth_in"] is None else f" {s['eth_in'] / 1e18:.4f} ETH"
+        eth = "" if s["eth_in"] is None else f" {s['eth_in'] / scale:.4f} {unit}"
         fl = _flags(s)
-        ev("wallet_flag", f"{s['kind']}{eth}, +{data[w]['entry_ts'] - ts[launch['block']]}s"
+        when = "entry not found" if data[w]["entry_ts"] is None else f"+{data[w]['entry_ts'] - ts[launch['block']]}s"
+        ev("wallet_flag", f"{s['kind'] or 'unknown'}{eth}, {when}"
            + (", " + ", ".join(fl) if fl else ""), wallet=w, spider=spider[w],
            flags=fl, kind=s["kind"], share=share[w], share_supply=share[w] * ratio)
 
@@ -149,14 +177,14 @@ def scan(token, emit=lambda e: None):
 
     ev("stage", "links")
     sig = d.wallet_signals(data, ts[launch["block"]], launch["deployer"])
-    packs = d.find_packs(sig)
+    packs = d.find_packs(sig, window=a.PACK_WINDOW)
     # раздатчики токена, общие для ≥ 2 холдеров: проверяем только на контракт
     hset, by_src = set(hs), {}
     for t in transfers:
         if t["to"] in hset and t["frm"] not in hset and t["frm"] not in excluded:
             by_src.setdefault(t["frm"], set()).add(t["to"])
     cand = {a for a, ws in by_src.items() if len(ws) > 1}
-    contracts = {a for a, c in ch.is_contract(cand).items() if c} if cand else set()
+    contracts = {x for x, c in a.is_contract(cand).items() if c} if cand else set()
     # без фандинга исходящих ETH не знаем: раздатчик-кошелёк (не контракт) считаем не хабом
     outgoing = {a: 0 for a in cand - contracts}
     links = d.find_links(hs, transfers, sig, {}, outgoing, contracts, excluded, packs)
@@ -174,7 +202,7 @@ def scan(token, emit=lambda e: None):
     mkt_thread.join(timeout=max(0.0, deadline - time.time()))
     meta = {}
     if not mkt_box.get("name"):
-        meta = ch.token_meta(token)
+        meta = a.token_meta(token)
     header = {"name": mkt_box.get("name") or meta.get("name"), "ticker": mkt_box.get("ticker") or meta.get("symbol"),
               "price_usd": mkt_box.get("price_usd"), "mcap_usd": mkt_box.get("mcap_usd"),
               "liquidity_usd": mkt_box.get("liquidity_usd"), "vol24h_usd": mkt_box.get("vol24h_usd"),
@@ -183,7 +211,7 @@ def scan(token, emit=lambda e: None):
     ev("done", reason, score=sc["score"], band=sc["band"], headline=sc["headline"])
 
     return {
-        "token": token, "header": header,
+        "token": token, "chain": chain, "header": header,
         "launch": launch | {"ts": ts[launch["block"]]},
         "supply": supply, "circulating": base["circulating"], "holders_total": base["holders_total"],
         "holders": [{"wallet": a, "share": s, "share_supply": s * ratio, "spider": spider[a],
@@ -192,5 +220,5 @@ def scan(token, emit=lambda e: None):
         "score": sc["score"], "band": sc["band"], "parts": sc["parts"], "gates": sc["gates"],
         "metrics": sc["metrics"], "headline": sc["headline"], "reason": reason,
         "unread": unread, "use_funding": USE_FUNDING,
-        "elapsed_s": elapsed, "rpc_requests": ch.REQUESTS[0] - r0,
+        "elapsed_s": elapsed, "rpc_requests": a.REQUESTS[0] - r0,
     }
