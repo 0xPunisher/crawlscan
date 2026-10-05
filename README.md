@@ -277,8 +277,8 @@ python3 -m unittest discover -s tests -v
 * [ ] **Early buyers crawl**
   See how much supply was bundled at launch, even after the bundlers exit.
 
-* [ ] **Multichain: other EVM chains**
-  The same methodology on other EVM networks, adapted to each chain's infrastructure.
+* [ ] **All-chain support**
+  More EVM chains and beyond: the same methodology, adapted to each chain's infrastructure.
 
 * [ ] **Telegram bot**
   Send a token address in Telegram and get the verdict, score and key holder signals.

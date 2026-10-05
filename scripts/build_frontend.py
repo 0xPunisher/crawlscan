@@ -14,7 +14,8 @@
   - кнопка «try a sample» -> настоящий токен Pons V2;
   - ссылки X и GitHub -> реальные адреса, в новой вкладке (target="_blank" rel="noopener");
   - роадмап: «Solana support (pump.fun)» — в SHIPPED; в NEXT первым «Early buyers crawl», за ним
-    «Multichain» (другие EVM-сети); Launch radar — в конец LATER;
+    «All-chain support» (больше EVM-сетей и не только); Launch radar — в конец LATER;
+  - герой: «for Robinhood and Solana memecoins», Solana — цветом Solana (#9945FF);
   - токен проекта: PONS -> страница токена, секция «the token» (чарт, coming soon, CA с copy)
     между «crawlers at work» и «how it works», строка CA с copy в герое;
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
@@ -208,8 +209,8 @@ rep('''  // Fake player. To go live: replace with e.g. new EventSource('/crawl?c
 rep("score:done?String(m.scoreShown):'—',", "score:done&&done.score!=null?String(m.scoreShown):'—',")
 # sample — настоящий токен выбранной сети (SAMPLES)
 rep("this.startScan('0x4d3d8a71c02f5be9e6b14d07a3c9f1e28b5a9023');", "this.startScan(SAMPLES[this.state.net]);")
-# роадмап (v1.1.0): Solana support -> в конец SHIPPED; в NEXT первыми Early buyers crawl и Multichain
-# (другие EVM-сети, без бейджа); Launch radar -> в конец LATER. Карточки — по образцу карточек дизайна.
+# роадмап (v1.1.0): Solana support -> в конец SHIPPED; в NEXT первыми Early buyers crawl и All-chain support
+# (больше EVM-сетей и не только, без бейджа); Launch radar -> в конец LATER. Карточки — по образцу карточек дизайна.
 ITEM = '              <div data-grip="1" style="padding:18px 0;border-bottom:1px solid #141b20;display:flex;flex-direction:column;gap:6px">'
 TITLE = '<span style="font-size:17px;font-weight:500;color:#eef1f3">'
 DESC = '<span style="font-size:14.5px;line-height:1.5;color:#8a959c;text-wrap:pretty">'
@@ -225,12 +226,17 @@ operator_card = (ITEM + TITLE + 'Operator clustering</span>' + DESC
                  + 'Linked wallets collapse into one operator, scored on real circulating float.</span></div>\n')
 solana_card = ITEM + TITLE + 'Solana support (pump.fun)</span>' + DESC + 'Chain detected from the address, Solscan links, same verdict.</span></div>\n'
 early_card = ITEM + TITLE + 'Early buyers crawl</span>' + DESC + 'See how much supply was bundled at launch, even after bundlers exit.</span></div>\n'
-multichain_new = early_card + ITEM + TITLE + 'Multichain</span>' + DESC + 'Other EVM chains.</span></div>\n'
+multichain_new = early_card + ITEM + TITLE + 'All-chain support</span>' + DESC + 'More EVM chains and beyond.</span></div>\n'
 rep(multichain_old, '')
 rep(radar, '')
 rep(telegram, multichain_new + telegram)
 rep(browser, browser + radar)
 rep(operator_card, operator_card + solana_card)
+
+# герой: «for Robinhood and Solana memecoins», «and» — цветом заголовка, Solana — фиолетовым Solana
+rep('<span data-grip="1" style="color:#00c805">Robinhood</span><span data-grip="1" style="color:#00c805">memecoins</span>',
+    '<span data-grip="1" style="color:#00c805">Robinhood</span><span data-grip="1">and</span>'
+    '<span data-grip="1" style="color:#9945FF">Solana</span><span data-grip="1" style="color:#00c805">memecoins</span>')
 
 # соцсети: заглушки href="#" -> реальные ссылки в новой вкладке (X — в шапке и футере, GitHub — в футере)
 ext = lambda url: f'href="{url}" target="_blank" rel="noopener"'
