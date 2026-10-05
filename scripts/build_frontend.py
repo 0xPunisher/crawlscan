@@ -14,6 +14,8 @@
   - кнопка «try a sample» -> настоящий токен Pons V2;
   - ссылки X и GitHub -> реальные адреса, в новой вкладке (target="_blank" rel="noopener");
   - роадмап: Multichain первым в NEXT с бейджем «in progress», Launch radar — в конец LATER;
+  - токен проекта: PONS -> страница токена, секция «the token» (чарт, coming soon, CA с copy)
+    между «crawlers at work» и «how it works», строка CA с copy в герое;
   - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора.
 
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
@@ -27,6 +29,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC, OUT = os.path.join(ROOT, "design.html"), os.path.join(ROOT, "index.html")
 SAMPLE = "0xb4bb188e2d0e82ef9dba8b31ffe41855a2feac0f"   # токен для «try a sample»
 X_URL = "https://x.com/0x_Punisher"
+PONS_URL = "https://www.ponsfamily.com/launchpad/0x19dCb63C4d2F29A6f077F094a4f858fC790145e1"
 GITHUB_URL = "https://github.com/0xPunisher/crawlscan"
 ICON_LINKS = "\n".join([                               # иконки отдаёт server.py из static/
     '<link rel="icon" type="image/svg+xml" href="/favicon.svg">',
@@ -202,6 +205,123 @@ rep('<a href="#" data-grip="1" style="color:#8a959c" style-hover="color:#ffffff"
     f'<a {ext(X_URL)} data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">X</a>', count=2)
 rep('<a href="#" data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">GitHub</a>',
     f'<a {ext(GITHUB_URL)} data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">GitHub</a>')
+
+# ---------------------------------------------------------------------------
+# токен проекта: ссылка PONS, секция с чартом между «crawlers at work» и «how it works»,
+# строка CA в герое. CA копируется в исходном регистре (чексумма).
+# ---------------------------------------------------------------------------
+TOKEN_CA = "0x19dCb63C4d2F29A6f077F094a4f858fC790145e1"
+TOKEN_TICKER = "CrawlScan"                      # symbol() из контракта
+TOKEN_CA_SHORT = TOKEN_CA[:6] + "…" + TOKEN_CA[-4:]
+# Чарт: CHART_KIND = "gecko" | "dexscreener" | None (None -> карточка «chart available after migration»).
+# GeckoTerminal — пул кривой Pons (dex pons-v2, реальная ликвидность и объём). Пары Dexscreener
+# для этого токена — сторонние V4-пулы с ликвидностью около $1: их график показывал бы ложную цену.
+CHART_KIND = "gecko"
+CHART_POOL = "0x75777d4b075af933df9264d460a3ce2ba7b2e9dd"   # кривая токена (get_launch)
+DEX_PAIR = None                                              # пара Dexscreener, если появится настоящая
+CHART_URL = {
+    "gecko": f"https://www.geckoterminal.com/robinhood/pools/{CHART_POOL}?embed=1&info=0&swaps=0&grayscale=0&light_chart=0",
+    "dexscreener": f"https://dexscreener.com/robinhood/{DEX_PAIR}?embed=1&theme=dark&info=0&trades=0",
+}.get(CHART_KIND)
+DEX_URL = f"https://dexscreener.com/robinhood/{DEX_PAIR}" if DEX_PAIR else None
+
+MONO = "font-family:'JetBrains Mono',monospace"
+ICON_COPY = ('<svg width="14" height="14" sc-camel-view-box="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" '
+             'style="display:block"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"></rect>'
+             '<path d="M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5h-5A1.5 1.5 0 0 0 2.5 3v5a1.5 1.5 0 0 0 1.5 1.5h.5"></path></svg>')
+ICON_CHECK = ('<svg width="14" height="14" sc-camel-view-box="0 0 16 16" fill="none" stroke="#00c805" stroke-width="2" '
+              'stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M3 8.5l3.2 3L13 4.5"></path></svg>')
+
+def copy_button(key, label):
+    """Кнопка copy: иконка копирования, после клика 1.5 с — зелёная галочка."""
+    return (f'<button sc-camel-on-click="{{{{copyCa{key}}}}}" title="copy contract address" aria-label="{label}" '
+            f'style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;'
+            f'border:1px solid #1c252b;border-radius:7px;background:#0b1013;color:#8a959c;cursor:pointer;flex-shrink:0" '
+            f'style-hover="color:#ffffff;border-color:#2c353b">'
+            f'<sc-if value="{{{{ca{key}Idle}}}}" hint-placeholder-val="{{{{true}}}}">{ICON_COPY}</sc-if>'
+            f'<sc-if value="{{{{ca{key}Done}}}}" hint-placeholder-val="{{{{false}}}}">{ICON_CHECK}</sc-if></button>')
+
+def ext_link(url, text):
+    return (f'<a href="{url}" target="_blank" rel="noopener" data-grip="1" style="color:#9fd9ff;{MONO};font-size:13px" '
+            f'style-hover="color:#ffffff">{text} ↗</a>')
+
+if CHART_URL:
+    chart = (f'<div data-grip="1" style="flex:1 1 620px;min-width:0;height:440px;border:1px solid #141b20;border-radius:12px;'
+             f'background:#090c0f;overflow:hidden">'
+             f'<iframe src="{CHART_URL}" title="${TOKEN_TICKER} chart" loading="lazy" frameborder="0" allow="clipboard-write" '
+             f'style="display:block;width:100%;height:100%;border:0"></iframe></div>')
+else:
+    chart = (f'<div data-grip="1" style="flex:1 1 620px;min-width:0;min-height:300px;border:1px dashed #1c252b;border-radius:12px;'
+             f'background:#090c0f;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:32px;box-sizing:border-box">'
+             f'<span style="{MONO};font-size:13px;color:#8a959c">chart available after migration</span>'
+             f'<a href="{PONS_URL}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#04140a;background:#00c805;'
+             f'padding:10px 18px;border-radius:8px" style-hover="background:#19dd1f">open on Pons ↗</a></div>')
+
+badge_soon = ('<span style="display:inline-flex;align-items:center;gap:6px;' + MONO + ';font-size:10.5px;padding:3px 8px;'
+              'border-radius:999px;color:#00c805;border:1px solid rgba(0,200,5,0.45);background:rgba(0,200,5,0.08)">'
+              '<span style="width:5px;height:5px;border-radius:50%;background:#00c805;box-shadow:0 0 6px #00c805"></span>coming soon</span>')
+
+links = ext_link(PONS_URL, "Pons") + (ext_link(DEX_URL, "Dexscreener") if DEX_URL else "")
+TOKEN_SECTION = f'''      <section id="token" style="max-width:1280px;margin:0 auto;padding:40px 32px 120px;box-sizing:border-box">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;gap:24px;border-top:1px solid #12181c;padding-top:22px;margin-bottom:44px">
+          <h2 data-grip="1" style="margin:0;font-size:34px;font-weight:500;letter-spacing:-0.03em;color:#eef1f3">the token</h2>
+          <span style="{MONO};font-size:12px;color:#5f6b72">02</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:24px;align-items:stretch">
+          {chart}
+          <div data-grip="1" style="flex:1 1 320px;min-width:0;display:flex;flex-direction:column;gap:18px;padding:28px 26px;border:1px solid #141b20;border-radius:14px;background:linear-gradient(180deg,#0c1114,#090c0f);box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);box-sizing:border-box">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">${TOKEN_TICKER}</span>{badge_soon}</div>
+            <h3 style="margin:0;font-size:28px;font-weight:500;letter-spacing:-0.02em;color:#eef1f3">CRAWLSCAN has a token</h3>
+            <p style="margin:0;font-size:15px;line-height:1.6;color:#8a959c">Holders of ${TOKEN_TICKER} will unlock premium features and priority crawling. Both are coming soon; the scanner stays free and read-only for everyone.</p>
+            <p style="margin:0;{MONO};font-size:11.5px;line-height:1.6;color:#5f6b72">Utility only. Not financial advice.</p>
+          </div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px 16px;margin-top:20px;padding:16px 18px;border:1px solid #141b20;border-radius:12px;background:#090c0f">
+          <span style="{MONO};font-size:12px;color:#5f6b72">Contract:</span>
+          <span data-grip="1" style="{MONO};font-size:13px;color:#dfe5e8;word-break:break-all;min-width:0">{TOKEN_CA}</span>
+          {copy_button("Section", "copy contract address")}
+          <span style="flex:1 1 0"></span>
+          <div style="display:flex;gap:18px">{links}</div>
+        </div>
+      </section>
+
+'''
+
+# PONS в шапке и футере -> страница токена на Pons, в новой вкладке
+rep('<a href="#" title="CRAWLSCAN on PONS" data-grip="1"', f'<a {ext(PONS_URL)} title="CRAWLSCAN on PONS" data-grip="1"')
+rep('<a href="#" data-grip="1" style="display:flex;align-items:center;gap:7px;color:#8a959c"',
+    f'<a {ext(PONS_URL)} data-grip="1" style="display:flex;align-items:center;gap:7px;color:#8a959c"')
+
+# секция токена — между #work и #how; номера следующих секций сдвигаются
+rep('      <section id="how" ', TOKEN_SECTION + '      <section id="how" ')
+rep('''color:#eef1f3">how it works</h2>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72">02</span>''',
+    '''color:#eef1f3">how it works</h2>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72">03</span>''')
+mr = re.search(r'''(color:#eef1f3">roadmap</h2>\s*<span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72">)03(</span>)''', t)
+if not mr:
+    sys.exit("design.html: не найден номер секции roadmap — сборка остановлена")
+t = t[:mr.start()] + mr.group(1) + "04" + mr.group(2) + t[mr.end():]
+
+# строка CA в герое, под полем ввода
+rep('          <span>read-only · no wallet connect · Robinhood Chain</span>\n',
+    '          <span>read-only · no wallet connect · Robinhood Chain</span>\n'
+    f'          <span style="display:inline-flex;align-items:center;gap:8px"><span style="color:#00c805">${TOKEN_TICKER}</span>'
+    f'<span>CA:</span><span title="{TOKEN_CA}" style="color:#aab4ba">{TOKEN_CA_SHORT}</span>{copy_button("Hero", "copy token contract address")}</span>\n')
+
+# логика copy в компоненте: CA в исходном регистре, галочка на 1.5 с
+rep("  blank(ca){return {", f"""  copyCa(key){{
+    const ca={json.dumps(TOKEN_CA)};
+    const fallback=()=>{{const t=document.createElement('textarea'); t.value=ca; t.style.position='fixed'; t.style.opacity='0'; document.body.appendChild(t); t.select(); try{{document.execCommand('copy');}}catch(e){{}} t.remove();}};
+    try{{ if(navigator.clipboard&&window.isSecureContext) navigator.clipboard.writeText(ca).catch(fallback); else fallback(); }}catch(e){{fallback();}}
+    this.setState({{caCopied:key}}); clearTimeout(this._caT); this._caT=setTimeout(()=>this.setState({{caCopied:''}}),1500);
+  }}
+  blank(ca){{return {{""")
+rep("      canvasRef:this.canvasRef, logRef:this.logRef,",
+    "      canvasRef:this.canvasRef, logRef:this.logRef,\n"
+    "      copyCaHero:()=>this.copyCa('hero'), copyCaSection:()=>this.copyCa('section'),\n"
+    "      caHeroDone:this.state.caCopied==='hero', caHeroIdle:this.state.caCopied!=='hero',\n"
+    "      caSectionDone:this.state.caCopied==='section', caSectionIdle:this.state.caCopied!=='section',")
 
 enc = encode(t)
 TITLE_OLD = '<title>Bundled Page</title>'
