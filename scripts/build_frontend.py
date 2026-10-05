@@ -13,7 +13,8 @@
     снаружи и внутри страницы;
   - кнопка «try a sample» -> настоящий токен Pons V2;
   - ссылки X и GitHub -> реальные адреса, в новой вкладке (target="_blank" rel="noopener");
-  - роадмап: Multichain первым в NEXT с бейджем «in progress», Launch radar — в конец LATER;
+  - роадмап: «Solana support (pump.fun)» — в SHIPPED; в NEXT первым «Early buyers crawl», за ним
+    «Multichain» (другие EVM-сети); Launch radar — в конец LATER;
   - токен проекта: PONS -> страница токена, секция «the token» (чарт, coming soon, CA с copy)
     между «crawlers at work» и «how it works», строка CA с copy в герое;
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
@@ -205,10 +206,10 @@ rep('''  // Fake player. To go live: replace with e.g. new EventSource('/crawl?c
 
 # счёт для TOO EARLY: «—», а не 0
 rep("score:done?String(m.scoreShown):'—',", "score:done&&done.score!=null?String(m.scoreShown):'—',")
-# sample — настоящий токен Pons V2
+# sample — настоящий токен выбранной сети (SAMPLES)
 rep("this.startScan('0x4d3d8a71c02f5be9e6b14d07a3c9f1e28b5a9023');", "this.startScan(SAMPLES[this.state.net]);")
-# роадмап: Multichain -> первым в NEXT с бейджем «in progress», Launch radar -> в конец LATER.
-# Карточка с бейджем собирается по образцу карточки Telegram bot, чтобы стиль совпадал с дизайном.
+# роадмап (v1.1.0): Solana support -> в конец SHIPPED; в NEXT первыми Early buyers crawl и Multichain
+# (другие EVM-сети, без бейджа); Launch radar -> в конец LATER. Карточки — по образцу карточек дизайна.
 ITEM = '              <div data-grip="1" style="padding:18px 0;border-bottom:1px solid #141b20;display:flex;flex-direction:column;gap:6px">'
 TITLE = '<span style="font-size:17px;font-weight:500;color:#eef1f3">'
 DESC = '<span style="font-size:14.5px;line-height:1.5;color:#8a959c;text-wrap:pretty">'
@@ -216,17 +217,20 @@ mm = re.search(r'(<div style="display:flex;align-items:center;justify-content:sp
                + re.escape(TITLE) + r'Telegram bot</span>(<span style="display:flex;align-items:center;gap:6px;flex-shrink:0;[^"]*">.*?in progress</span>)</div>', t)
 if not mm:
     sys.exit("design.html: не найдена карточка Telegram bot с бейджем in progress — сборка остановлена")
-head_row, badge = mm.group(1), mm.group(2)
 telegram = ITEM + mm.group(0)
 multichain_old = ITEM + TITLE + 'Multichain</span>' + DESC + 'Solana, Base, BNB.</span></div>\n'
 radar = ITEM + TITLE + 'Launch radar</span>' + DESC + 'Crawlers scan every new launch automatically and post alerts.</span></div>\n'
 browser = ITEM + TITLE + 'Browser extension</span>' + DESC + 'Crawl any token straight from Dexscreener.</span></div>\n'
-multichain_new = (ITEM + head_row + TITLE + 'Multichain</span>' + badge + '</div>'
-                  + DESC + 'Solana and other EVM chains.</span></div>\n')
+operator_card = (ITEM + TITLE + 'Operator clustering</span>' + DESC
+                 + 'Linked wallets collapse into one operator, scored on real circulating float.</span></div>\n')
+solana_card = ITEM + TITLE + 'Solana support (pump.fun)</span>' + DESC + 'Chain detected from the address, Solscan links, same verdict.</span></div>\n'
+early_card = ITEM + TITLE + 'Early buyers crawl</span>' + DESC + 'See how much supply was bundled at launch, even after bundlers exit.</span></div>\n'
+multichain_new = early_card + ITEM + TITLE + 'Multichain</span>' + DESC + 'Other EVM chains.</span></div>\n'
 rep(multichain_old, '')
 rep(radar, '')
 rep(telegram, multichain_new + telegram)
 rep(browser, browser + radar)
+rep(operator_card, operator_card + solana_card)
 
 # соцсети: заглушки href="#" -> реальные ссылки в новой вкладке (X — в шапке и футере, GitHub — в футере)
 ext = lambda url: f'href="{url}" target="_blank" rel="noopener"'

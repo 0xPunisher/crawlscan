@@ -10,6 +10,7 @@ Terminal access - https://crawlscan.fun/
 
 [![live](https://img.shields.io/badge/live-crawlscan.fun-00c805?style=flat-square\&labelColor=07090b)](https://crawlscan.fun)
 ![Robinhood Chain](https://img.shields.io/badge/Robinhood_Chain-4663-9fd9ff?style=flat-square\&labelColor=07090b)
+![chains](https://img.shields.io/badge/chains-Robinhood_%C2%B7_Solana-9fd9ff?style=flat-square\&labelColor=07090b)
 ![read-only](https://img.shields.io/badge/read--only-no_keys-00c805?style=flat-square\&labelColor=07090b)
 ![python](https://img.shields.io/badge/python-3.12-9fd9ff?style=flat-square\&labelColor=07090b)
 ![runtime deps](https://img.shields.io/badge/runtime_deps-0-00c805?style=flat-square\&labelColor=07090b)
@@ -38,7 +39,7 @@ The goal is to make a complex on-chain investigation understandable in seconds w
 
 ### The core idea
 
-Paste a Pons V2 memecoin address on Robinhood Chain.
+Paste a Pons V2 memecoin address on Robinhood Chain or a pump.fun token address on Solana. The chain is detected from the address automatically.
 
 CRAWLSCAN analyses the token's holder structure and returns a verdict such as:
 
@@ -149,7 +150,7 @@ The score is built from five major components:
 
 | Signal            | What it measures                                                     |
 | ----------------- | -------------------------------------------------------------------- |
-| **Operator**      | How much of the float is controlled by the largest detected operator |
+| **Operator**      | How far the price could fall if the largest detected operator sold everything into liquidity |
 | **Virgin**        | The share of virgin wallets among the top holders                    |
 | **Transfer**      | How much of the float was received rather than purchased             |
 | **Sniper**        | How much float is still controlled by early sniper wallets           |
@@ -159,6 +160,7 @@ The system also applies hard rules for situations where a weighted score alone w
 
 * Critical concentration signals can force a `DANGER` verdict.
 * Detected multi-wallet operators or suspicious packs can cap the result at `RISKY`.
+* Thin liquidity caps the result at `RISKY`.
 * Insufficient holder activity can result in `TOO EARLY`.
 
 The result is intentionally simple:
@@ -231,7 +233,8 @@ CRAWLSCAN is intentionally lightweight.
 
 * **Python 3.12**: Core crawler and analysis engine.
 * **Python standard library**: Zero runtime dependencies.
-* **Alchemy RPC**: Read-only on-chain access to Robinhood Chain.
+* **Alchemy RPC**: Read-only on-chain access to Robinhood Chain and Solana.
+* **Solana (pump.fun)**: Same methodology on Solana: slots instead of blocks, bonding curve and PumpSwap pools as infrastructure, Solscan links for wallets and tokens.
 * **GeckoTerminal**: Market and token data.
 * **Transaction-level trade classification**: Identifies actual buys even when transactions pass through third-party trading routers or bots.
 * **Parallel crawling**: Multiple wallets are analysed concurrently under a hard time budget.
@@ -265,29 +268,38 @@ That is the layer of information CRAWLSCAN is designed to uncover.
 ## Run locally
 
 ```sh
-echo "CRAWLER_RPC=https://robinhood-mainnet.g.alchemy.com/v2/<your-key>" > .env
+cp .env.example .env
+# CRAWLER_RPC=https://robinhood-mainnet.g.alchemy.com/v2/<your-key>
+# SOLANA_RPC=https://solana-mainnet.g.alchemy.com/v2/<your-key>
+# SOLANA_ENABLED=true          # Solana scans are off unless this is true
 python3 server.py
 ```
 
 Open `http://localhost:8000`, or go straight to:
 
-`http://localhost:8000/?ca=0x...`
+`http://localhost:8000/?ca=0x...` (Robinhood Chain) or `http://localhost:8000/?ca=<mint>` (Solana)
 
 ## Roadmap
 
 CRAWLSCAN is being developed from a token scanner into a broader **on-chain intelligence platform**.
 
+### ✅ Shipped
+
+* [x] **Solana support (pump.fun)**
+  The same wallet intelligence on Solana: paste a pump.fun token address, the chain is detected automatically, and wallets and tokens link to Solscan.
+
 ### 🟢 In progress
-
-* [ ] **Multichain: Solana and other EVM chains** ![in progress](https://img.shields.io/badge/-in_progress-00c805?style=flat-square&labelColor=07090b)
-  Expand the CRAWLSCAN engine beyond Robinhood Chain and make the same wallet intelligence available on Solana and other EVM networks.
-
-  The goal is to preserve the same core methodology, including holder analysis, operator detection, behavioural clustering and risk scoring, while adapting the crawler to each chain's infrastructure.
 
 * [ ] **Browser extension**
   The browser extension is already in development. It will bring CRAWLSCAN directly into the places where users discover and trade tokens, allowing them to analyse a token without leaving the page they are already using.
 
 ### 🔜 Next
+
+* [ ] **Early buyers crawl**
+  See how much supply was bundled at launch, even after bundlers exit.
+
+* [ ] **Multichain: other EVM chains**
+  Bring the same methodology, including holder analysis, operator detection, behavioural clustering and risk scoring, to other EVM networks while adapting the crawler to each chain's infrastructure.
 
 * [ ] **Telegram bot**
   Run scans directly from Telegram by sending a token address and receiving the CRAWLSCAN verdict, score and key holder signals.
