@@ -18,7 +18,13 @@
     между «crawlers at work» и «how it works», строка CA с copy в герое;
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
     переносы в логах, отступы 16 px;
-  - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора.
+  - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора;
+  - цвета частей скора и критериев: больше баллов = чище = зелёный, мало = красный;
+  - две сети: сеть по адресу (0x + 40 hex — Robinhood, base58 32–44 — Solana, регистр Solana
+    не меняется), переключатель «Robinhood | Solana» над полем (плейсхолдер и sample сети),
+    бейдж сети у тикера, ссылки solscan для Solana (у Robinhood ссылок нет, как в дизайне),
+    слот вместо блока, unread-кошельки серым, «operator (dump impact)», сообщение
+    «Solana support is coming soon» под полем (флаг из /api/config).
 
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
 и index.html не перезаписывает.
@@ -29,7 +35,8 @@ import json, os, re, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC, OUT = os.path.join(ROOT, "design.html"), os.path.join(ROOT, "index.html")
-SAMPLE = "0xb4bb188e2d0e82ef9dba8b31ffe41855a2feac0f"   # токен для «try a sample»
+SAMPLES = {"robinhood": "0xb4bb188e2d0e82ef9dba8b31ffe41855a2feac0f",   # «try a sample» по сети
+           "solana": "fjKUqPWK9m331Y5TZZNFismtqoP2MGWAMHEkB62pump"}
 X_URL = "https://x.com/0x_Punisher"
 PONS_URL = "https://www.ponsfamily.com/launchpad/0x19dCb63C4d2F29A6f077F094a4f858fC790145e1"
 GITHUB_URL = "https://github.com/0xPunisher/crawlscan"
@@ -68,7 +75,17 @@ rep("const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD};",
 rep("class Component extends DCLogic {", r'''// ---- live API (rh-crawler server.py) -> design format ----
 const STAGE_TEXT={launch:'resolving token',transfers:'reading top holders',entries:'classifying entries',wallets:'tracing wallet history',links:'linking wallets'};
 const FLAG_KEEP=['deployer','virgin','short_history','sniper','sold','unread'];
-const shortAddr=a=>typeof a==='string'&&/^0x[0-9a-fA-F]{40}$/.test(a)?a.slice(0,6)+'…'+a.slice(-4):a;
+const RH_RE=/^0x[0-9a-fA-F]{40}$/, SOL_RE=/^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const chainOf=a=>typeof a!=='string'?null:RH_RE.test(a)?'robinhood':SOL_RE.test(a)?'solana':null;   // как engine.chain_of
+const CHAIN_NAME={robinhood:'Robinhood',solana:'Solana'};
+const SAMPLES=__SAMPLES__;
+const PLACEHOLDER={robinhood:'0x… token contract address',solana:'token mint address (base58)'};
+const NET_LINE={robinhood:'Robinhood Chain',solana:'Solana · pump.fun'};
+const SOON='Solana support is coming soon';
+const EXPLORER={solana:{account:a=>'https://solscan.io/account/'+a,token:a=>'https://solscan.io/token/'+a}};   // Robinhood: ссылок нет
+const FULL={};   // короткий адрес -> полный (ссылки на эксплорер)
+const shortAddr=a=>{const c=chainOf(a); if(!c) return a; const s=a.slice(0,c==='robinhood'?6:4)+'…'+a.slice(-4); FULL[s]=a; return s;};
+const fmtImpact=i=>typeof i!=='number'?null:i<0.01?'<1%':'−'+Math.round(i*100)+'%';
 function normalizeEvent(e){
   if(!e||!e.type) return e;
   const o={...e};
@@ -80,8 +97,14 @@ function normalizeEvent(e){
     case 'wallet_flag': {
       const fl=(e.flags||[]).filter(f=>FLAG_KEEP.includes(f));
       if(e.kind==='transfer') fl.push('transfer');
+      if(e.kind==null&&!fl.includes('unread')) fl.push('unread');   // вход не найден (Solana)
       o.detail=(fl.length?fl:['clean']).join(', ');
       o.share=e.share!=null?e.share*100:null; break;
+    }
+    case 'link': {   // где связь: блок (Robinhood) / слот (Solana), общая транзакция, раздатчик
+      const v=e.via||'', mb=/^block (\d+)/.exec(v);
+      o.where=mb?(e.chain==='solana'?'slot ':'block ')+mb[1]:e.kind==='same_tx'?'same tx':e.kind==='distributor'?'via '+shortAddr(v):e.kind==='direct'?'direct transfer':'';
+      break;
     }
     case 'done':
       o.band=e.band==='TOO_EARLY_OR_LATE'?'TOO EARLY':e.band; break;
@@ -94,13 +117,16 @@ const fmtPrice=p=>typeof p!=='number'?null:'$'+(p>=1?p.toFixed(2):p.toPrecision(
 const fmtTok=v=>v>=1e9?(v/1e9).toFixed(2)+'B':v>=1e6?(v/1e6).toFixed(0)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':String(Math.round(v));
 function normalizeResult(r){
   if(!r) return r;
-  const h=r.header||{}, sup=(r.supply||0)/1e18, circ=(r.circulating||0)/1e18;
+  const ch=r.chain||chainOf(r.token)||'robinhood', dec=ch==='solana'?1e6:1e18;   // pump.fun — 6 знаков, Pons — 18
+  const h=r.header||{}, sup=(r.supply||0)/dec, circ=(r.circulating||0)/dec;
   return {
     header:{name:h.name,ticker:h.ticker,mcap:h.mcap_usd,liquidity:h.liquidity_usd,vol24h:h.vol24h_usd,
             age:fmtAge(h.age_h),price:fmtPrice(h.price_usd),holders:r.holders_total,
             supply:sup?Math.round(sup).toLocaleString('en-US'):null,
             circulating:sup?`${fmtTok(circ)} (${(circ/sup*100).toFixed(1)}%)`:null,
-            pool:'Pons V2',deployer:shortAddr(r.launch&&r.launch.deployer)},
+            pool:ch==='solana'?(r.launch&&r.launch.complete?'PumpSwap':'pump.fun curve'):'Pons V2',
+            deployer:shortAddr(r.launch&&r.launch.deployer)},
+    chain:ch, impact:r.metrics&&typeof r.metrics.impact==='number'?r.metrics.impact:null,
     parts:r.parts||{},
     operators:(r.operators||[]).filter(o=>o.wallets.length>1).map(o=>({wallets:o.wallets.map(shortAddr),share:o.share*100,level:o.level})),
     raw:r
@@ -163,12 +189,13 @@ rep('''  // Fake player. To go live: replace with e.g. new EventSource('/crawl?c
       const base=this.props.eventMs??150, k=e&&e.type==='stage'?0.4:(0.7+Math.random()*0.6);
       feed.feedT=setTimeout(step,e?base*k:60);
     };
-    if(!/^0x[0-9a-fA-F]{40}$/.test(ca)){fail('not a token address'); step(); return;}   // same rule as engine.validate, no request
+    if(!chainOf(ca)){fail('not a token address'); step(); return;}   // same rule as engine.chain_of, no request
     (async()=>{
       try{
         const r=await fetch('/api/scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:ca})});
         const d=await r.json().catch(()=>({}));
         if(!alive()) return;
+        if(!r.ok&&d.error===SOON){this.soon(ca); return;}   // Solana выключена: сообщение под полем, не поломка
         if(!r.ok||!d.job){fail(d.error||('http '+r.status)); step(); return;}
         feed.job=d.job; poll(); step();
       }catch(err){fail('server unreachable'); step();}
@@ -179,7 +206,7 @@ rep('''  // Fake player. To go live: replace with e.g. new EventSource('/crawl?c
 # счёт для TOO EARLY: «—», а не 0
 rep("score:done?String(m.scoreShown):'—',", "score:done&&done.score!=null?String(m.scoreShown):'—',")
 # sample — настоящий токен Pons V2
-rep("this.startScan('0x4d3d8a71c02f5be9e6b14d07a3c9f1e28b5a9023');", "this.startScan('" + SAMPLE + "');")
+rep("this.startScan('0x4d3d8a71c02f5be9e6b14d07a3c9f1e28b5a9023');", "this.startScan(SAMPLES[this.state.net]);")
 # роадмап: Multichain -> первым в NEXT с бейджем «in progress», Launch radar -> в конец LATER.
 # Карточка с бейджем собирается по образцу карточки Telegram bot, чтобы стиль совпадал с дизайном.
 ITEM = '              <div data-grip="1" style="padding:18px 0;border-bottom:1px solid #141b20;display:flex;flex-direction:column;gap:6px">'
@@ -307,7 +334,7 @@ t = t[:mr.start()] + mr.group(1) + "04" + mr.group(2) + t[mr.end():]
 
 # строка CA в герое, под полем ввода
 rep('          <span>read-only · no wallet connect · Robinhood Chain</span>\n',
-    '          <span>read-only · no wallet connect · Robinhood Chain</span>\n'
+    '          <span>read-only · no wallet connect · {{netLine}}</span>\n'
     f'          <span style="display:inline-flex;align-items:center;gap:8px"><span style="color:#00c805">${TOKEN_TICKER}</span>'
     f'<span>CA:</span><span title="{TOKEN_CA}" style="color:#aab4ba">{TOKEN_CA_SHORT}</span>{copy_button("Hero", "copy token contract address")}</span>\n')
 
@@ -431,6 +458,110 @@ rep('<div style="display:flex;gap:10px;white-space:nowrap">', '<div class="cs-lo
 
 # чипы адресов на сцене: на узком экране круг уже, чтобы крайние чипы не выходили за экран
 rep("chips.push({left:(50+Math.cos(a)*38)+'%'", "chips.push({left:(50+Math.cos(a)*(innerWidth<640?31:38))+'%'")
+
+# ---------------------------------------------------------------------------
+# две сети: переключатель над полем, плейсхолдер/sample сети, бейдж сети, ссылки solscan,
+# слот вместо блока, unread серым, «operator (dump impact)», «coming soon» под полем.
+# ---------------------------------------------------------------------------
+t = t.replace("const SAMPLES=__SAMPLES__;", "const SAMPLES=" + json.dumps(SAMPLES) + ";")
+pill = lambda key, handler, label, extra="": (
+    f'<button sc-camel-on-click="{{{{{handler}}}}}" aria-label="{label}" style="height:30px;padding:0 14px;border-radius:999px;'
+    f'border:1px solid {{{{{key}Border}}}};background:{{{{{key}Bg}}}};color:{{{{{key}Color}}}};{MONO};font-size:12px;cursor:pointer;'
+    f'display:inline-flex;align-items:center;gap:6px" style-hover="color:#ffffff">{label}{extra}</button>')
+SOON_TAG = '<sc-if value="{{solSoon}}" hint-placeholder-val="{{false}}"><span style="color:#5f6b72;font-size:10.5px">soon</span></sc-if>'
+TOGGLE = ('        <div role="group" aria-label="network" style="display:flex;align-items:center;gap:6px">'
+          + pill("rh", "pickRh", "Robinhood") + pill("sol", "pickSol", "Solana", SOON_TAG) + '</div>\n')
+rep('        <div style="display:flex;flex-wrap:wrap;gap:12px;">\n', TOGGLE + '        <div style="display:flex;flex-wrap:wrap;gap:12px;">\n')
+rep('placeholder="0x… token contract address"', 'placeholder="{{placeholder}}"')
+rep('<sc-if value="{{inputError}}" hint-placeholder-val="{{false}}"><span style="color:#ff4d4d">{{inputError}}</span></sc-if>',
+    '<sc-if value="{{inputError}}" hint-placeholder-val="{{false}}"><span style="color:#ff4d4d">{{inputError}}</span></sc-if>'
+    '<sc-if value="{{inputNotice}}" hint-placeholder-val="{{false}}"><span data-notice="1" style="display:inline-flex;align-items:center;gap:8px;color:#9fd9ff">'
+    '<span style="width:6px;height:6px;border-radius:50%;background:#9fd9ff;box-shadow:0 0 6px #9fd9ff"></span>{{inputNotice}}</span></sc-if>')
+
+# бейдж сети у тикера и ссылка на токен
+TICKER = "<span data-grip=\"1\" style=\"font-family:'JetBrains Mono',monospace;font-size:14px;color:#9fd9ff\">${{hTicker}}</span>"
+rep(TICKER, TICKER + f'<span data-chain="1" style="align-self:center;{MONO};font-size:10.5px;padding:2px 8px;border-radius:999px;color:#c9d1d6;'
+    'border:1px solid #2c353b;background:#0b1013">{{chainLabel}}</span>')
+CA_STYLE = f"{MONO};font-size:12px;color:#5f6b72;word-break:break-all"
+rep("<span style=\"font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72\">{{ca}}</span>",
+    f'<sc-if value="{{{{caLink}}}}" hint-placeholder-val="{{{{false}}}}"><a href="{{{{caUrl}}}}" target="_blank" rel="noopener" style="{CA_STYLE}" style-hover="color:#9fd9ff">{{{{ca}}}} ↗</a></sc-if>'
+    f'<sc-if value="{{{{caPlain}}}}" hint-placeholder-val="{{{{true}}}}"><span style="{CA_STYLE}">{{{{ca}}}}</span></sc-if>')
+
+# адрес кошелька в таблице: ссылка solscan для Solana, иначе текст
+ADDR = "font-family:'JetBrains Mono',monospace;font-size:13px;color:{{r.addrColor}}"
+rep(f'<span style="{ADDR}">{{{{r.addr}}}}</span>',
+    f'<span style="display:flex;min-width:0">'
+    f'<sc-if value="{{{{r.hasUrl}}}}" hint-placeholder-val="{{{{false}}}}"><a href="{{{{r.url}}}}" target="_blank" rel="noopener" style="{ADDR}" style-hover="color:#9fd9ff">{{{{r.addr}}}}</a></sc-if>'
+    f'<sc-if value="{{{{r.noUrl}}}}" hint-placeholder-val="{{{{true}}}}"><span style="{ADDR}">{{{{r.addr}}}}</span></sc-if></span>')
+
+# unread: свой флаг (серый, без веса); строка таблицы серым
+rep("clean:{t:'clean',c:G,w:0,log:'clean'}};", "clean:{t:'clean',c:G,w:0,log:'clean'},unread:{t:'unread',c:'#5f6b72',w:0,log:'entry not read'}};")
+rep("    const n=Math.max(20,m.wallets.length), rows=[], chips=[];",
+    "    const n=Math.max(20,m.wallets.length), rows=[], chips=[], ex=EXPLORER[chainOf(m.ca)];")
+rep("rows.push({rank,addr:'0x····…····',addrColor:'#262f35',bg:'transparent',shareText:'',shareW:'0%',shareColor:'#1c252b',badges:[]});",
+    "rows.push({rank,addr:ex?'····…····':'0x····…····',addrColor:'#262f35',bg:'transparent',shareText:'',shareW:'0%',shareColor:'#1c252b',badges:[],url:'',hasUrl:false,noUrl:true});")
+rep("label:w?w.addr:'0x····',", "label:w?w.addr:(ex?'····':'0x····'),")   # чипы на сцене — так же
+rep("        rows.push({rank,addr:w.addr,addrColor:'#dfe5e8',bg:col?rgba(col,fresh?0.2:(wo.w?0.06:0.025)):'rgba(159,217,255,0.03)',shareText:w.share!=null?w.share.toFixed(1)+'%':'…',shareW:w.share!=null?Math.min(100,w.share/6*100)+'%':'0%',shareColor:col||'#3a454c',badges:fl.map(badge)});",
+    "        const un=fl.includes('unread'), url=ex?ex.account(FULL[w.addr]||w.addr):'';\n"
+    "        rows.push({rank,addr:w.addr,addrColor:un?'#5f6b72':'#dfe5e8',bg:un?'transparent':col?rgba(col,fresh?0.2:(wo.w?0.06:0.025)):'rgba(159,217,255,0.03)',shareText:w.share!=null?w.share.toFixed(1)+'%':'…',shareW:w.share!=null?Math.min(100,w.share/6*100)+'%':'0%',shareColor:un?'#2c353b':col||'#3a454c',badges:fl.map(badge),url,hasUrl:!!url,noUrl:!url});")
+
+# лог связи: где (блок / слот / транзакция / раздатчик)
+rep("this.log('link',e.level==='proven'?RD:A,`${e.wallet} ⇄ ${e.b} · ${e.level}`); break;",
+    "this.log('link',e.level==='proven'?RD:A,`${e.wallet} ⇄ ${e.b} · ${e.level}`+(e.where?` · ${e.where}`:'')); break;")
+
+# части скора и критерии: оператор — по dump impact; стая — слоты на Solana
+rep("return {label:k,text:v!=null?`${v} / ${max}`:`— / ${max}`,",
+    "return {label:k==='operator'?'operator (dump impact)':k,text:v!=null?`${v} / ${max}`:`— / ${max}`,")
+rep("w:(r*100)+'%',color:r>0.66?RD:r>0.33?A:G};});", "w:(r*100)+'%',color:r>=0.8?G:r>=0.4?A:RD};});")   # баллы части: больше = чище = зелёный
+rep("    const lvl=r=>r>=0.6?RD:r>0.2?A:G;",
+    "    const lvl=r=>r>=0.8?G:r>=0.4?A:RD, slots=chainOf(m.ca)==='solana', imp=fmtImpact(res&&res.impact);")   # r — доля набранных баллов: больше = чище
+rep("{name:'Operator clustering',desc:'Linked wallets collapse into one operator',find:n?`${n} wallets → ${ops} operators`+(big.length>1?` · biggest: ${big.length} wallets, ${pct(big)}`:''):null,",
+    "{name:'Operator clustering',desc:'Linked wallets collapse into one operator, scored by dump impact',find:n?`${n} wallets → ${ops} operators`+(big.length>1?` · biggest: ${big.length} wallets, ${pct(big)}`:'')+(done&&imp?` · dump ${imp}`:''):null,")
+rep("desc:'3+ fresh wallets buying in one block with matching sizes',find:n?(pk.length?`${pk.length} pack · ${pk[0].wallets.length} wallets in one block`",
+    "desc:slots?'3+ fresh wallets buying within 2 slots with matching sizes':'3+ fresh wallets buying in one block with matching sizes',find:n?(pk.length?`${pk.length} pack · ${pk[0].wallets.length} wallets `+(slots?'within 2 slots':'in one block')")
+
+# состояние: сеть, сообщение под полем, флаг Solana с сервера
+rep("  state={view:'landing',input:'',inputError:'',copied:false,v:0};",
+    "  state={view:'landing',input:'',inputError:'',inputNotice:'',net:'robinhood',solanaOn:null,copied:false,v:0};")
+rep("    window.handleResult=r=>this.handleResult(r);\n",
+    "    window.handleResult=r=>this.handleResult(r);\n"
+    "    this.cfg=fetch('/api/config').then(r=>r.json()).then(d=>this.setState({solanaOn:!!d.solana})).catch(()=>{});\n")
+# ?ca= с солановским адресом: сначала флаг Solana с сервера, иначе лишний POST и 400 в консоли
+rep("    if(ca) this.startScan(ca,true); else this.toLanding(true);",
+    "    if(ca&&chainOf(ca.trim())==='solana'&&this.state.solanaOn==null&&this.cfg){const c=this.cfg; this.cfg=null; c.then(()=>this.fromUrl()); return;}\n"
+    "    if(ca) this.startScan(ca,true); else this.toLanding(true);")
+rep("    const ca=(raw||'').trim();\n    if(!/^0x[0-9a-fA-F]{6,}$/.test(ca)){this.setState({inputError:'enter a 0x… contract address'});return;}",
+    "    const ca=(raw||'').trim(), net=chainOf(ca);   // регистр не меняем: base58 чувствителен к регистру\n"
+    "    if(!net){this.setState({inputError:'enter a token address: 0x… (Robinhood) or base58 (Solana)',inputNotice:''});return;}\n"
+    "    if(net==='solana'&&this.state.solanaOn===false){this.soon(ca);return;}")
+rep("    this.setState({view:'scan',input:'',inputError:'',copied:false});",
+    "    this.setState({view:'scan',input:'',inputError:'',inputNotice:'',net,copied:false});")
+rep("  blank(ca){return {", """  soon(ca){   // Solana выключена: лендинг, адрес в поле, сообщение под ним (не красная поломка)
+    this.stopFeed(); clearInterval(this.timer);
+    if(location.search) history.replaceState(null,'',location.pathname);
+    this.links=[]; this.clusters=[];
+    const was=this.state.view;
+    this.setState({view:'landing',input:ca,inputError:'',inputNotice:SOON,net:'solana'});
+    if(was!=='landing'){window.scrollTo(0,0); this.startLanding();}
+  }
+  netVals(){
+    const net=this.state.net, ch=chainOf(this.m.ca)||'robinhood', ex=EXPLORER[ch];
+    const st=on=>on?{c:'#eef1f3',b:'rgba(0,200,5,0.55)',g:'rgba(0,200,5,0.1)'}:{c:'#5f6b72',b:'#1c252b',g:'transparent'};
+    const rh=st(net==='robinhood'), so=st(net==='solana');
+    const pick=n=>()=>this.setState({net:n,inputError:'',inputNotice:''});
+    return {placeholder:PLACEHOLDER[net], netLine:NET_LINE[net], inputNotice:this.state.inputNotice,
+      rhColor:rh.c, rhBorder:rh.b, rhBg:rh.g, solColor:so.c, solBorder:so.b, solBg:so.g,
+      solSoon:this.state.solanaOn===false, pickRh:pick('robinhood'), pickSol:pick('solana'),
+      chainLabel:CHAIN_NAME[ch], caUrl:ex?ex.token(this.m.ca):'', caLink:!!ex, caPlain:!ex};
+  }
+  blank(ca){return {""")
+rep("      onInput:e=>this.setState({input:e.target.value,inputError:''}),",
+    "      onInput:e=>{const v=e.target.value, c=chainOf(v.trim()); this.setState(c?{input:v,inputError:'',inputNotice:'',net:c}:{input:v,inputError:'',inputNotice:''});},\n"
+    "      ...this.netVals(),")
+
+
+# суммы меньше $1K — без хвоста знаков (тонкая ликвидность на Solana)
+rep("':'$'+v;", "':'$'+(v>=10?Math.round(v):v.toFixed(2));")
 
 enc = encode(t)
 TITLE_OLD = '<title>Bundled Page</title>'

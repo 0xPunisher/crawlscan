@@ -1,5 +1,6 @@
 """Тесты HTTP-сервера: настоящий ThreadingHTTPServer на свободном порту, движок на подставном адаптере."""
-import json, threading, time, unittest, urllib.error, urllib.request
+import json, os, threading, time, unittest, urllib.error, urllib.request
+from unittest import mock
 from http.server import ThreadingHTTPServer
 
 import fakes
@@ -53,6 +54,19 @@ class TestServer(unittest.TestCase):
     def test_health(self):
         code, d, _ = self.request("/health")
         self.assertEqual((code, d), (200, {"ok": True}))
+
+    def test_config_solana_flag(self):
+        for value, on in (("true", True), ("false", False)):
+            with mock.patch.dict(os.environ, {"SOLANA_ENABLED": value}):
+                code, d, _ = self.request("/api/config")
+            self.assertEqual((code, d), (200, {"solana": on}))
+
+    def test_solana_coming_soon(self):
+        sol_ca = "fjKUqPWK9m331Y5TZZNFismtqoP2MGWAMHEkB62pump"
+        with mock.patch.dict(os.environ, {"SOLANA_ENABLED": "false"}):
+            code, d, _ = self.request("/api/scan", {"token": sol_ca})
+        self.assertEqual((code, d), (400, {"error": "Solana support is coming soon"}))
+        self.assertFalse(ch.get_launch.called)
 
     def test_scan_bad_address(self):
         for bad in ("0x123", "", "not an address"):

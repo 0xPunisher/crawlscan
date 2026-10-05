@@ -6,6 +6,8 @@ import detect as d
 SUPPLY = 10_000             # 1% сапплая = 100
 ZERO = "0x" + "0" * 40
 CURVE = "0xcurve"
+POOL = "0xpool"             # пул после миграции (ликвидность)
+LOCKER = "0xlocker"         # инфраструктура, не ликвидность
 ROUTER = "0xrouter"         # сторонний бот-роутер (контракт)
 BUNDLER = "0xbundler"       # контракт, раздавший токен одной транзакцией
 HUB = "0xhub"               # биржа: ≥ 100 исходящих ETH-переводов
@@ -17,11 +19,12 @@ ETH = 10 ** 18
 class Scenario:
     """Собирает переводы токена и данные по кошелькам и прогоняет весь detect."""
 
-    def __init__(self):
-        self.transfers = [{"frm": ZERO, "to": CURVE, "amount": SUPPLY, "tx": "0xmint", "block": LAUNCH_BLOCK}]
+    def __init__(self, supply=SUPPLY):
+        self.supply = supply
+        self.transfers = [{"frm": ZERO, "to": CURVE, "amount": supply, "tx": "0xmint", "block": LAUNCH_BLOCK}]
         self.data, self.inflows, self.outgoing = {}, {}, {}
-        self.contracts = {CURVE, ROUTER, BUNDLER}
-        self.excluded = {ZERO, CURVE}
+        self.contracts = {CURVE, ROUTER, BUNDLER, POOL, LOCKER}
+        self.excluded = {ZERO, CURVE, POOL, LOCKER}
         self.n = 0
 
     def wallet(self, amount, kind="buy", via=CURVE, tx=None, block=None, dt=600,
@@ -47,12 +50,21 @@ class Scenario:
                         "inflows": inflows, "sold": False}
         return w
 
+    def move(self, to, amount):
+        """Токены из кривой в инфраструктуру (миграция в пул, локер)."""
+        self.transfers.append({"frm": CURVE, "to": to, "amount": amount, "tx": f"0xmove{to}", "block": 9999})
+
     def normal(self, k, share=100):
         """k обычных старых кошельков: разные блоки, суммы, фандеры."""
         return [self.wallet(share + 7 * i) for i in range(k)]
 
-    def run(self):
-        self.base = d.supply_base(self.transfers, SUPPLY, self.excluded)
+    def run(self, liquidity_usd=None):
+        self.base = d.supply_base(self.transfers, self.supply, self.excluded)
+        bal = {}
+        for t in self.transfers:
+            bal[t["frm"]] = bal.get(t["frm"], 0) - t["amount"]
+            bal[t["to"]] = bal.get(t["to"], 0) + t["amount"]
+        self.reserve = bal.get(CURVE, 0) + bal.get(POOL, 0)   # ликвидность: кривая + пул
         self.holders = d.top_holders(self.base)
         hs = [a for a, _, _ in self.holders]
         self.signals = d.wallet_signals({w: self.data[w] for w in hs}, LAUNCH_TS, DEPLOYER)
@@ -60,8 +72,8 @@ class Scenario:
         self.links = d.find_links(hs, self.transfers, self.signals, self.inflows, self.outgoing,
                                   self.contracts, self.excluded, self.packs)
         self.ops = d.operators(self.holders, self.links, self.packs,
-                               self.base["circulating"] / SUPPLY)
-        self.score = d.score(self.holders, self.signals, self.ops, self.base)
+                               self.base["circulating"] / self.supply)
+        self.score = d.score(self.holders, self.signals, self.ops, self.base, self.reserve, liquidity_usd)
         return self
 
 
@@ -158,8 +170,79 @@ class TestDetect(unittest.TestCase):
         self.assertAlmostEqual(top["share"], 0.20)                # 20% оборота
         self.assertAlmostEqual(top["share_supply"], 0.02)         # и от сапплая
         self.assertAlmostEqual(s.holders[0][2], 0.20)
-        self.assertAlmostEqual(s.score["parts"]["operator"], 8.75, delta=0.1)  # из 35: 35*(25-20)/(25-5)
-        self.assertIn("20.0% of float (2.0% of supply)", s.score["headline"])
+        # кривая держит 9000: продажа 200 уронит цену на 1 - (9000/9200)^2 ≈ 4.3% → полные 35 баллов
+        self.assertAlmostEqual(s.score["metrics"]["impact"], 1 - (9000 / 9200) ** 2)
+        self.assertEqual(s.score["parts"]["operator"], 35)
+        self.assertIn("20.0% of float (2.0% of supply), could move price −4% if sold", s.score["headline"])
+
+    def test_h_dump_impact(self):
+        self.assertEqual(d.dump_impact(0, 100), 0.0)
+        self.assertEqual(d.dump_impact(10, 0), 1.0)                       # продать некуда
+        self.assertAlmostEqual(d.dump_impact(100, 100), 0.75)             # 1 - (1/2)^2
+        self.assertAlmostEqual(d.dump_impact(2000, 3000), 1 - 0.6 ** 2)
+
+    def test_i_migrated_small_wallet_not_danger(self):
+        # мигрировал: 99.9% сапплая в пуле; кошелёк с 0.1% сапплая = ~72% крошечного оборота
+        s = Scenario(supply=1_000_000)
+        whale = s.wallet(1000)
+        for i in range(19):
+            s.wallet(20)
+        s.move(POOL, 1_000_000 - 1000 - 19 * 20)
+        s.run()
+        self.assertEqual(s.ops[0]["wallets"], [whale])
+        self.assertGreater(s.ops[0]["share"], 0.30)                       # раньше это было стоп-правило
+        self.assertAlmostEqual(s.ops[0]["share_supply"], 0.001)
+        self.assertLess(s.score["metrics"]["impact"], 0.01)
+        self.assertEqual(s.score["parts"]["operator"], 35)
+        self.assertNotEqual(s.score["band"], "DANGER")
+        self.assertFalse([g for g in s.score["gates"] if "operator" in g])
+        self.assertNotIn("could move price", s.score["headline"])            # < 1% и групп нет — фразы нет
+
+    def test_j_operator_20pct_vs_30pct_reserve_danger(self):
+        # оператор держит 20% сапплая, в ликвидности 30%: 1 - (0.3/0.5)^2 = 64% ≥ 50% → DANGER
+        s = Scenario()
+        whale = s.wallet(2000)
+        s.normal(19, share=50)                                            # 19 кошельков: 50..176
+        rest = SUPPLY - 2000 - sum(50 + 7 * i for i in range(19))
+        s.move(POOL, 3000)
+        s.move(LOCKER, rest - 3000)
+        s.run()
+        self.assertEqual(s.reserve, 3000)
+        self.assertEqual(s.ops[0]["wallets"], [whale])
+        self.assertAlmostEqual(s.score["metrics"]["impact"], 1 - 0.6 ** 2)
+        self.assertEqual(s.score["parts"]["operator"], 0)                 # ≥ 60% → 0 баллов
+        self.assertEqual(s.score["band"], "DANGER")
+        self.assertTrue(any(g.startswith("biggest operator could move price −64% if sold") for g in s.score["gates"]))
+
+
+    def test_k_impact_below_1pct_with_group(self):
+        # группа из 3 кошельков одной транзакцией, но в пуле 99.9% → "<1%"
+        s = Scenario(supply=1_000_000)
+        for _ in range(3):
+            s.wallet(100, kind="transfer", via=BUNDLER, tx="0xbundle", block=101)
+        for i in range(17):
+            s.wallet(20 + i)
+        s.move(POOL, 990_000)
+        s.run()
+        self.assertGreater(len(s.ops[0]["wallets"]), 1)
+        self.assertLess(s.score["metrics"]["impact"], 0.01)
+        self.assertIn("could move price <1% if sold", s.score["headline"])
+
+    def test_l_thin_liquidity_soft_rule(self):
+        def clean():
+            s = Scenario()
+            for i in range(20):
+                s.wallet(100 + 10 * i, eth_in=ETH // 20 + i * ETH // 100)
+            return s
+        ok = clean().run(liquidity_usd=None)                               # неизвестна — правило не применяем
+        self.assertIn(ok.score["band"], ("CLEAN", "OK"))
+        self.assertFalse([g for g in ok.score["gates"] if "liquidity" in g])
+        self.assertFalse([g for g in clean().run(liquidity_usd=1000).score["gates"] if "liquidity" in g])
+        thin = clean().run(liquidity_usd=114.2)
+        self.assertIn("soft: liquidity too thin ($114)", thin.score["gates"])
+        self.assertEqual(thin.score["band"], "RISKY")                      # не лучше RISKY
+        self.assertEqual(thin.score["score"], min(ok.score["score"], d.SOFT_GATE_SCORE))
+        self.assertEqual(thin.score["parts"], ok.score["parts"])           # части скора не меняются
 
 
 if __name__ == "__main__":
