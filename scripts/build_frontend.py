@@ -15,7 +15,8 @@
   - ссылки X и GitHub -> реальные адреса, в новой вкладке (target="_blank" rel="noopener");
   - роадмап: «Solana support (pump.fun)» — в SHIPPED; в NEXT первым «Early buyers crawl», за ним
     «All-chain support» (больше EVM-сетей и не только); Launch radar — в конец LATER;
-  - герой: «for Robinhood and Solana memecoins», Solana — цветом Solana (#9945FF);
+  - герой: обе сети — бейдж «memecoin holder scanner · Robinhood and Solana», заголовок «for Robinhood and
+    Solana memecoins», подпись под полем «… · Robinhood and Solana»; Solana — цветом Solana (#9945FF);
   - токен проекта: PONS -> страница токена, секция «the token» (чарт, coming soon, CA с copy)
     между «crawlers at work» и «how it works», строка CA с copy в герое;
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
@@ -87,7 +88,6 @@ const chainOf=a=>typeof a!=='string'?null:RH_RE.test(a)?'robinhood':SOL_RE.test(
 const CHAIN_NAME={robinhood:'Robinhood',solana:'Solana'};
 const SAMPLES=__SAMPLES__;
 const PLACEHOLDER={robinhood:'0x… token contract address',solana:'token mint address (base58)'};
-const NET_LINE={robinhood:'Robinhood Chain',solana:'Solana · pump.fun'};
 const SOON='Solana support is coming soon';
 const EXPLORER={solana:{account:a=>'https://solscan.io/account/'+a,token:a=>'https://solscan.io/token/'+a}};   // Robinhood: ссылок нет
 const FULL={};   // короткий адрес -> полный (ссылки на эксплорер)
@@ -243,6 +243,9 @@ rep('<span data-grip="1" style="color:#00c805">Robinhood</span><span data-grip="
     '<span data-grip="1" style="color:#00c805">Robinhood</span><span data-grip="1">and</span>'
     '<span data-grip="1" style="color:#9945FF">Solana</span><span data-grip="1" style="color:#00c805">memecoins</span>')
 
+rep('<span>memecoin holder scanner · Robinhood Chain</span>',
+    '<span>memecoin holder scanner · <span style="white-space:nowrap">Robinhood and <span style="color:#9945FF">Solana</span></span></span>')
+
 # соцсети: заглушки href="#" -> реальные ссылки в новой вкладке (X — в шапке и футере, GitHub — в футере)
 ext = lambda url: f'href="{url}" target="_blank" rel="noopener"'
 rep('<a href="#" data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">X</a>',
@@ -349,7 +352,7 @@ t = t[:mr.start()] + mr.group(1) + "04" + mr.group(2) + t[mr.end():]
 
 # строка CA в герое, под полем ввода
 rep('          <span>read-only · no wallet connect · Robinhood Chain</span>\n',
-    '          <span>read-only · no wallet connect · {{netLine}}</span>\n'
+    '          <span>read-only · no wallet connect · <span style="white-space:nowrap">Robinhood and <span style="color:#9945FF">Solana</span></span></span>\n'
     f'          <span style="display:inline-flex;align-items:center;gap:8px"><span style="color:#00c805">${TOKEN_TICKER}</span>'
     f'<span>CA:</span><span title="{TOKEN_CA}" style="color:#aab4ba">{TOKEN_CA_SHORT}</span>{copy_button("Hero", "copy token contract address")}</span>\n')
 
@@ -564,7 +567,7 @@ rep("  blank(ca){return {", """  soon(ca){   // Solana выключена: ле�
     const st=on=>on?{c:'#eef1f3',b:'rgba(0,200,5,0.55)',g:'rgba(0,200,5,0.1)'}:{c:'#5f6b72',b:'#1c252b',g:'transparent'};
     const rh=st(net==='robinhood'), so=st(net==='solana');
     const pick=n=>()=>this.setState({net:n,inputError:'',inputNotice:''});
-    return {placeholder:PLACEHOLDER[net], netLine:NET_LINE[net], inputNotice:this.state.inputNotice,
+    return {placeholder:PLACEHOLDER[net], inputNotice:this.state.inputNotice,
       rhColor:rh.c, rhBorder:rh.b, rhBg:rh.g, solColor:so.c, solBorder:so.b, solBg:so.g,
       solSoon:this.state.solanaOn===false, pickRh:pick('robinhood'), pickSol:pick('solana'),
       chainLabel:CHAIN_NAME[ch], caUrl:ex?ex.token(this.m.ca):'', caLink:!!ex, caPlain:!ex};
