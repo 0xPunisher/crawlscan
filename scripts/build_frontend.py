@@ -19,6 +19,7 @@
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
     переносы в логах, отступы 16 px;
   - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора;
+  - цвета частей скора и критериев: больше баллов = чище = зелёный, мало = красный;
   - две сети: сеть по адресу (0x + 40 hex — Robinhood, base58 32–44 — Solana, регистр Solana
     не меняется), переключатель «Robinhood | Solana» над полем (плейсхолдер и sample сети),
     бейдж сети у тикера, ссылки solscan для Solana (у Robinhood ссылок нет, как в дизайне),
@@ -498,7 +499,8 @@ rep("clean:{t:'clean',c:G,w:0,log:'clean'}};", "clean:{t:'clean',c:G,w:0,log:'cl
 rep("    const n=Math.max(20,m.wallets.length), rows=[], chips=[];",
     "    const n=Math.max(20,m.wallets.length), rows=[], chips=[], ex=EXPLORER[chainOf(m.ca)];")
 rep("rows.push({rank,addr:'0x····…····',addrColor:'#262f35',bg:'transparent',shareText:'',shareW:'0%',shareColor:'#1c252b',badges:[]});",
-    "rows.push({rank,addr:'0x····…····',addrColor:'#262f35',bg:'transparent',shareText:'',shareW:'0%',shareColor:'#1c252b',badges:[],url:'',hasUrl:false,noUrl:true});")
+    "rows.push({rank,addr:ex?'····…····':'0x····…····',addrColor:'#262f35',bg:'transparent',shareText:'',shareW:'0%',shareColor:'#1c252b',badges:[],url:'',hasUrl:false,noUrl:true});")
+rep("label:w?w.addr:'0x····',", "label:w?w.addr:(ex?'····':'0x····'),")   # чипы на сцене — так же
 rep("        rows.push({rank,addr:w.addr,addrColor:'#dfe5e8',bg:col?rgba(col,fresh?0.2:(wo.w?0.06:0.025)):'rgba(159,217,255,0.03)',shareText:w.share!=null?w.share.toFixed(1)+'%':'…',shareW:w.share!=null?Math.min(100,w.share/6*100)+'%':'0%',shareColor:col||'#3a454c',badges:fl.map(badge)});",
     "        const un=fl.includes('unread'), url=ex?ex.account(FULL[w.addr]||w.addr):'';\n"
     "        rows.push({rank,addr:w.addr,addrColor:un?'#5f6b72':'#dfe5e8',bg:un?'transparent':col?rgba(col,fresh?0.2:(wo.w?0.06:0.025)):'rgba(159,217,255,0.03)',shareText:w.share!=null?w.share.toFixed(1)+'%':'…',shareW:w.share!=null?Math.min(100,w.share/6*100)+'%':'0%',shareColor:un?'#2c353b':col||'#3a454c',badges:fl.map(badge),url,hasUrl:!!url,noUrl:!url});")
@@ -510,8 +512,9 @@ rep("this.log('link',e.level==='proven'?RD:A,`${e.wallet} ⇄ ${e.b} · ${e.leve
 # части скора и критерии: оператор — по dump impact; стая — слоты на Solana
 rep("return {label:k,text:v!=null?`${v} / ${max}`:`— / ${max}`,",
     "return {label:k==='operator'?'operator (dump impact)':k,text:v!=null?`${v} / ${max}`:`— / ${max}`,")
+rep("w:(r*100)+'%',color:r>0.66?RD:r>0.33?A:G};});", "w:(r*100)+'%',color:r>=0.8?G:r>=0.4?A:RD};});")   # баллы части: больше = чище = зелёный
 rep("    const lvl=r=>r>=0.6?RD:r>0.2?A:G;",
-    "    const lvl=r=>r>=0.6?RD:r>0.2?A:G, slots=chainOf(m.ca)==='solana', imp=fmtImpact(res&&res.impact);")
+    "    const lvl=r=>r>=0.8?G:r>=0.4?A:RD, slots=chainOf(m.ca)==='solana', imp=fmtImpact(res&&res.impact);")   # r — доля набранных баллов: больше = чище
 rep("{name:'Operator clustering',desc:'Linked wallets collapse into one operator',find:n?`${n} wallets → ${ops} operators`+(big.length>1?` · biggest: ${big.length} wallets, ${pct(big)}`:''):null,",
     "{name:'Operator clustering',desc:'Linked wallets collapse into one operator, scored by dump impact',find:n?`${n} wallets → ${ops} operators`+(big.length>1?` · biggest: ${big.length} wallets, ${pct(big)}`:'')+(done&&imp?` · dump ${imp}`:''):null,")
 rep("desc:'3+ fresh wallets buying in one block with matching sizes',find:n?(pk.length?`${pk.length} pack · ${pk[0].wallets.length} wallets in one block`",
