@@ -356,19 +356,22 @@ def _legs(tx, mint):
 _LAUNCH, _HOLDERS = {}, {}
 _PDA_SEEN = set()      # PDA-владельцы и PDA-контрагенты, встреченные по ходу скана (пулы, хранилища)
 _LABEL = {}            # адрес -> подпись для вывода (пул PumpSwap, кривая, ...)
+_OWNER_PROG = {}       # PDA -> программа-владелец
 _ENTRY_SIG = {}        # (кошелёк, слот входа) -> подпись входа, для wallet_distinct_tokens
 
 
 def _parse_curve(data_b64):
-    """BondingCurve: complete@48 (bool), creator@49..81 (есть не у всех старых кривых)."""
+    """BondingCurve: virtual_token_reserves@8 (u64), complete@48 (bool),
+    creator@49..81 (есть не у всех старых кривых)."""
     b = base64.b64decode(data_b64)
-    return {"complete": bool(b[48]) if len(b) > 48 else None,
+    return {"virtual_token_reserves": int.from_bytes(b[8:16], "little") if len(b) >= 16 else None,
+            "complete": bool(b[48]) if len(b) > 48 else None,
             "creator": b58encode(b[49:81]) if len(b) >= 81 else None}
 
 
 def get_launch(token):
     """{"block" (слот), "curve", "deployer", "tx", "ts", "curve_account", "creator",
-    "complete", "token_program"} или None (не pump.fun).
+    "complete", "virtual_token_reserves", "token_program"} или None (не pump.fun).
     Запуск = самая старая транзакция бондинг-кривой (create). История кривой короткая
     (после миграции кривая не торгуется), поэтому до дна mint не листаем.
     deployer — получатель дев-бая в транзакции запуска; нет дев-бая — creator."""
@@ -406,7 +409,8 @@ def get_launch(token):
                       if v > 0 and o != curve and not is_pda(o)), reverse=True)
         res = {"block": tx["slot"], "curve": curve, "deployer": dev[0][1] if dev else creator,
                "tx": s["signature"], "ts": tx.get("blockTime") or s["blockTime"], "curve_account": curve_ata,
-               "creator": creator, "complete": cs["complete"], "token_program": tprog}
+               "creator": creator, "complete": cs["complete"],
+               "virtual_token_reserves": cs["virtual_token_reserves"], "token_program": tprog}
         _LABEL[curve] = "bonding curve"
         _LAUNCH[token] = res
         return res
@@ -448,6 +452,7 @@ def top_accounts(token):
     if pdas:  # подписи PDA по программе-владельцу: одним вызовом
         for a, info in zip(pdas, rpc("getMultipleAccounts", [pdas, {"encoding": "base64", "dataSlice": {"offset": 0, "length": 0}}])["value"]):
             prog = info["owner"] if info else None
+            _OWNER_PROG[a] = prog
             _LABEL[a] = {PUMP_SWAP: "PumpSwap pool", PUMP: "pump.fun", SYSTEM: "system-owned PDA"}.get(prog, f"PDA of {DEX.get(prog, prog)}")
     for r in rows:
         if r["owner"] == BURN:
@@ -479,12 +484,23 @@ def supply_base(token, launch):
 
 def token_facts(token, launch):
     """Факты о токене для движка (общий контракт сетей): {"supply", "transfers", "excluded",
-    "market", "base"}. base — балансы топ-20 (форма detect.supply_base); transfers — только
-    по токен-аккаунтам холдеров топ-20 (продажи, раздатчики, прямые переводы, входы)."""
+    "market", "reserve", "base"}. base — балансы топ-20 (форма detect.supply_base); transfers — только
+    по токен-аккаунтам холдеров топ-20 (продажи, раздатчики, прямые переводы, входы).
+    reserve — токены ликвидности для dump_impact: на кривой — её virtual_token_reserves (по ним
+    кривая считает цену; нет поля — реальный баланс кривой), после миграции (complete) — реальный
+    баланс пулов: аккаунты топ-20, чей владелец — PDA DEX-программы (PumpSwap, Raydium, Meteora, ...)."""
     base = supply_base(token, launch)
     transfers = get_token_transfers(token, launch["block"])
+    rows = top_accounts(token)
+    if launch.get("complete"):
+        reserve = sum(r["amount"] for r in rows
+                      if r["owner"] != launch["curve"] and _OWNER_PROG.get(r["owner"]) in DEX)
+    elif launch.get("virtual_token_reserves"):
+        reserve = launch["virtual_token_reserves"]
+    else:
+        reserve = sum(r["amount"] for r in rows if r["owner"] == launch["curve"])
     return {"supply": base["supply"], "transfers": transfers, "excluded": excluded_addresses(launch["curve"]),
-            "market": market_addresses(launch["curve"]), "base": base}
+            "market": market_addresses(launch["curve"]), "reserve": reserve, "base": base}
 
 
 def market_addresses(curve):

@@ -38,7 +38,8 @@ def patched_chain(mod, token, wallets, entries, history, bal=None):
     p("get_launch", side_effect=lambda t: {"block": LAUNCH_SLOT, "curve": curve, "deployer": "deployer",
                                            "tx": "launch"} if t == token else None)
     p("token_facts", side_effect=lambda t, l: {"supply": SUPPLY, "transfers": [], "excluded": {curve},
-                                               "market": {curve}, "base": base})
+                                               "market": {curve}, "reserve": SUPPLY - base["circulating"],
+                                               "base": base})
     p("classify_entries", side_effect=lambda t, trs, ws: {w: entries[w] for w in ws})
     p("block_timestamps", side_effect=lambda blocks: {b: LAUNCH_TS + (b - LAUNCH_SLOT) for b in blocks})
     p("wallet_distinct_tokens", side_effect=history)
@@ -122,7 +123,58 @@ class TestPackWindow(unittest.TestCase):
         self.assertEqual(res["packs"], [])
 
 
+class TestSolanaReserve(unittest.TestCase):
+    """reserve в token_facts: на кривой — виртуальный резерв, после миграции — реальный баланс пула."""
+    POOL = sol.b58encode(bytes([9]) * 32)
+
+    def facts(self, complete, virtual):
+        rows = [{"account": "a1", "owner": SOL_CURVE, "amount": 700, "pda": True, "label": "bonding curve"},
+                {"account": "a2", "owner": self.POOL, "amount": 900, "pda": True, "label": "PumpSwap pool"},
+                {"account": "a3", "owner": SOL_WALLETS[0], "amount": 50, "pda": False, "label": "wallet"}]
+        launch = {"block": LAUNCH_SLOT, "curve": SOL_CURVE, "complete": complete, "virtual_token_reserves": virtual}
+        base = {"supply": 1650, "circulating": 50, "holders_total": 1, "balances": {SOL_WALLETS[0]: 50}}
+        with ExitStack() as st:
+            p = lambda name, **kw: st.enter_context(mock.patch.object(sol, name, **kw))
+            p("_post", side_effect=fakes._no_network)
+            p("supply_base", return_value=base)
+            p("get_token_transfers", return_value=[])
+            p("top_accounts", return_value=rows)
+            st.enter_context(mock.patch.dict(sol._OWNER_PROG, {self.POOL: sol.PUMP_SWAP, SOL_CURVE: sol.PUMP}))
+            return sol.token_facts(SOL_TOKEN, launch)
+
+    def test_curve_uses_virtual_reserves(self):
+        self.assertEqual(self.facts(False, 1_073_000)["reserve"], 1_073_000)
+
+    def test_curve_without_virtual_uses_real_balance(self):
+        self.assertEqual(self.facts(False, None)["reserve"], 700)
+
+    def test_migrated_uses_real_pool_balance(self):
+        self.assertEqual(self.facts(True, 1_073_000)["reserve"], 900)
+
+    def test_parse_curve_layout(self):
+        data = (b"\0" * 8 + (1_073_000_000_000_000).to_bytes(8, "little") + b"\0" * 32 + b"\1"
+                + sol.b58decode(SOL_WALLETS[1]))
+        cs = sol._parse_curve(sol.base64.b64encode(data).decode())
+        self.assertEqual(cs, {"virtual_token_reserves": 1_073_000_000_000_000, "complete": True,
+                              "creator": SOL_WALLETS[1]})
+
+
 class TestSolanaScan(unittest.TestCase):
+
+    def test_thin_liquidity_from_header(self):
+        """Ликвидность из шапки GeckoTerminal < $1,000 → мягкое правило; нет шапки — не применяется."""
+        entries = {w: buy(LAUNCH_SLOT + 300 + 10 * i, 10 ** 8, f"tx{i}") for i, w in enumerate(SOL_WALLETS)}
+        history = lambda w, b, t, window=None, cap=4: cap
+        for liq, thin in ((114.0, True), (None, False), (5000.0, False)):
+            with enabled(), patched_chain(sol, SOL_TOKEN, SOL_WALLETS, entries, history), \
+                    mock.patch.object(market, "fetch_market", return_value={"liquidity_usd": liq}):
+                res = engine.scan(SOL_TOKEN)
+            gate = [g for g in res["gates"] if "liquidity too thin" in g]
+            self.assertEqual(bool(gate), thin, liq)
+            if thin:
+                self.assertEqual(gate, ["soft: liquidity too thin ($114)"])
+                self.assertNotIn(res["band"], ("CLEAN", "OK"))
+                self.assertEqual(res["header"]["liquidity_usd"], 114.0)
 
     def test_unread_entries_not_virgin(self):
         entries = pack_entries(SOL_WALLETS, 10 ** 8)

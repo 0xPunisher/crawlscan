@@ -89,7 +89,8 @@ def _reason(sc, base):
     k = max(loss, key=loss.get)
     if loss[k] < 5:
         return "no clear signs of a single operator"
-    return {"operator": f"biggest operator holds {m['operator'] * 100:.1f}% of float",
+    return {"operator": f"biggest operator could move price −{m['impact'] * 100:.0f}% if sold "
+                        f"({m['operator'] * 100:.1f}% of float)",
             "virgin": f"{m['virgin'] * 100:.0f}% virgin wallets in top",
             "transfer": f"{m['transfer'] * 100:.1f}% of float received by transfer",
             "sniper": f"snipers hold {m['sniper'] * 100:.1f}% of float",
@@ -100,7 +101,8 @@ def scan(token, emit=lambda e: None):
     """Полный скан токена. emit(event) — события в формате README. Возвращает result (dict).
     ScanError — понятная ошибка (адрес, не Pons V2 / pump.fun, Solana выключена); прочие исключения — сбой.
     Факты о токене адаптер сети отдаёт в общей форме (token_facts): переводы, сапплай,
-    исключённые адреса, рынок и, если сеть знает балансы напрямую (Solana), base."""
+    исключённые адреса, рынок, резерв токенов ликвидности (reserve) и, если сеть знает
+    балансы напрямую (Solana), base."""
     t0 = time.time()
     deadline = t0 + BUDGET
     chain, token = chain_of(token)
@@ -197,9 +199,9 @@ def scan(token, emit=lambda e: None):
                wallet=o["wallets"][0], wallets=o["wallets"], level=o["level"],
                share=o["share"], share_supply=o["share_supply"])
 
-    sc = d.score(holders, sig, ops, base)
+    mkt_thread.join(timeout=max(0.0, deadline - time.time()))  # ликвидность из шапки нужна скору
+    sc = d.score(holders, sig, ops, base, facts["reserve"], mkt_box.get("liquidity_usd"))
     reason = _reason(sc, base)
-    mkt_thread.join(timeout=max(0.0, deadline - time.time()))
     meta = {}
     if not mkt_box.get("name"):
         meta = a.token_meta(token)
@@ -218,7 +220,7 @@ def scan(token, emit=lambda e: None):
                      "signals": sig[a]} for a, _, s in holders],
         "links": links, "packs": packs, "operators": ops,
         "score": sc["score"], "band": sc["band"], "parts": sc["parts"], "gates": sc["gates"],
-        "metrics": sc["metrics"], "headline": sc["headline"], "reason": reason,
+        "metrics": sc["metrics"], "headline": sc["headline"], "reason": reason, "reserve": facts["reserve"],
         "unread": unread, "use_funding": USE_FUNDING,
         "elapsed_s": elapsed, "rpc_requests": a.REQUESTS[0] - r0,
     }

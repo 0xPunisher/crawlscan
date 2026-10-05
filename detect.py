@@ -26,7 +26,7 @@ PACK_WEIGHT = 0.6          # вес стаи в доле оператора (д�
 # --- Скор (README «Скор») ---
 MIN_HOLDERS = 10           # меньше 10 холдеров (все ненулевые, без инфраструктуры) → «рано или поздно»
 WEIGHTS = {                # веса частей скора, сумма 100
-    "operator": 35,        # доля сапплая у крупнейшего оператора (с учётом веса)
+    "operator": 35,        # падение цены, если крупнейший оператор (с учётом веса) продаст всё в ликвидность
     "virgin": 25,          # доля девственных кошельков в топе (без деплоера)
     "transfer": 20,        # доля сапплая, полученного переводом, а не купленного
     "sniper": 10,          # сапплай снайперов (первые 30 с), ещё не проданный
@@ -36,13 +36,14 @@ WEIGHTS = {                # веса частей скора, сумма 100
 # Верхние границы трёх частей = стоп-правила README; остальные границы стартовые
 # (в README не заданы), калибруются на реальных токенах.
 SCALE = {
-    "operator":      (0.05, 0.25),  # README: 35 баллов при ≤ 5% оборота, 0 при ≥ 25%
+    "operator":      (0.10, 0.60),  # dump_impact: 35 баллов при ≤ 10% падения цены, 0 при ≥ 60%
     "virgin":        (0.10, 0.80),
     "transfer":      (0.01, 0.10),
     "sniper":        (0.01, 0.15),
     "concentration": (0.25, 0.70),
 }
-GATE_OPERATOR = 0.30       # стоп: крупнейший оператор с учётом веса ≥ 30% оборота
+GATE_IMPACT = 0.50         # стоп: продажа крупнейшего оператора уронит цену на ≥ 50%
+LIQ_MIN_USD = 1_000        # мягкое правило: ликвидность из шапки < $1,000 → band не лучше RISKY
 GATE_VIRGIN = 0.80         # стоп: девственных ≥ 80% топа ...
 GATE_VIRGIN_MIN = 5        # ... минимум 5 холдеров (без деплоера)
 GATE_TRANSFER = 0.10       # стоп: полученное переводом ≥ 10% оборота
@@ -236,22 +237,47 @@ def operators(holders, links, packs=(), supply_ratio=1.0):
     return out
 
 
+def dump_impact(q, reserve):
+    """На сколько (0..1) упадёт цена, если продать q токенов в ликвидность x*y=k с резервом
+    токенов reserve (пул после миграции или бондинг-кривая до): 1 - (R / (R + q))^2.
+    Нет резерва — продать некуда: 1.0 (если есть что продавать)."""
+    if q <= 0:
+        return 0.0
+    if not reserve or reserve <= 0:
+        return 1.0
+    return 1.0 - (reserve / (reserve + q)) ** 2
+
+
 def _part(name, x):
     good, bad = SCALE[name]
     k = 1.0 if x <= good else 0.0 if x >= bad else (bad - x) / (bad - good)
     return round(WEIGHTS[name] * k, 1)
 
 
-def score(holders, signals, ops, base):
+def _impact_phrase(impact, ops):
+    """Фраза о цене для headline: < 1% → "<1%"; без операторов из 2+ кошельков и < 1% — не показываем."""
+    if impact < 0.01:
+        return ", could move price <1% if sold" if any(len(o["wallets"]) > 1 for o in ops) else ""
+    return f", could move price −{impact * 100:.0f}% if sold"
+
+
+def score(holders, signals, ops, base, reserve, liquidity_usd=None):
     """Скор 0–100 (100 = чисто): {"score", "band", "parts", "gates", "metrics", "headline"}.
-    Все метрики — доли оборота. parts — баллы по пяти частям README.
+    reserve — резерв токенов ликвидности (сырые единицы): баланс пула после миграции или кривой до.
+    Часть "operator" и её стоп-правило — от dump_impact крупнейшего оператора (q = взвешенная доля
+    оборота × оборот), metrics["impact"]; metrics["operator"] — его взвешенная доля оборота (для информации).
+    Остальные метрики — доли оборота. parts — баллы по пяти частям README.
+    liquidity_usd — ликвидность из шапки токена; < LIQ_MIN_USD → мягкое правило (band не лучше RISKY),
+    None (неизвестна) — правило не применяется.
     gates — сработавшие стоп-правила: жёсткие (→ DANGER) и мягкие с префиксом "soft:"
     (стая или доказанный оператор из ≥ 3 кошельков → score не выше 59, band не лучше RISKY).
     Меньше MIN_HOLDERS холдеров (base["holders_total"]) → score None, band TOO_EARLY_OR_LATE."""
     n = len(holders)
     big = ops[0] if ops else {"share": 0.0, "share_supply": 0.0, "weighted": 0.0, "wallets": []}
+    impact = dump_impact(big["weighted"] * base["circulating"], reserve)
     headline = (f"{n} wallets → {len(ops)} operators, biggest holds "
-                f"{big['share'] * 100:.1f}% of float ({big['share_supply'] * 100:.1f}% of supply)")
+                f"{big['share'] * 100:.1f}% of float ({big['share_supply'] * 100:.1f}% of supply)"
+                + _impact_phrase(impact, ops))
     if base["holders_total"] < MIN_HOLDERS:
         return {"score": None, "band": TOO_EARLY, "parts": {}, "gates": [], "metrics": {}, "headline": headline}
 
@@ -260,15 +286,17 @@ def score(holders, signals, ops, base):
     virgins = [a for a in non_dev if signals[a]["virgin"]]
     m = {
         "operator": big["weighted"],
+        "impact": impact,
         "virgin": len(virgins) / len(non_dev) if non_dev else 0.0,
         "transfer": sum(s for a, s in share.items() if signals[a]["kind"] == "transfer"),
         "sniper": sum(share[a] for a in non_dev if signals[a]["sniper"]),
         "concentration": sum(share.values()),
     }
-    parts = {k: _part(k, m[k]) for k in WEIGHTS}
+    parts = {k: _part(k, m["impact"] if k == "operator" else m[k]) for k in WEIGHTS}
     gates = []
-    if m["operator"] >= GATE_OPERATOR:
-        gates.append(f"biggest operator holds {m['operator'] * 100:.1f}% of float (≥ {GATE_OPERATOR * 100:.0f}%)")
+    if m["impact"] >= GATE_IMPACT:
+        gates.append(f"biggest operator could move price −{m['impact'] * 100:.0f}% if sold "
+                     f"(≥ {GATE_IMPACT * 100:.0f}%; {m['operator'] * 100:.1f}% of float)")
     if len(non_dev) >= GATE_VIRGIN_MIN and m["virgin"] >= GATE_VIRGIN:
         gates.append(f"{m['virgin'] * 100:.0f}% virgin wallets in top (≥ {GATE_VIRGIN * 100:.0f}%)")
     if m["transfer"] >= GATE_TRANSFER:
@@ -280,7 +308,9 @@ def score(holders, signals, ops, base):
     for o in groups:
         gates.append(f"soft: {'pack of' if o['level'] == 'pack' else 'proven operator of'} "
                      f"{len(o['wallets'])} wallets, {o['share'] * 100:.1f}% of float")
-    if groups:
+    if liquidity_usd is not None and liquidity_usd < LIQ_MIN_USD:
+        gates.append(f"soft: liquidity too thin (${liquidity_usd:,.0f})")
+    if any(g.startswith("soft:") for g in gates):
         total = min(total, SOFT_GATE_SCORE)
     band = "DANGER" if hard else next((b for lim, b in BANDS if total >= lim), "DANGER")
     return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline}
