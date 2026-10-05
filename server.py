@@ -115,6 +115,8 @@ class H(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/health":
             return self._send(200, {"ok": True})
+        if u.path == "/api/config":  # фронт: какие сети включены (Solana — флаг SOLANA_ENABLED)
+            return self._send(200, {"solana": engine.solana_enabled()})
         if u.path == "/api/events":
             job = self._job(q)
             if job is None:

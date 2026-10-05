@@ -14,6 +14,7 @@ import market
 
 BUDGET = 25.0          # секунд на весь скан (README)
 DETECT_RESERVE = 1.0   # секунд оставляем на detect и события после чтения кошельков
+MARKET_WAIT = 3.0      # шапку GeckoTerminal ждём не дольше стольких секунд от старта скана
 WORKERS = 12           # потоков чтения истории кошельков; лимитер RPS в адаптере общий
 SPIDERS = 6            # пауков; кошельки раздаются по кругу
 HIST_CAP = d.SHORT_HISTORY_MAX + 1  # монеты до входа считаем до 4: важно 0 / 1..3 / больше
@@ -199,15 +200,17 @@ def scan(token, emit=lambda e: None):
                wallet=o["wallets"][0], wallets=o["wallets"], level=o["level"],
                share=o["share"], share_supply=o["share_supply"])
 
-    mkt_thread.join(timeout=max(0.0, deadline - time.time()))  # ликвидность из шапки нужна скору
-    sc = d.score(holders, sig, ops, base, facts["reserve"], mkt_box.get("liquidity_usd"))
+    # ликвидность из шапки нужна скору; не пришла за MARKET_WAIT — скор без правила ликвидности
+    mkt_thread.join(timeout=max(0.0, t0 + MARKET_WAIT - time.time()))
+    gt = dict(mkt_box)   # снимок: поздний ответ GT не меняет уже посчитанный результат
+    sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"))
     reason = _reason(sc, base)
     meta = {}
-    if not mkt_box.get("name"):
+    if not gt.get("name"):
         meta = a.token_meta(token)
-    header = {"name": mkt_box.get("name") or meta.get("name"), "ticker": mkt_box.get("ticker") or meta.get("symbol"),
-              "price_usd": mkt_box.get("price_usd"), "mcap_usd": mkt_box.get("mcap_usd"),
-              "liquidity_usd": mkt_box.get("liquidity_usd"), "vol24h_usd": mkt_box.get("vol24h_usd"),
+    header = {"name": gt.get("name") or meta.get("name"), "ticker": gt.get("ticker") or meta.get("symbol"),
+              "price_usd": gt.get("price_usd"), "mcap_usd": gt.get("mcap_usd"),
+              "liquidity_usd": gt.get("liquidity_usd"), "vol24h_usd": gt.get("vol24h_usd"),
               "age_h": round((time.time() - ts[launch["block"]]) / 3600, 1)}
     elapsed = round(time.time() - t0, 1)
     ev("done", reason, score=sc["score"], band=sc["band"], headline=sc["headline"])

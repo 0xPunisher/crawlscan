@@ -112,5 +112,43 @@ class TestScan(unittest.TestCase):
         self.assertEqual(res["token"], fakes.TOKEN)
 
 
+class TestMarketTimeout(unittest.TestCase):
+    """Шапка GeckoTerminal не задерживает скан: ≤ 3 с на запрос, движок ждёт ≤ MARKET_WAIT от старта."""
+
+    def test_slow_header_not_awaited(self):
+        def slow(token, network="robinhood"):
+            time.sleep(1.5)
+            return {"name": "Late", "liquidity_usd": 10.0}
+        with fakes.patched(), mock.patch.object(fakes.market, "fetch_market", side_effect=slow), \
+                mock.patch.object(engine, "MARKET_WAIT", 0.2):
+            t0 = time.time()
+            res, events = TestScan.scan(self)
+            elapsed = time.time() - t0
+        self.assertLess(elapsed, 1.0)                                    # не ждали 1.5 с
+        self.assertFalse([g for g in res["gates"] if "liquidity" in g])  # скор без правила ликвидности
+        self.assertIsNone(res["header"]["liquidity_usd"])
+        self.assertEqual(res["header"]["ticker"], "SYN")                 # имя — из контракта
+        time.sleep(1.5)                                                  # поздний ответ GT не меняет результат
+        self.assertIsNone(res["header"]["liquidity_usd"])
+
+    def test_gt_budget(self):
+        self.assertLessEqual(fakes.market.GT_BUDGET, 3.0)
+        self.assertLessEqual(fakes.market._gt.__defaults__[0], 3.0)
+        timeouts = []
+
+        def rate_limited(req, timeout):
+            timeouts.append(timeout)
+            raise fakes.market.urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
+        with mock.patch.object(fakes.market.urllib.request, "urlopen", side_effect=rate_limited):
+            t0 = time.time()
+            with self.assertRaises(Exception):
+                fakes.market._gt("/robinhood/tokens/x", budget=0.8)
+            elapsed = time.time() - t0
+        self.assertLess(elapsed, 1.0)                                    # повторы на 429 — в пределах бюджета
+        self.assertTrue(timeouts and all(t <= 0.8 for t in timeouts))
+        with mock.patch.object(fakes.market.urllib.request, "urlopen", side_effect=rate_limited):
+            self.assertEqual(fakes.market.fetch_market(fakes.TOKEN), {})  # сбой шапки не фатален
+
+
 if __name__ == "__main__":
     unittest.main()
