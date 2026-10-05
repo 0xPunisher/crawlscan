@@ -8,14 +8,25 @@ Read-only: скан идёт в фоне, браузер опрашивает с
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
   GET  /health
 
+Розыгрыш среди холдеров (только при DRAW_ENABLED=true, иначе 404; status отвечает всегда):
+  GET  /api/draw/status                  -> включено ли, токен, следующий розыгрыш, снимки и веса за сегодня
+  GET  /api/draw/latest                  -> последний розыгрыш
+  GET  /api/draw/history?limit=30        -> розыгрыши, новые первыми (limit до 365)
+  GET  /api/draw/<YYYY-MM-DD>/participants -> полный список участников с весами
+  GET  /api/draw/<YYYY-MM-DD>/verify     -> входные данные и пересчёт победителя
+  POST /api/draw/<YYYY-MM-DD>/payout     -> админ: X-Admin-Token == ADMIN_TOKEN,
+                                            {"prize_amount", "prize_currency", "payout_tx"}; иначе 403
+
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
 """
-import json, os, threading, time, uuid
+import hmac, json, os, re, threading, time, uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import engine
+import draw_service as ds
+from draw_store import Store
 
 CACHE_TTL = 600            # секунд: кэш результата по токену
 MAX_CONCURRENT = 3         # одновременных сканов
@@ -83,6 +94,27 @@ def start_scan(token):
     return jid
 
 
+DRAW_PATH = re.compile(r"^/api/draw/(\d{4}-\d{2}-\d{2})/(participants|verify|payout)$")
+_stores, _stores_lock = {}, threading.Lock()
+
+
+def draw_store():
+    """Хранилище розыгрыша (одно на путь DRAW_DB_PATH) или None, если розыгрыш выключен."""
+    if not ds.enabled():
+        return None
+    path = os.environ.get("DRAW_DB_PATH") or ""
+    with _stores_lock:
+        if path not in _stores:
+            _stores[path] = Store(path or None)
+        return _stores[path]
+
+
+def admin_ok(header):
+    """X-Admin-Token совпадает с ADMIN_TOKEN (сравнение за постоянное время). Не задан ADMIN_TOKEN — всегда нет."""
+    token = os.environ.get("ADMIN_TOKEN") or ""
+    return bool(token) and bool(header) and hmac.compare_digest(header.encode(), token.encode())
+
+
 class H(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json", cache="no-store"):
         b = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -98,7 +130,61 @@ class H(BaseHTTPRequestHandler):
         with _lock:
             return JOBS.get(jid)
 
+    def _draw_payout(self, day):
+        if not admin_ok(self.headers.get("X-Admin-Token")):
+            return self._send(403, {"error": "forbidden"})
+        store = draw_store()
+        if store is None:
+            return self._send(404, {"error": "draw is disabled"})
+        try:
+            n = int(self.headers.get("content-length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            amount, currency, tx = body["prize_amount"], body["prize_currency"], body["payout_tx"]
+            if not isinstance(currency, str) or not isinstance(tx, str) or not currency or not tx \
+                    or isinstance(amount, bool) or float(amount) < 0:
+                raise ValueError
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return self._send(400, {"error": "need prize_amount, prize_currency, payout_tx"})
+        res = store.set_payout(day, amount, currency, tx)
+        if res == "not_found":
+            return self._send(404, {"error": "no draw for this day"})
+        if res in ("no_winner", "conflict"):
+            return self._send(409, {"error": "no winner, prize carries over" if res == "no_winner"
+                                    else "payout already recorded with another tx"})
+        return self._send(200, ds.draw_json(store.get_draw(day)))
+
+    def _draw_get(self, path, q):
+        if path == "/api/draw/status":
+            return self._send(200, ds.status_json(draw_store(), ds.config()))
+        store = draw_store()
+        if store is None:
+            return self._send(404, {"error": "draw is disabled"})
+        if path == "/api/draw/latest":
+            row = store.latest_draw()
+            return self._send(200, ds.draw_json(row)) if row else self._send(404, {"error": "no draws yet"})
+        if path == "/api/draw/history":
+            try:
+                limit = min(365, max(1, int((q.get("limit") or ["30"])[0])))
+            except ValueError:
+                limit = 30
+            return self._send(200, {"draws": [ds.draw_json(r) for r in store.history(limit)]})
+        m = DRAW_PATH.match(path)
+        if not m or m.group(2) == "payout":
+            return self._send(404, {"error": "not found"})
+        day, what = m.groups()
+        row = store.get_draw(day)
+        if not row:
+            return self._send(404, {"error": "no draw for this day"})
+        if what == "participants":
+            parts = store.participants(day)
+            return self._send(200, {"day": day, "list_hash": row["list_hash"], "total_weight": int(row["total_weight"]),
+                                    "participants": [{"address": a, "weight": w} for a, w in sorted(parts.items())]})
+        return self._send(200, ds.verify_json(store, day))
+
     def do_POST(self):
+        m = DRAW_PATH.match(urlparse(self.path).path)
+        if m and m.group(2) == "payout":
+            return self._draw_payout(m.group(1))
         if urlparse(self.path).path != "/api/scan":
             return self._send(404, {"error": "not found"})
         try:
@@ -115,6 +201,8 @@ class H(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/health":
             return self._send(200, {"ok": True})
+        if u.path.startswith("/api/draw/"):
+            return self._draw_get(u.path, q)
         if u.path == "/api/config":  # фронт: какие сети включены (Solana — флаг SOLANA_ENABLED)
             return self._send(200, {"solana": engine.solana_enabled()})
         if u.path == "/api/events":
@@ -156,7 +244,21 @@ class H(BaseHTTPRequestHandler):
         pass
 
 
+def start_draw_scheduler():
+    """Фоновый планировщик розыгрыша — только при DRAW_ENABLED=true и заданном DRAW_MINT."""
+    cfg = ds.config()
+    if not cfg["enabled"]:
+        return None
+    if not cfg["mint"]:
+        ds.log("DRAW_ENABLED=true, but DRAW_MINT is empty: scheduler not started")
+        return None
+    sch = ds.Scheduler(draw_store(), cfg)
+    sch.start()
+    return sch
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"rh-crawler on http://0.0.0.0:{port}", flush=True)
+    start_draw_scheduler()
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()

@@ -8,3 +8,4 @@ DEV_NOTES.md
 CLAUDE.md
 scripts/probe_*.py
 .claude/
+data/
