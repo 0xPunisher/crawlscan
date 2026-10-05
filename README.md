@@ -166,7 +166,8 @@ The result is intentionally simple:
 > **Complex on-chain investigation -> one understandable verdict.**
 
 <div align="center">
-<img src="assets/scan.png" alt="CRAWLSCAN scan result" width="100%">
+<img src="assets/scan.png" alt="CRAWLSCAN scan result" width="74%">
+<img src="assets/mobile.jpg" alt="CRAWLSCAN scan result on mobile" width="21%">
 </div>
 
 ## Self-learning intelligence
