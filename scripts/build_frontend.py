@@ -16,6 +16,8 @@
   - роадмап: Multichain первым в NEXT с бейджем «in progress», Launch radar — в конец LATER;
   - токен проекта: PONS -> страница токена, секция «the token» (чарт, coming soon, CA с copy)
     между «crawlers at work» и «how it works», строка CA с copy в герое;
+  - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
+    переносы в логах, отступы 16 px;
   - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора.
 
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
@@ -322,6 +324,113 @@ rep("      canvasRef:this.canvasRef, logRef:this.logRef,",
     "      copyCaHero:()=>this.copyCa('hero'), copyCaSection:()=>this.copyCa('section'),\n"
     "      caHeroDone:this.state.caCopied==='hero', caHeroIdle:this.state.caCopied!=='hero',\n"
     "      caSectionDone:this.state.caCopied==='section', caSectionIdle:this.state.caCopied!=='section',")
+
+# ---------------------------------------------------------------------------
+# телефон (≤ 640 px): без горизонтальной прокрутки и без обрезки. Классы cs-* навешиваются на
+# элементы дизайна, правила — в одном @media (инлайн-стили дизайна перебиваются !important).
+# ---------------------------------------------------------------------------
+MOBILE_CSS = """
+.cs-menu{display:none;position:relative}
+.cs-menu>summary{list-style:none}
+.cs-menu>summary::-webkit-details-marker{display:none}
+@media (max-width:640px){
+  .cs-wrap{padding-left:16px!important;padding-right:16px!important}
+  .cs-head{gap:12px!important}
+  .cs-nav{gap:14px!important}
+  .cs-wide{display:none!important}
+  .cs-menu{display:block}
+  .cs-demo-table{padding:10px 10px 10px 22px!important}
+  .cs-demo-head,.cs-demo-row{grid-template-columns:minmax(0,1fr) 52px!important;gap:6px 12px!important;padding-top:8px!important;padding-bottom:8px!important}
+  .cs-demo-head>:nth-child(3),.cs-demo-row>:nth-child(3){grid-column:1/-1}
+  .cs-scan-table{padding:0 92px 0 18px!important}
+  .cs-row-head,.cs-row{grid-template-columns:22px minmax(0,1fr) auto!important;gap:6px 10px!important;padding:8px!important}
+  .cs-row-head>:nth-child(4),.cs-row>:nth-child(4){grid-column:2/-1}
+  .cs-bar{display:none!important}
+  .cs-crit-head,.cs-crit-row{grid-template-columns:minmax(0,1fr) minmax(110px,140px)!important;gap:10px 14px!important;padding-left:14px!important;padding-right:14px!important}
+  .cs-crit-head>:first-child,.cs-crit-row>:first-child{grid-column:1/-1}
+  .cs-status{height:auto!important;min-height:52px;flex-wrap:wrap;font-size:13px!important;gap:6px 12px!important;padding-top:8px!important;padding-bottom:8px!important}
+  .cs-status>div{flex-wrap:wrap;gap:6px 10px!important}
+  .cs-status-ca{white-space:nowrap}
+  .cs-stage{white-space:normal!important;overflow:visible!important;text-overflow:clip!important}
+  .cs-log-line{white-space:normal!important;flex-wrap:wrap}
+  .cs-log-line>span{overflow:visible!important;text-overflow:clip!important;overflow-wrap:anywhere}
+}
+"""
+rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}" + MOBILE_CSS)
+
+# контейнеры секций и шапки: боковые отступы 16 px на телефоне
+n_wrap = t.count(' style="max-width:1280px;')
+if n_wrap < 5:
+    sys.exit(f"design.html: контейнеров max-width:1280px найдено {n_wrap} — сборка остановлена")
+t = t.replace(' style="max-width:1280px;', ' class="cs-wrap" style="max-width:1280px;')
+rep('class="cs-wrap" style="max-width:1280px;margin:0 auto;padding:0 32px;height:64px;',
+    'class="cs-wrap cs-head" style="max-width:1280px;margin:0 auto;padding:0 32px;height:64px;')
+
+# шапка: «how it works» и «roadmap» на телефоне уходят в компактное меню, X и PONS видны всегда
+rep('<nav style="display:flex;align-items:center;gap:28px;', '<nav class="cs-nav" style="display:flex;align-items:center;gap:28px;')
+rep('<a href="#how" sc-camel-on-click="{{navHow}}" data-grip="1"', '<a class="cs-wide" href="#how" sc-camel-on-click="{{navHow}}" data-grip="1"')
+rep('<a href="#roadmap" sc-camel-on-click="{{navRoadmap}}" data-grip="1"', '<a class="cs-wide" href="#roadmap" sc-camel-on-click="{{navRoadmap}}" data-grip="1"')
+menu_link = lambda handler, href, text: (f'<a href="{href}" sc-camel-on-click="{{{{{handler}}}}}" style="display:block;padding:10px 12px;'
+                                         f'border-radius:6px;color:#c9d1d6" style-hover="background:#121a1f;color:#ffffff">{text}</a>')
+MENU = ('<details class="cs-menu"><summary aria-label="menu" title="menu" style="display:flex;align-items:center;cursor:pointer;'
+        'color:#8a959c;padding:4px 2px">'
+        '<svg width="18" height="18" sc-camel-view-box="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" '
+        'stroke-linecap="round" style="display:block"><path d="M3 5h12M3 9h12M3 13h12"></path></svg></summary>'
+        '<div style="position:absolute;right:0;top:calc(100% + 14px);min-width:180px;display:flex;flex-direction:column;'
+        'padding:6px;border:1px solid #1c252b;border-radius:10px;background:#0b1013;box-shadow:0 12px 32px rgba(0,0,0,0.5);z-index:30">'
+        + menu_link("navToken", "#token", "the token") + menu_link("navHow", "#how", "how it works")
+        + menu_link("navRoadmap", "#roadmap", "roadmap") + '</div></details>')
+mr = re.search(r'(<a class="cs-wide" href="#roadmap"[^>]*>roadmap</a>)', t)
+if not mr:
+    sys.exit("design.html: не найден пункт roadmap в шапке — сборка остановлена")
+t = t[:mr.end()] + "\n" + MENU + t[mr.end():]
+# пункты меню закрывают его и прокручивают к секции
+rep("navRoadmap:e=>{e.preventDefault(); this.scrollToId('roadmap');},",
+    "navRoadmap:e=>{e.preventDefault(); this.closeMenu(); this.scrollToId('roadmap');},\n"
+    "      navToken:e=>{e.preventDefault(); this.closeMenu(); this.scrollToId('token');},")
+rep("navHow:e=>{e.preventDefault(); this.scrollToId('how');},",
+    "navHow:e=>{e.preventDefault(); this.closeMenu(); this.scrollToId('how');},")
+rep("  blank(ca){return {", "  closeMenu(){document.querySelectorAll('details.cs-menu').forEach(d=>d.removeAttribute('open'));}\n  blank(ca){return {")
+
+# демо-таблица на лендинге
+rep('padding:10px 14px 10px 44px;box-sizing:border-box">', 'padding:10px 14px 10px 44px;box-sizing:border-box" class="cs-demo-table">')
+rep('<div style="display:grid;grid-template-columns:minmax(120px,150px) 64px minmax(0,1fr);gap:16px;padding:10px 12px;',
+    '<div class="cs-demo-head" style="display:grid;grid-template-columns:minmax(120px,150px) 64px minmax(0,1fr);gap:16px;padding:10px 12px;')
+rep('<div data-grip="1" data-demo-row="{{$index}}" style=', '<div class="cs-demo-row" data-grip="1" data-demo-row="{{$index}}" style=')
+
+# таблица кошельков скана: на телефоне ранг · адрес · доля, флаги — второй строкой
+rep('<div data-table="1" style="flex:1 1 640px;min-width:0;padding:0 150px 0 40px;',
+    '<div class="cs-scan-table" data-table="1" style="flex:1 1 640px;min-width:0;padding:0 150px 0 40px;')
+rep('<div style="display:grid;grid-template-columns:28px minmax(120px,150px) minmax(110px,1fr) minmax(0,1.5fr);gap:16px;padding:10px 12px;',
+    '<div class="cs-row-head" style="display:grid;grid-template-columns:28px minmax(120px,150px) minmax(110px,1fr) minmax(0,1.5fr);gap:16px;padding:10px 12px;')
+rep('<div data-grip="1" data-row="{{r.addr}}" style=', '<div class="cs-row" data-grip="1" data-row="{{r.addr}}" style=')
+rep('<div style="flex:0 0 64px;height:3px;background:#141b20;', '<div class="cs-bar" style="flex:0 0 64px;height:3px;background:#141b20;')
+# подпись оператора у скобки: на узком экране — тремя короткими строками
+rep("ctx.fillStyle='#c9d1d6'; ctx.fillText(C.label2,x+12,mid+12);",
+    "ctx.fillStyle='#c9d1d6'; if(innerWidth<640) C.label2.split(' · ').forEach((s,i)=>ctx.fillText(s,x+12,mid+12+i*14)); else ctx.fillText(C.label2,x+12,mid+12);")
+
+# строка статуса скана: на телефоне переносится, стадия без многоточия
+rep('class="cs-wrap" style="max-width:1280px;margin:0 auto;padding:0 32px;height:52px;',
+    'class="cs-wrap cs-status" style="max-width:1280px;margin:0 auto;padding:0 32px;height:52px;')
+rep('<span data-grip="1" style="color:#9fd9ff">{{caShort}}</span>', '<span class="cs-status-ca" data-grip="1" style="color:#9fd9ff">{{caShort}}</span>')
+rep('<span style="color:#5f6b72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">· {{stage}}</span>',
+    '<span class="cs-stage" style="color:#5f6b72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">· {{stage}}</span>')
+
+# таблица критериев: на телефоне критерий во всю ширину, под ним finding и score
+rep('<div style="display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1.3fr) minmax(120px,170px);gap:20px;padding:12px 20px;',
+    '<div class="cs-crit-head" style="display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1.3fr) minmax(120px,170px);gap:20px;padding:12px 20px;')
+rep('<div data-grip="1" style="display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1.3fr) minmax(120px,170px);gap:20px;align-items:center;',
+    '<div class="cs-crit-row" data-grip="1" style="display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1.3fr) minmax(120px,170px);gap:20px;align-items:center;')
+
+# строки логов: на телефоне переносятся вместо обрезки
+rep('<div data-grip="1" style="display:flex;gap:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">',
+    '<div class="cs-log-line" data-grip="1" style="display:flex;gap:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">')
+rep('<div style="display:flex;gap:10px;white-space:nowrap;overflow:hidden">',
+    '<div class="cs-log-line" style="display:flex;gap:10px;white-space:nowrap;overflow:hidden">')
+rep('<div style="display:flex;gap:10px;white-space:nowrap">', '<div class="cs-log-line" style="display:flex;gap:10px;white-space:nowrap">')
+
+# чипы адресов на сцене: на узком экране круг уже, чтобы крайние чипы не выходили за экран
+rep("chips.push({left:(50+Math.cos(a)*38)+'%'", "chips.push({left:(50+Math.cos(a)*(innerWidth<640?31:38))+'%'")
 
 enc = encode(t)
 TITLE_OLD = '<title>Bundled Page</title>'
