@@ -282,6 +282,7 @@ Only one copy of the bot can poll Telegram at a time.
 * [x] **Operator clustering**: proven links and behavioural packs
 * [x] **Solana support (pump.fun)**: automatic chain detection, Solscan links
 * [x] **Dump-impact scoring** and liquidity guard
+* [x] **Telegram bot**: send a token address and get the verdict, score and key holder signals
 
 ### 🟢 In progress
 
@@ -295,9 +296,6 @@ Only one copy of the bot can poll Telegram at a time.
 
 * [ ] **All-chain support**
   More EVM chains and beyond: the same methodology, adapted to each chain's infrastructure.
-
-* [ ] **Telegram bot**
-  Send a token address in Telegram and get the verdict, score and key holder signals.
 
 * [ ] **Operator memory across launches**
   Recognise wallet clusters and behavioural patterns across multiple launches.
