@@ -1,7 +1,7 @@
 """Ручной запуск Rewards & Burns на реальном токене Robinhood Chain.
 
   python3 scripts/rewards_once.py --dry-run --day YYYY-MM-DD [--token 0x...]
-      розыгрыш за прошедшие сутки из блокчейна, без записи в базу: участники, топ-5 весов с шансом,
+      розыгрыш за сутки [22:00 UTC day-1, 22:00 UTC day) из блокчейна, без записи в базу: участники, топ-5 весов с шансом,
       list_hash, seed-блок, победитель, verify, время расчёта и число RPC-запросов;
   python3 scripts/rewards_once.py --day YYYY-MM-DD
       то же с записью в базу (DRAW_DB_PATH; идемпотентно), затем проверка сжиганий, выплат и сапплая.
@@ -36,7 +36,7 @@ def main():
         cfg["token"] = a.token.lower()
     token = cfg["token"]
     if time.time() < rw.seed_time(a.day):
-        sys.exit("рано: сутки ещё не закончились (seed — 00:01 UTC следующих суток)")
+        sys.exit("рано: seed-блока ещё нет (seed — 22:01 UTC дня розыгрыша)")
     if not a.dry_run:
         store = RewardsStore()
         row = rs.run_draw(store, cfg, a.day)

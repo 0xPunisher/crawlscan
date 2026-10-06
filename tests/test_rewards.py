@@ -1,6 +1,7 @@
 """Тесты Token Burn & Holder Rewards: правила (rewards.py), хранилище, оркестрация с подставной сетью, API."""
 import json, math, os, tempfile, threading, time, unittest, urllib.error, urllib.request
 from contextlib import ExitStack
+from datetime import datetime
 from http.server import ThreadingHTTPServer
 from unittest import mock
 
@@ -29,7 +30,7 @@ def blk(ts):
 
 
 def at(h, m=0, day_start=DAY_START):
-    """Блок в момент hh:mm суток."""
+    """Блок через h ч m мин от начала суток весов (22:00 UTC накануне)."""
     return blk(day_start + h * 3600 + m * 60)
 
 
@@ -42,12 +43,12 @@ class FakeChain:
         self.contracts = {CONTRACT}
         self.calls = {"seed": 0, "launch": 0}
         self.add(ZERO_, CURVE, 10 ** 9, LAUNCH)        # минт в кривую
-        self.add(CURVE, A, 1000, 20)                    # A держит весь день до 06:00
+        self.add(CURVE, A, 1000, 20)                    # A держит с начала суток
         self.add(CURVE, DEV, 5000, 20)                  # разработчик
         self.add(CURVE, CONTRACT, 300, 20)              # контракт
-        self.add(A, C, 400, at(6))                      # 06:00: A -> C
-        self.add(CURVE, B, 1000, at(12))                # 12:00: B купил
-        self.add(DEV, rw.DEAD, 100, at(15))             # сжигание разработчика
+        self.add(A, C, 400, at(6))                      # +6 ч (04:00 UTC): A -> C
+        self.add(CURVE, B, 1000, at(12))                # +12 ч (10:00 UTC): B купил
+        self.add(DEV, rw.DEAD, 100, at(15))             # +15 ч (13:00 UTC): сжигание разработчика
 
     def add(self, frm, to, amount, block, tx=None):
         t = {"frm": frm, "to": to, "amount": amount, "block": block, "tx": tx or f"0xtx{len(self.transfers):04d}",
@@ -100,14 +101,14 @@ ZERO_ = rw.ZERO
 class TestRules(unittest.TestCase):
 
     def test_time_weighted_half_day(self):
-        # купил в 12:00 и держал до конца суток — половина веса; A отдал 400 в 06:00
+        # купил через 12 ч после начала суток и держал до конца — половина веса; A отдал 400 через 6 ч
         trs = FakeChain().transfers
         ts_of = {t["block"]: T0 + t["block"] * BLOCK_SECONDS for t in trs}
         w = rw.time_weights(trs, DAY0, blk(DAY_END), ts_of, DAY_START, DAY_END)
         self.assertEqual(w[B], 500)                                   # 1000 * 12 ч / 24 ч
         self.assertEqual(w[A], 1000 * 6 // 24 + 600 * 18 // 24)       # 250 + 450 = 700
         self.assertEqual(w[C], 300)                                   # 400 * 18 / 24
-        self.assertEqual(w[DEV], (5000 * 15 + 4900 * 9) // 24)       # сжёг 100 в 15:00
+        self.assertEqual(w[DEV], (5000 * 15 + 4900 * 9) // 24)       # сжёг 100 через 15 ч
 
     def test_balance_before_day_and_sold_before(self):
         trs = [{"frm": ZERO_, "to": A, "amount": 10, "block": 5, "log_index": 0},
@@ -147,12 +148,51 @@ class TestRules(unittest.TestCase):
         self.assertEqual({d: t["tx"] for d, t in m.items()}, {DAY: "0xpay1", "2026-10-05": "0xpay2"})
         self.assertEqual(rw.match_payouts(draws, trs, [DEV], ts_of, {("0xpay1", 0), ("0xpay2", 0)}), {})
 
-    def test_total_burned_and_next_burn(self):
+    def test_total_burned(self):
         self.assertEqual(rw.total_burned(1000, 950, 30), 80)
-        self.assertEqual(rw.next_burn(DAY_START, 12), DAY_START + 12 * 3600)
-        self.assertEqual(rw.next_burn(DAY_START + 11 * 3600, 12), DAY_START + 12 * 3600)
-        self.assertEqual(rw.next_burn(DAY_START + 12 * 3600, 12), DAY_END)
-        self.assertEqual(rw.next_burn(DAY_START + 13 * 3600, 6), DAY_START + 18 * 3600)
+        self.assertEqual(rw.BURN_ADDRESS.lower(), rw.DEAD)
+        self.assertEqual(rw.BURN_SINKS, {rw.DEAD, ZERO_})
+
+
+def utc(s):
+    return int(datetime.fromisoformat(s + "+00:00").timestamp())
+
+
+class TestSchedule(unittest.TestCase):
+    """Расписание UTC: сжигания 10:00 и 22:00, розыгрыш 22:00 (расчёт 22:05), сутки [22:00 накануне, 22:00), seed 22:01."""
+
+    def test_draw_window_seed_and_run(self):
+        self.assertEqual(rw.day_bounds("2026-10-06"), (utc("2026-10-05T22:00:00"), utc("2026-10-06T22:00:00")))
+        self.assertEqual(rw.draw_at("2026-10-06"), utc("2026-10-06T22:00:00"))
+        self.assertEqual(rw.seed_time("2026-10-06"), utc("2026-10-06T22:01:00"))
+        self.assertEqual(rw.draw_time("2026-10-06"), utc("2026-10-06T22:05:00"))
+
+    def test_which_draw(self):
+        self.assertEqual(rw.next_draw(utc("2026-10-06T00:20:00")), ("2026-10-06", utc("2026-10-06T22:00:00")))
+        self.assertEqual(rw.day_key(utc("2026-10-05T22:00:00")), "2026-10-06")     # с 22:00 — сутки следующего розыгрыша
+        self.assertEqual(rw.day_key(utc("2026-10-06T21:59:59")), "2026-10-06")
+        self.assertEqual(rw.next_draw(utc("2026-10-06T22:00:00")), ("2026-10-07", utc("2026-10-07T22:00:00")))
+        self.assertEqual(rw.prev_day(utc("2026-10-06T22:03:00")), "2026-10-06")
+
+    def test_next_burns(self):
+        self.assertEqual(rw.next_burns(utc("2026-10-06T00:20:00"), 2), [utc("2026-10-06T10:00:00"), utc("2026-10-06T22:00:00")])
+        self.assertEqual(rw.next_burn(utc("2026-10-06T10:00:00")), utc("2026-10-06T22:00:00"))      # ровно 10:00 — уже следующее
+        self.assertEqual(rw.next_burns(utc("2026-10-06T22:30:00"), 2), [utc("2026-10-07T10:00:00"), utc("2026-10-07T22:00:00")])
+
+    def test_first_draw_by_default(self):
+        with mock.patch.dict(os.environ, {"REWARDS_START_DAY": ""}):
+            self.assertEqual(rs.config()["start_day"], "2026-10-06")
+        tmp = tempfile.TemporaryDirectory()
+        store = RewardsStore(os.path.join(tmp.name, "d.db"))
+        cfg = {"start_day": rs.FIRST_DAY}
+        try:
+            self.assertEqual(rs.pending_days(store, cfg, utc("2026-10-06T15:00:00")), [])           # релиз днём: ждём
+            self.assertEqual(rs.pending_days(store, cfg, utc("2026-10-06T22:04:59")), [])           # расчёт в 22:05
+            self.assertEqual(rs.pending_days(store, cfg, utc("2026-10-06T22:05:00")), ["2026-10-06"])
+            self.assertEqual(rs.pending_days(store, cfg, utc("2026-10-08T22:10:00")),                 # простой: наверстывает
+                             ["2026-10-06", "2026-10-07", "2026-10-08"])
+        finally:
+            store.close(); tmp.cleanup()
 
 
 class TestService(unittest.TestCase):
@@ -161,7 +201,7 @@ class TestService(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = RewardsStore(os.path.join(self.tmp.name, "draw.db"))
         self.cfg = {"enabled": True, "token": TOKEN, "dev_wallets": [DEV], "invalid_dev_wallets": [],
-                    "burn_interval_hours": 12.0, "start_day": DAY}
+                    "start_day": DAY}
         self.chain = FakeChain()
         self.st = self.chain.patch()
         self.st.__enter__()
@@ -244,7 +284,7 @@ class TestService(unittest.TestCase):
         row = rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY))
         win = row["winner"]
         self.assertEqual(rs.check_payouts(self.store, self.cfg), 0)    # выплаты нет
-        self.chain.add(DEV, win, 11, blk(DAY_END) + 10)                # 00:01:40 — раньше 00:05, не выплата
+        self.chain.add(DEV, win, 11, blk(DAY_END) + 10)                # 22:01:40 — раньше расчёта в 22:05, не выплата
         self.chain.add(OUTSIDER, win, 12, blk(rw.draw_time(DAY)) + 5)  # не с DEV_WALLETS
         self.assertEqual(rs.check_payouts(self.store, self.cfg), 0)
         pay = self.chain.add(DEV, win, 25, blk(rw.draw_time(DAY)) + 30)
@@ -264,8 +304,13 @@ class TestService(unittest.TestCase):
         self.assertEqual(st["total_burned"]["amount"], 50 + 100)       # minted - totalSupply + dead
         self.assertEqual((st["burned_by_dev"]["amount"], st["burned_by_dev"]["count"]), (100, 1))
         self.assertEqual(st["last_burn"]["amount"], 100)
-        self.assertEqual(st["next_burn"], "2026-10-05T12:00:00+00:00")
-        self.assertEqual(st["next_draw"], "2026-10-06T00:05:00+00:00")
+        # now = 2026-10-04 23:00 UTC: сутки весов розыгрыша 2026-10-05 уже идут
+        self.assertEqual(st["next_burns"], ["2026-10-05T10:00:00+00:00", "2026-10-05T22:00:00+00:00"])
+        self.assertEqual(st["next_burn"], "2026-10-05T10:00:00+00:00")
+        self.assertEqual((st["next_draw"], st["next_draw_day"]), ("2026-10-05T22:00:00+00:00", "2026-10-05"))
+        self.assertEqual(st["next_draw_runs_at"], "2026-10-05T22:05:00+00:00")
+        self.assertEqual((st["period_start"], st["period_end"]), ("2026-10-04T22:00:00+00:00", "2026-10-05T22:00:00+00:00"))
+        self.assertEqual(st["burn_address"], "0x000000000000000000000000000000000000dEaD")
         self.assertEqual((st["last_draw"]["day"], st["participants_last"], st["last_draw"]["payout_status"]), (DAY, 3, "pending"))
         self.assertAlmostEqual(st["last_draw"]["chance"], st["last_draw"]["weight"] / 1500)
 
@@ -279,11 +324,6 @@ class TestService(unittest.TestCase):
             sch.tick(now=rw.draw_time("2026-10-05") + 60)               # ошибка розыгрыша не роняет поток
         self.assertIsNone(self.store.get_draw("2026-10-05"))
 
-    def test_pending_days_start(self):
-        self.cfg["start_day"] = None
-        now = rw.draw_time(DAY) + 60
-        self.assertEqual(rs.pending_days(self.store, self.cfg, now), [])           # первый запуск: с сегодняшних суток
-        self.assertEqual(rs.pending_days(self.store, self.cfg, now + 86400), ["2026-10-05"])
 
 
 class TestRewardsAPI(unittest.TestCase):

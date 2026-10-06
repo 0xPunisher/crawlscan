@@ -4,8 +4,12 @@
 раздел «Rewards & Burns».
 
 Проверяемый выбор победителя (канонический список, list_hash, r, накопленная сумма) и verify —
-общие с солановским розыгрышем: draw.pick / draw.verify, они не зависят от сети. Время розыгрыша и
-seed — тоже как там: розыгрыш суток D в 00:05 UTC суток D+1, seed — первый блок с timestamp >= 00:01 UTC D+1.
+общие с солановским розыгрышем: draw.pick / draw.verify, они не зависят от сети.
+
+Расписание — фиксированное время UTC:
+  розыгрыш D (D — дата розыгрыша) — в 22:00 UTC суток D, расчёт в 22:05 UTC; сутки для среднего баланса —
+  [22:00 UTC D-1, 22:00 UTC D); seed — первый блок с timestamp >= 22:01 UTC D;
+  плановые сжигания — 10:00 и 22:00 UTC каждый день (только таймер).
 
 Единицы: балансы и веса — целые базовые единицы токена (raw, с учётом decimals).
 Адреса — 0x в нижнем регистре.
@@ -16,23 +20,57 @@ import draw as dr
 
 ZERO = "0x" + "0" * 40
 DEAD = "0x000000000000000000000000000000000000dead"
-BURN_SINKS = {ZERO, DEAD}
+BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD"   # адрес сжиганий для показа (чексумма)
+BURN_SINKS = {ZERO, DEAD}                                       # нулевой адрес — тоже сжигание
 DAY_SECONDS = 86400
+DRAW_HOUR = 22                 # розыгрыш и граница суток весов: 22:00 UTC
+SEED_DELAY = 60                # seed — первый блок с timestamp >= 22:01 UTC
+RUN_DELAY = 300                # расчёт — в 22:05 UTC
+BURN_HOURS = (10, 22)          # плановые сжигания: 10:00 и 22:00 UTC
 
-# общие правила выбора и времени (не зависят от сети)
-pick, verify, canonical, list_hash = dr.pick, dr.verify, dr.canonical, dr.list_hash
-draw_time, seed_time, day_key, is_day = dr.draw_time, dr.seed_time, dr.day_key, dr.is_day
+# общие правила выбора (не зависят от сети)
+pick, verify, canonical, list_hash, is_day = dr.pick, dr.verify, dr.canonical, dr.list_hash, dr.is_day
+
+
+def _date(day):
+    return datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
 
 def day_bounds(day):
-    """(начало, конец) UTC-суток day в unix-времени: [00:00 D, 00:00 D+1)."""
-    start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
-    return start, start + DAY_SECONDS
+    """Сутки весов розыгрыша day в unix-времени: [22:00 UTC day-1, 22:00 UTC day)."""
+    end = int(_date(day).replace(hour=DRAW_HOUR).timestamp())
+    return end - DAY_SECONDS, end
+
+
+def draw_at(day):
+    """Время розыгрыша day (то, что показывает таймер): 22:00 UTC day = конец суток весов."""
+    return day_bounds(day)[1]
+
+
+def seed_time(day):
+    """Seed розыгрыша day: первый блок с timestamp >= 22:01 UTC day."""
+    return draw_at(day) + SEED_DELAY
+
+
+def draw_time(day):
+    """Когда розыгрыш day можно считать (и с какого момента ищется выплата): 22:05 UTC day."""
+    return draw_at(day) + RUN_DELAY
+
+
+def day_key(ts):
+    """Розыгрыш, в сутки весов которого попадает момент ts: с 22:00 UTC — уже завтрашний."""
+    return (datetime.fromtimestamp(ts, timezone.utc) + timedelta(hours=24 - DRAW_HOUR)).strftime("%Y-%m-%d")
 
 
 def prev_day(ts):
-    """Прошедшие UTC-сутки относительно ts."""
-    return (datetime.fromtimestamp(ts, timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    """Последний розыгрыш, чьи сутки весов уже закончились к моменту ts."""
+    return (_date(day_key(ts)) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def next_draw(now):
+    """Ближайший розыгрыш > now: (day, время 22:00 UTC)."""
+    day = day_key(now)
+    return day, draw_at(day)
 
 
 # ---------- веса ----------
@@ -97,7 +135,7 @@ def find_burns(transfers, dev_wallets):
 
 def match_payouts(draws, transfers, dev_wallets, ts_of, used_txs=()):
     """Выплаты: для каждого розыгрыша с победителем и без выплаты — первый перевод токена с любого
-    из dev_wallets на кошелёк победителя не раньше времени розыгрыша (draw_time). Розыгрыши — по дням
+    из dev_wallets на кошелёк победителя не раньше расчёта розыгрыша (draw_time, 22:05 UTC). Розыгрыши — по дням
     по порядку; один перевод — выплата только одного розыгрыша (used_txs — уже засчитанные).
     -> {day: перевод}."""
     devs = {a.lower() for a in dev_wallets}
@@ -124,10 +162,15 @@ def total_burned(minted, supply, dead_balance):
     return max(0, int(minted) - int(supply)) + int(dead_balance)
 
 
-def next_burn(now, interval_hours=12):
-    """Следующее плановое сжигание (только для таймера): ближайший момент > now на сетке
-    00:00 UTC + k * interval_hours."""
-    step = int(interval_hours * 3600)
+def next_burns(now, n=2):
+    """Ближайшие n плановых сжиганий > now (только для таймера): 10:00 и 22:00 UTC каждый день."""
     day0 = int(now) - int(now) % DAY_SECONDS
-    k = (int(now) - day0) // step + 1
-    return day0 + k * step
+    out, d = [], day0
+    while len(out) < n:
+        out += [d + h * 3600 for h in BURN_HOURS if d + h * 3600 > now][:n - len(out)]
+        d += DAY_SECONDS
+    return out
+
+
+def next_burn(now):
+    return next_burns(now, 1)[0]

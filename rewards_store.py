@@ -4,7 +4,7 @@
   rw_draws         — розыгрыши (ключ — UTC-сутки весов 'YYYY-MM-DD'): блоки суток, seed, list_hash, победитель, выплата;
   rw_participants  — участники розыгрыша с весами (для проверки);
   rw_burns         — сжигания разработчика (ключ — транзакция + номер лога);
-  rw_meta          — служебное: курсор сжиганий, набор DEV_WALLETS, сожжённый сапплай, первый день, запуск токена.
+  rw_meta          — служебное: курсор сжиганий, набор DEV_WALLETS, сожжённый сапплай, запуск токена, decimals.
 Всё идемпотентно: повторная запись тех же суток или той же транзакции ничего не дублирует.
 Базы нет — розыгрыши пересчитываются из блокчейна детерминированно (rewards_service.compute_day).
 """
@@ -57,12 +57,6 @@ class RewardsStore:
     def set_meta(self, key, value):
         with self._lock, self.db:
             self.db.execute("INSERT OR REPLACE INTO rw_meta(key, value) VALUES (?,?)", (key, json.dumps(value)))
-
-    def init_meta(self, key, value):
-        """Записывает значение, только если ключа ещё нет. -> текущее значение."""
-        with self._lock, self.db:
-            self.db.execute("INSERT OR IGNORE INTO rw_meta(key, value) VALUES (?,?)", (key, json.dumps(value)))
-            return json.loads(self.db.execute("SELECT value FROM rw_meta WHERE key=?", (key,)).fetchone()["value"])
 
     # ---------- розыгрыши ----------
     def get_draw(self, day):

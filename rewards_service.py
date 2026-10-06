@@ -4,9 +4,9 @@
 время блоков, код адресов на блоке, блок по времени (seed), totalSupply и баланс dead.
 
 Настройки (env): REWARDS_ENABLED (true включает, по умолчанию выключено), REWARDS_TOKEN (по умолчанию
-токен проекта), DEV_WALLETS (адреса разработчика через запятую), BURN_INTERVAL_HOURS (по умолчанию 12),
-REWARDS_START_DAY (первые сутки розыгрыша, YYYY-MM-DD; по умолчанию — сутки первого запуска планировщика),
-DRAW_DB_PATH (база, общая с розыгрышем Solana).
+токен проекта), DEV_WALLETS (адреса разработчика через запятую), REWARDS_START_DAY (первый розыгрыш, YYYY-MM-DD;
+по умолчанию FIRST_DAY), DRAW_DB_PATH (база, общая с розыгрышем Solana).
+Расписание фиксированное (UTC), см. rewards.py: розыгрыш 22:00 (расчёт 22:05), сжигания 10:00 и 22:00.
 """
 import os, re, sys, threading, time, traceback
 from datetime import datetime, timedelta, timezone
@@ -15,6 +15,7 @@ import rewards as rw
 from chains import robinhood as ch
 
 DEFAULT_TOKEN = "0x19dCb63C4d2F29A6f077F094a4f858fC790145e1"
+FIRST_DAY = "2026-10-06"  # первый розыгрыш: 2026-10-06 22:00 UTC за [2026-10-05 22:00, 2026-10-06 22:00) UTC
 CHECK_EVERY = 300       # секунд между проверками сжиганий, выплат и сапплая
 TICK = 20               # секунд между проверками планировщика
 RETRY_AFTER = 120       # секунд до повтора розыгрыша после ошибки
@@ -24,7 +25,8 @@ ADDR_RE = re.compile(r"^0x[0-9a-f]{40}$")
 METHOD = ("weight = time-weighted average balance over the UTC day (integral of balance over time / 86400, floor, "
           "token base units); list_hash = sha256(canonical_list); r = int(sha256(blockhash + list_hash), 16) mod "
           "total_weight (strings, UTF-8); winner = first address, sorted ascending, whose running sum of weights > r. "
-          "blockhash: first Robinhood Chain block with timestamp >= seed_time.")
+          "Day window: 22:00 UTC of the previous day to 22:00 UTC of the draw day. "
+          "blockhash: first Robinhood Chain block with timestamp >= seed_time (22:01 UTC of the draw day).")
 
 
 class NotReady(Exception):
@@ -37,13 +39,11 @@ def enabled():
 
 def config():
     raw = [a.strip().lower() for a in (os.environ.get("DEV_WALLETS") or "").split(",") if a.strip()]
-    hours = (os.environ.get("BURN_INTERVAL_HOURS") or "").strip()
     start = (os.environ.get("REWARDS_START_DAY") or "").strip()
     return {"enabled": enabled(), "token": ((os.environ.get("REWARDS_TOKEN") or "").strip() or DEFAULT_TOKEN).lower(),
             "dev_wallets": sorted({a for a in raw if ADDR_RE.match(a)}),
             "invalid_dev_wallets": [a for a in raw if not ADDR_RE.match(a)],
-            "burn_interval_hours": float(hours) if hours else 12.0,
-            "start_day": start if rw.is_day(start) else None}
+            "start_day": start if rw.is_day(start) else FIRST_DAY}
 
 
 def log(msg):
@@ -98,9 +98,9 @@ def timestamps(transfers, blocks=None):
 
 # ---------- розыгрыш ----------
 def compute_day(token, day, dev_wallets, launch, dec=None):
-    """Розыгрыш суток day целиком из блокчейна (детерминированно). -> (запись для базы, участники, сводка).
-    Блоки суток: первый блок с timestamp >= 00:00 D и >= 00:00 D+1; балансы — из всех переводов токена
-    с запуска; контракты — по коду на последнем блоке суток."""
+    """Розыгрыш day целиком из блокчейна (детерминированно). -> (запись для базы, участники, сводка).
+    Блоки суток весов: первый блок с timestamp >= 22:00 UTC day-1 и >= 22:00 UTC day; балансы — из всех
+    переводов токена с запуска; контракты — по коду на последнем блоке суток."""
     day_start, day_end = rw.day_bounds(day)
     b_start, b_end = block_at(day_start), block_at(day_end)
     last = b_end["number"] - 1
@@ -129,7 +129,7 @@ def compute_day(token, day, dev_wallets, launch, dec=None):
 
 
 def run_draw(store, cfg, day, now=None):
-    """Розыгрыш суток day (идемпотентно: уже есть — возвращает сохранённый). Раньше 00:05 UTC D+1 — NotReady."""
+    """Розыгрыш day (идемпотентно: уже есть — возвращает сохранённый). Раньше 22:05 UTC day — NotReady."""
     have = store.get_draw(day)
     if have:
         return have
@@ -142,8 +142,9 @@ def run_draw(store, cfg, day, now=None):
 
 
 def pending_days(store, cfg, now):
-    """Сутки, которым пора разыграться и которых нет в базе: от первых суток до вчерашних (не больше CATCH_UP_DAYS)."""
-    start = cfg["start_day"] or store.init_meta("start_day", rw.day_key(now))
+    """Розыгрыши, которым пора (после 22:05 UTC) и которых нет в базе: от первого (REWARDS_START_DAY,
+    по умолчанию FIRST_DAY) до последнего закончившегося (не больше CATCH_UP_DAYS)."""
+    start = cfg["start_day"] or FIRST_DAY
     last = rw.prev_day(now)
     out, d = [], datetime.strptime(max(start, rw.prev_day(now - CATCH_UP_DAYS * 86400)), "%Y-%m-%d")
     while d.strftime("%Y-%m-%d") <= last:
@@ -228,7 +229,8 @@ def draw_json(row):
     out["chance"] = _chance(row["winner_weight"], row["total_weight"])
     out["payout_status"] = "paid" if row["payout_tx"] else "pending" if row["winner"] else "no_winner"
     out["payout_tokens"] = _tokens(row["payout_amount"], row["decimals"])
-    out["seed_time_iso"], out["draw_time_iso"] = _iso(row["seed_time"]), _iso(rw.draw_time(row["day"]))
+    out["seed_time_iso"], out["draw_time_iso"] = _iso(row["seed_time"]), _iso(rw.draw_at(row["day"]))
+    out["period_start_iso"], out["period_end_iso"] = (_iso(x) for x in rw.day_bounds(row["day"]))
     out["paid_at_iso"] = _iso(row["paid_at"])
     return out
 
@@ -257,10 +259,14 @@ def status_json(store, cfg, now=None):
                 "participants": latest["participants"], "payout_status": draw_json(latest)["payout_status"],
                 "payout_amount": latest["payout_amount"], "payout_tokens": _tokens(latest["payout_amount"], dec),
                 "payout_tx": latest["payout_tx"]}
-    nb = rw.next_burn(now, cfg["burn_interval_hours"])
+    burns = rw.next_burns(now, 2)
+    day, at = rw.next_draw(now)
     return {"enabled": True, "chain": "robinhood", "token": token, "decimals": dec, "dev_wallets": cfg["dev_wallets"],
-            "next_draw": _iso(rw.draw_time(rw.day_key(now))), "next_burn": _iso(nb),
-            "burn_interval_hours": cfg["burn_interval_hours"],
+            "now": _iso(now), "next_draw": _iso(at), "next_draw_day": day, "next_draw_runs_at": _iso(rw.draw_time(day)),
+            "period_start": _iso(rw.day_bounds(day)[0]), "period_end": _iso(at),
+            "next_burn": _iso(burns[0]), "next_burns": [_iso(b) for b in burns],
+            "burn_schedule_utc": [f"{h:02d}:00" for h in rw.BURN_HOURS], "draw_schedule_utc": f"{rw.DRAW_HOUR:02d}:00",
+            "burn_address": rw.BURN_ADDRESS,
             "last_burn": burn_json(last_burn[0], dec) if last_burn else None,
             "burned_by_dev": {"amount": burned, "amount_tokens": _tokens(burned, dec), "count": n_burns},
             "total_burned": None if not supply else {
@@ -303,7 +309,7 @@ def verify_json(store, day):
 
 # ---------- планировщик ----------
 class Scheduler(threading.Thread):
-    """Фоновый поток: розыгрыш прошедших суток в 00:05 UTC (наверстывает пропущенные), каждые 5 минут —
+    """Фоновый поток: розыгрыш в 22:05 UTC за сутки до 22:00 UTC (наверстывает пропущенные), каждые 5 минут —
     сжигания, выплаты и сожжённый сапплай. Ошибки логируются и повторяются позже; поток не падает и не
     роняет сервер; сканер не затрагивается (общий только лимитер RPS адаптера)."""
 
