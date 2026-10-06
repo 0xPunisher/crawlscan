@@ -62,7 +62,7 @@ START = (
     "<b>CrawlScan has its own token, and it rewards its holders.</b>\n\n"
     "Every 24 hours one holder wins 10% of the creator fees, paid in $CrawlScan. Every token you hold is a ticket, "
     "so the more you hold, the bigger your chance. Every 12 hours the dev burns tokens. "
-    "All verifiable live on crawlscan.fun.\n\n"
+    "All verifiable live on the website.\n\n"
     f"CA: <code>{OFFICIAL_CA}</code>"
 )
 CAPTION_MAX = 1024     # лимит подписи к фото в Telegram (видимый текст, UTF-16)

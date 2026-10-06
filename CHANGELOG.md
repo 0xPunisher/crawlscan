@@ -9,6 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Early buyers crawl: see how much supply was bundled at launch, even after bundlers exit.
 
+## [1.3.0] - 2026-10-06
+
+### Added
+
+- Telegram bot [@CrawlScanBot](https://t.me/CrawlScanBot): send a token address from Robinhood Chain or Solana and get the score, verdict and key holder signals in seconds. `/scan <address>` works in groups. Runs as a separate service on the site's scan API and shares its cache, with rate limits per user.
+- Telegram links on the website, in the header and footer.
+
 ## [1.1.0] - 2026-10-05
 
 ### Added

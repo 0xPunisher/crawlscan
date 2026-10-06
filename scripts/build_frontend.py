@@ -13,6 +13,7 @@
     снаружи и внутри страницы;
   - кнопка «try a sample» -> настоящий токен Pons V2;
   - ссылки X и GitHub -> реальные адреса, в новой вкладке (target="_blank" rel="noopener");
+    иконка Telegram-бота (t.me/CrawlScanBot) сразу после X в шапке и футере;
   - роадмап: «Solana support (pump.fun)» — в SHIPPED; в NEXT первым «Early buyers crawl», за ним
     «All-chain support» (больше EVM-сетей и не только); Launch radar — в конец LATER;
   - герой: обе сети — бейдж «memecoin holder scanner · Robinhood and Solana», заголовок «for Robinhood and
@@ -55,6 +56,7 @@ SAMPLES = {"robinhood": "0xb4bb188e2d0e82ef9dba8b31ffe41855a2feac0f",   # «try 
 X_URL = "https://x.com/0x_Punisher"
 PONS_URL = "https://www.ponsfamily.com/launchpad/0x19dCb63C4d2F29A6f077F094a4f858fC790145e1"
 GITHUB_URL = "https://github.com/0xPunisher/crawlscan"
+TELEGRAM_URL = "https://t.me/CrawlScanBot"
 ICON_LINKS = "\n".join([                               # иконки отдаёт server.py из static/
     '<link rel="icon" type="image/svg+xml" href="/favicon.svg">',
     '<link rel="icon" type="image/png" href="/favicon.png">',
@@ -259,6 +261,14 @@ rep('<a href="#" data-grip="1" style="color:#8a959c" style-hover="color:#ffffff"
     f'<a {ext(X_URL)} data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">X</a>', count=2)
 rep('<a href="#" data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">GitHub</a>',
     f'<a {ext(GITHUB_URL)} data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">GitHub</a>')
+# Telegram-бот: иконка (бумажный самолётик, контур как у иконок меню и copy) сразу после X — в шапке и футере
+TELEGRAM_LINK = (f'<a {ext(TELEGRAM_URL)} aria-label="Telegram bot" title="Telegram bot" data-grip="1" '
+                 'style="display:flex;align-items:center;color:#8a959c" style-hover="color:#ffffff">'
+                 '<svg width="16" height="16" sc-camel-view-box="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" '
+                 'stroke-linecap="round" stroke-linejoin="round" style="display:block" aria-hidden="true">'
+                 '<path d="M21.5 3.5 2.5 11l7 2.6 2.6 7.4 9.4-17.5Z"></path><path d="m9.5 13.6 6.5-5.1"></path></svg></a>')
+x_link = f'<a {ext(X_URL)} data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">X</a>'
+rep(x_link, x_link + "\n" + TELEGRAM_LINK, count=2)
 
 # ---------------------------------------------------------------------------
 # токен проекта: ссылка PONS, секция с чартом между «crawlers at work» и «how it works»,
