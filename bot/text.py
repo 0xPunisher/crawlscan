@@ -54,11 +54,18 @@ def e(s):
 
 
 START = (
-    "🕷 <b>CrawlScan</b> scans memecoin holders on Robinhood Chain and Solana: how many real people are behind "
-    "the top holders, linked wallets, snipers, and how hard the biggest operator could dump.\n\n"
-    "<b>How to use:</b> just send me a token address.\n\n"
-    f"$CrawlScan, the official token of the project:\n<code>{OFFICIAL_CA}</code>"
+    "<b>CrawlScan</b> shows how many real people are behind a memecoin's top holders.\n\n"
+    "Send me a token address from Robinhood Chain or Solana. Crawlers go through the top 20 holders onchain "
+    "and check who actually bought and who just received tokens, fresh wallets with no history, snipers still "
+    "holding, and wallets linked by the same transaction, distributor or funder.\n\n"
+    "In about 15 seconds you get a score from 0 to 100 and a verdict.\n\n"
+    "<b>CrawlScan has its own token, and it rewards its holders.</b>\n\n"
+    "Every 24 hours one holder wins 10% of the creator fees, paid in $CrawlScan. Every token you hold is a ticket, "
+    "so the more you hold, the bigger your chance. Every 12 hours the dev burns tokens. "
+    "All verifiable live on crawlscan.fun.\n\n"
+    f"CA: <code>{OFFICIAL_CA}</code>"
 )
+CAPTION_MAX = 1024     # лимит подписи к фото в Telegram (видимый текст, UTF-16)
 START_BUTTONS = {"inline_keyboard": [
     [{"text": "Scan a token", "callback_data": "scan"}, {"text": "Help", "callback_data": "help"}],
     [{"text": "Website", "url": WEBSITE}, {"text": "Buy $CrawlScan", "url": BUY_URL}],

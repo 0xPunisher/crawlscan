@@ -1,5 +1,5 @@
 """Тесты Telegram-бота: подставные Telegram и API сайта, никакой сети."""
-import os, sys, threading, time, unittest
+import html, os, re, sys, tempfile, threading, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,7 +14,7 @@ PUMP = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"
 
 class FakeTG:
     def __init__(self):
-        self.calls, self.n, self.lock = [], 100, threading.Lock()
+        self.calls, self.uploads, self.n, self.lock = [], [], 100, threading.Lock()
 
     def redact(self, s):
         return str(s)
@@ -22,10 +22,18 @@ class FakeTG:
     def call(self, method, **params):
         with self.lock:
             self.calls.append((method, params))
-            if method == "sendMessage":
+            if method in ("sendMessage", "sendPhoto"):
                 self.n += 1
-                return {"message_id": self.n}
+                msg = {"message_id": self.n}
+                if method == "sendPhoto":
+                    msg["photo"] = [{"file_id": "small"}, {"file_id": "BANNER_ID"}]
+                return msg
         return True
+
+    def upload(self, method, field, path, **params):
+        with self.lock:
+            self.uploads.append((method, field, path))
+        return self.call(method, **params)
 
     def of(self, method):
         with self.lock:
@@ -88,10 +96,10 @@ def group(text, user=1):
                         "text": text}}
 
 
-def make(api=None, **kw):
-    tg, clock = FakeTG(), Clock()
+def make(api=None, tg=None, **kw):
+    tg, clock = tg or FakeTG(), Clock()
     bot = bm.Bot(tg, api or FakeAPI(), username="CrawlScanBot", clock=clock, sleep=clock.sleep,
-                 log=lambda m: None, **kw)
+                 log=lambda m: None, **{"banner": None} | kw)
     return bot, tg, clock
 
 
@@ -126,13 +134,12 @@ class TestAddress(unittest.TestCase):
 
 class TestCommands(unittest.TestCase):
 
-    def test_start_buttons(self):
-        bot, tg, _ = make()
-        bot.handle_update(private("/start"))
-        (msg,) = tg.of("sendMessage")
+    def check_start(self, msg, field):
         self.assertEqual(msg["parse_mode"], "HTML")
-        self.assertIn(f"<code>{T.OFFICIAL_CA}</code>", msg["text"])
-        self.assertIn("$CrawlScan, the official token of the project", msg["text"])
+        self.assertIn(f"CA: <code>{T.OFFICIAL_CA}</code>", msg[field])
+        self.assertTrue(msg[field].startswith("<b>CrawlScan</b> shows how many real people"))
+        self.assertIn("<b>CrawlScan has its own token, and it rewards its holders.</b>", msg[field])
+        self.assertNotIn("🕷", msg[field])
         buttons = [b for row in msg["reply_markup"]["inline_keyboard"] for b in row]
         by = {b["text"]: b for b in buttons}
         self.assertEqual(by["Scan a token"]["callback_data"], "scan")
@@ -140,6 +147,47 @@ class TestCommands(unittest.TestCase):
         self.assertEqual(by["Website"]["url"], "https://crawlscan.fun")
         self.assertEqual(by["Buy $CrawlScan"]["url"],
                          "https://www.ponsfamily.com/launchpad/0x19dCb63C4d2F29A6f077F094a4f858fC790145e1")
+
+    def test_caption_fits(self):
+        visible = html.unescape(re.sub(r"<[^>]+>", "", T.START))
+        self.assertLessEqual(len(visible.encode("utf-16-le")) // 2, T.CAPTION_MAX)
+        self.assertLessEqual(len(T.START), T.CAPTION_MAX)          # и с тегами — с запасом
+
+    def test_banner_shipped(self):
+        self.assertTrue(os.path.isfile(bm.BANNER))
+
+    def test_start_photo_then_file_id(self):
+        with tempfile.NamedTemporaryFile(suffix=".png") as f:
+            bot, tg, _ = make(banner=f.name)
+            bot.handle_update(private("/start"))
+            bot.handle_update(private("/start", user=2))
+            self.assertEqual(tg.uploads, [("sendPhoto", "photo", f.name)])   # файл загружен один раз
+        first, second = tg.of("sendPhoto")
+        self.check_start(first, "caption")
+        self.assertNotIn("photo", first)
+        self.assertEqual(second["photo"], "BANNER_ID")                         # дальше по file_id
+        self.assertEqual(second["chat_id"], 2)
+        self.check_start(second, "caption")
+        self.assertEqual(tg.of("sendMessage"), [])
+
+    def test_start_without_banner(self):
+        bot, tg, _ = make(banner="/nonexistent/banner.png")
+        bot.handle_update(private("/start"))
+        self.assertEqual(tg.of("sendPhoto"), [])
+        (msg,) = tg.of("sendMessage")
+        self.check_start(msg, "text")
+
+    def test_start_photo_failed(self):
+        class NoPhotoTG(FakeTG):
+            def upload(self, method, field, path, **params):
+                raise TelegramError(400, "Bad Request: IMAGE_PROCESS_FAILED")
+
+        with tempfile.NamedTemporaryFile(suffix=".png") as f:
+            bot, tg, _ = make(tg=NoPhotoTG(), banner=f.name)
+            bot.handle_update(private("/start"))
+        (msg,) = tg.of("sendMessage")
+        self.check_start(msg, "text")
+        self.assertIsNone(bot.banner_id)
 
     def test_callbacks(self):
         bot, tg, _ = make()

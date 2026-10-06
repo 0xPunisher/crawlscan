@@ -25,6 +25,7 @@ WORKERS = 3            # сканов одновременно на весь б�
 MAX_QUEUE = 30         # ждущих в очереди; больше — "too many scans"
 USER_COOLDOWN = 20     # секунд между сканами одного пользователя
 SCAN_TIMEOUT = 60      # секунд на скан (от начала, без ожидания в очереди)
+BANNER = os.path.join(ROOT, "bot", "assets", "banner.png")   # картинка /start
 POLL_EVERY = 1.5       # секунд между запросами /api/result
 LONG_POLL = 30         # getUpdates timeout
 COMMANDS = [{"command": "start", "description": "What this bot does"},
@@ -50,7 +51,7 @@ def parse_command(text):
 
 class Bot:
     def __init__(self, tg, api, username="", workers=WORKERS, cooldown=USER_COOLDOWN, scan_timeout=SCAN_TIMEOUT,
-                 poll_every=POLL_EVERY, clock=time.monotonic, sleep=time.sleep, log=log):
+                 poll_every=POLL_EVERY, clock=time.monotonic, sleep=time.sleep, log=log, banner=BANNER):
         self.tg, self.api, self.username = tg, api, username
         self.workers, self.cooldown, self.scan_timeout, self.poll_every = workers, cooldown, scan_timeout, poll_every
         self.clock, self.sleep, self.log = clock, sleep, log
@@ -58,12 +59,17 @@ class Bot:
         self.busy = 0                # сканов в работе
         self.last_scan = {}          # user_id -> clock() последнего принятого скана
         self.lock = threading.Lock()
+        self.banner = banner
+        self.banner_id = None        # file_id баннера после первой загрузки: дальше шлём без файла
 
     # --- Telegram ---------------------------------------------------------------------------------
 
-    def call(self, method, **params):
-        """Вызов Bot API; ошибка логируется, бот живёт. → result или None."""
+    def call(self, method, upload=None, **params):
+        """Вызов Bot API; ошибка логируется, бот живёт. → result или None.
+        upload=(поле, путь) — с файлом (multipart)."""
         try:
+            if upload:
+                return self.tg.upload(method, *upload, **params)
             return self.tg.call(method, **params)
         except TelegramError as e:
             if "message is not modified" not in e.description:
@@ -77,6 +83,24 @@ class Bot:
                         link_preview_options={"is_disabled": True},
                         reply_parameters={"message_id": reply_to, "allow_sending_without_reply": True}
                         if reply_to else None)
+        return msg.get("message_id") if isinstance(msg, dict) else None
+
+    def send_start(self, chat_id):
+        """Баннер с приветствием в подписи; по file_id, если баннер уже загружали.
+        Нет файла или sendPhoto не прошёл — то же приветствие обычным сообщением."""
+        params = dict(chat_id=chat_id, caption=T.START, parse_mode="HTML", reply_markup=T.START_BUTTONS)
+        msg = None
+        if self.banner_id:
+            msg = self.call("sendPhoto", photo=self.banner_id, **params)
+            if msg is None:
+                self.banner_id = None    # file_id не принят — в следующий раз загрузим файл заново
+        elif self.banner and os.path.isfile(self.banner):
+            msg = self.call("sendPhoto", upload=("photo", self.banner), **params)
+            sizes = msg.get("photo") if isinstance(msg, dict) else None
+            if sizes:
+                self.banner_id = sizes[-1]["file_id"]   # самый большой размер
+        if msg is None:
+            return self.send(chat_id, T.START, T.START_BUTTONS)
         return msg.get("message_id") if isinstance(msg, dict) else None
 
     def edit(self, chat_id, message_id, html, markup=None):
@@ -102,7 +126,7 @@ class Bot:
         chat_id, mid = chat.get("id"), m.get("message_id")
         if chat.get("type") == "private":
             if cmd == "start":
-                return self.send(chat_id, T.START, T.START_BUTTONS)
+                return self.send_start(chat_id)
             if cmd == "help":
                 return self.send(chat_id, T.HELP)
             if cmd == "scan":
