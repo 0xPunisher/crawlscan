@@ -39,6 +39,8 @@ RPS = int(os.environ.get("SOLANA_RPS", "8"))  # потолок HTTP-запрос
 USE_FUNDING = False
 CHAIN = "solana"
 PACK_WINDOW = 2            # окно стаи (detect.find_packs): до 2 слотов от первого покупателя
+BUNDLE_WINDOW = 2          # launch_bundle: вход не позже 2 слотов от запуска (бандл в слоте create)
+RUG_SNIPERS = False        # probably rug: 30-секундные снайперы — обычные боты, в запас не входят
 
 # --- программы и аккаунты ---
 PUMP = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"            # pump.fun (бондинг-кривые)

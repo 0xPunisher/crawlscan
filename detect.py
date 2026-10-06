@@ -1,6 +1,6 @@
 """Детекторы rh-crawler: чистые функции без сети, не знают, какая сеть.
 На входе — переводы токена и заранее собранные адаптером данные по кошелькам,
-на выходе — холдеры, сигналы, связи, стаи, операторы и скор. Правила — README.
+на выходе — холдеры, сигналы, связи, стаи, операторы, скор и проекция «probably rug». Правила — README.
 
 Все доли (share) — числа 0..1 от ОБОРОТНОГО сапплая (circulating = сапплай минус
 всё, что лежит в инфраструктуре: кривая, pool manager, локер, burn, ...).
@@ -16,6 +16,7 @@ DUST_SHARE = 0.001         # пыль: < 0.1% оборота не считаем
 # --- Сигналы (README «Сигналы на кошелёк») ---
 SHORT_HISTORY_MAX = 3      # короткая история: ≤ 3 разных монет за всю историю до входа
 SNIPER_SECONDS = 30        # снайпер: вход в первые 30 с после запуска
+# launch_bundle: вход не позже bundle_window блоков от запуска (параметр сети: Robinhood 0, Solana 2)
 
 # --- Связи и стаи (README «Связи») ---
 HUB_MIN_OUT = 100          # хаб: ≥ 100 исходящих ETH-переводов, через него не склеиваем
@@ -52,6 +53,10 @@ SOFT_GATE_WALLETS = 3      #   → band не лучше RISKY (score = min(score
 BANDS = ((80, "CLEAN"), (60, "OK"), (40, "RISKY"))  # иначе DANGER
 TOO_EARLY = "TOO_EARLY_OR_LATE"
 
+# --- Probably rug (README «Probably rug») ---
+RUG_MIN_DROP = 0.40        # проекция показывается, если продажа подозрительного запаса уронит цену на ≥ 40%
+RUG_ORDER = ("linked", "transfer", "virgin", "bundle")  # приоритет причин: кошелёк попадает в первую подходящую
+
 
 def supply_base(transfers, supply, excluded):
     """{"supply", "circulating", "holders_total", "balances"}: circulating = сумма
@@ -79,7 +84,7 @@ def sellers(transfers, market):
     return {t["frm"] for t in transfers if t["to"] in market and t["frm"] not in market}
 
 
-def wallet_signals(data, launch_ts, deployer):
+def wallet_signals(data, launch_ts, deployer, launch_block=None, bundle_window=0):
     """Сигналы по кошелькам. data — {wallet: {
         "kind": "buy" | "transfer" | None,  # тип первого входа (adapter.classify_entries); None — не найден
         "tx": str, "block": int,      # транзакция и блок первого входа
@@ -91,12 +96,15 @@ def wallet_signals(data, launch_ts, deployer):
         "sold": bool,                 # продавал ли токен (detect.sellers)
     }}
     Возвращает {wallet: {"kind", "virgin", "short_history", "one_shot_funded",
-    "sniper", "eth_in", "is_deployer", "sold", "unread", "block", "tx", "via"}}.
+    "sniper", "launch_bundle", "eth_in", "is_deployer", "sold", "unread", "block", "tx", "via"}}.
     virgin — 0 монет до входа; short_history — 1..3 монет (virgin в неё не входит).
-    unread — историю не успели прочитать в бюджет: virgin и short_history = False."""
+    unread — историю не успели прочитать в бюджет: virgin и short_history = False.
+    launch_bundle — вход в блоке запуска или не позже bundle_window блоков (слотов) после;
+    launch_block None или вход не найден — False."""
     out = {}
     for w, d in data.items():
         n = d["distinct_tokens"]
+        b = d["block"]
         out[w] = {
             "kind": d["kind"],
             "virgin": n == 0,
@@ -104,6 +112,7 @@ def wallet_signals(data, launch_ts, deployer):
             "unread": n is None,
             "one_shot_funded": len(d["inflows"]) == 1,
             "sniper": d["entry_ts"] is not None and d["entry_ts"] - launch_ts <= SNIPER_SECONDS,
+            "launch_bundle": launch_block is not None and b is not None and 0 <= b - launch_block <= bundle_window,
             "eth_in": d["eth_in"],
             "is_deployer": w == deployer,
             "sold": d.get("sold", False),
@@ -314,3 +323,45 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None):
         total = min(total, SOFT_GATE_SCORE)
     band = "DANGER" if hard else next((b for lim, b in BANDS if total >= lim), "DANGER")
     return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline}
+
+
+def rug_projection(holders, signals, ops, base, reserve, band, snipers=True):
+    """Проекция «probably rug»: куда упадёт цена, если весь подозрительный запас продадут в ликвидность.
+    Только при band DANGER (скор и вердикт не меняет); иначе, без запаса или при падении
+    < RUG_MIN_DROP — None.
+    Запас (каждый кошелёк один раз) — кошельки топа:
+      linked   — в операторе из 2+ кошельков (доказанные связи и стаи);
+      transfer — первый вход переводом;
+      virgin   — 0 монет до входа (unread сюда не попадает: историю не угадываем);
+      bundle   — не продавал и launch_bundle, а при snipers=True ещё и снайпер (≤ SNIPER_SECONDS).
+    Кошелёк относится к первой подходящей причине в порядке RUG_ORDER, поэтому доли parts
+    складываются в share. drop = dump_impact(q, reserve), q — все токены запаса без весов.
+    {"drop", "level_factor" (= 1 − drop), "share", "share_supply", "parts": [{"kind", "wallets",
+    "share", "share_supply"}], "wallets"}; доли — от оборота, share_supply — от сапплая."""
+    if band != "DANGER":
+        return None
+    linked = {w for o in ops if len(o["wallets"]) > 1 for w in o["wallets"]}
+    test = {
+        "linked": lambda w, s: w in linked,
+        "transfer": lambda w, s: s["kind"] == "transfer",
+        "virgin": lambda w, s: s["virgin"],
+        "bundle": lambda w, s: not s["sold"] and (s["launch_bundle"] or (snipers and s["sniper"])),
+    }
+    ratio = base["circulating"] / base["supply"] if base["supply"] else 0.0
+    parts, taken, q = [], set(), 0
+    for kind in RUG_ORDER:
+        rows = [(w, v, sh) for w, v, sh in holders if w not in taken and test[kind](w, signals[w])]
+        if not rows:
+            continue
+        sh = sum(r[2] for r in rows)
+        parts.append({"kind": kind, "wallets": [r[0] for r in rows], "share": sh, "share_supply": sh * ratio})
+        taken.update(r[0] for r in rows)
+        q += sum(r[1] for r in rows)
+    if not taken:
+        return None
+    drop = dump_impact(q, reserve)
+    if drop < RUG_MIN_DROP:
+        return None
+    share = sum(p["share"] for p in parts)
+    return {"drop": drop, "level_factor": 1.0 - drop, "share": share, "share_supply": share * ratio,
+            "parts": parts, "wallets": [w for w, _, _ in holders if w in taken]}

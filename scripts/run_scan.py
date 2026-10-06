@@ -33,6 +33,13 @@ for tok in sys.argv[1:]:
     h = r["header"]
     print(f"  шапка: {h}")
     print(f"  unread: {len(r['unread'])}, RPC-запросов: {r['rpc_requests']}, причина: {r['reason']}")
+    rug = r.get("rug")
+    if rug:
+        parts = ", ".join(f"{p['kind']} {len(p['wallets'])} ({p['share'] * 100:.1f}%)" for p in rug["parts"])
+        lvl = "" if rug["level_usd"] is None else f", уровень ${rug['level_usd']:.8g}"
+        print(f"  probably rug: −{rug['drop'] * 100:.1f}%{lvl}; запас {rug['share'] * 100:.1f}% оборота: {parts}")
+    else:
+        print("  probably rug: нет")
     print(f"  итог: {time.time() - t0:.1f} с\n")
     summary.append((tok, time.time() - t0, n[0], r["score"], r["band"], r["headline"]))
 

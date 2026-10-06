@@ -4,6 +4,8 @@ Read-only: скан идёт в фоне, браузер опрашивает с
   POST /api/scan {"token": "0x..."}      -> {"job": id}
   GET  /api/events?job=ID&after=N        -> {"events": [...], "done": bool}  (события с i >= N)
   GET  /api/result?job=ID                -> {"done", "result" | "error"}
+  GET  /api/chart?token=CA               -> {"token", "chain", "pool", "dex", "timeframe", "candles", "price_usd"}
+                                            свечи GeckoTerminal [[ts, o, h, l, c, v]] от старых к новым; в скан не входит
   GET  /                                 -> index.html
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
   GET  /health
@@ -25,6 +27,7 @@ Token Burn & Holder Rewards, Robinhood (только при REWARDS_ENABLED=true
   GET  /api/rewards/<YYYY-MM-DD>/verify  -> входные данные и пересчёт победителя
 
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
+Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
 Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
 """
 import hmac, json, os, re, threading, time, uuid
@@ -32,6 +35,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import engine
+import market
 import draw_service as ds
 import rewards_service as rs
 from draw_store import Store
@@ -49,7 +53,12 @@ ICONS = {                  # путь -> (файл в static/, content-type); .i
 }
 ICON_CACHE = "public, max-age=86400"
 
+CHART_TTL = 600            # секунд: кэш чарта по токену
+CHART_EMPTY_TTL = 60       # секунд: кэш чарта без свечей (GT не ответил или токен слишком свежий)
+CHART_MAX = 500            # чартов в памяти, старые вытесняются
+
 JOBS = {}                  # job_id -> {"token", "chain", "events", "done", "result", "error", "ts"}
+CHARTS = {}                # token -> (ts, ответ /api/chart)
 BY_TOKEN = {}              # token -> job_id последнего скана
 _lock = threading.Lock()
 _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
@@ -101,6 +110,29 @@ def start_scan(token):
         BY_TOKEN[token] = jid
     threading.Thread(target=_run, args=(jid, token), daemon=True).start()
     return jid
+
+
+def get_chart(token):
+    """Ответ /api/chart: адрес через engine.chain_of (ScanError — плохой адрес / Solana выключена),
+    свечи из market.fetch_chart с кэшем. Любой сбой GT — пустой чарт, не исключение."""
+    chain, token = engine.chain_of(token)
+    now = time.time()
+    with _lock:
+        hit = CHARTS.get(token)
+        if hit and now - hit[0] < (CHART_TTL if hit[1]["candles"] else CHART_EMPTY_TTL):
+            return hit[1]
+    try:
+        c = market.fetch_chart(token, engine.GT_NETWORK[chain])
+    except Exception:
+        c = {}
+    out = {"token": token, "chain": chain, "pool": c.get("pool"), "dex": c.get("dex"),
+           "timeframe": c.get("timeframe"), "candles": c.get("candles") or [], "price_usd": c.get("price_usd")}
+    with _lock:
+        CHARTS[token] = (now, out)
+        if len(CHARTS) > CHART_MAX:
+            for t, _ in sorted(CHARTS.items(), key=lambda kv: kv[1][0])[:len(CHARTS) - CHART_MAX]:
+                del CHARTS[t]
+    return out
 
 
 DRAW_PATH = re.compile(r"^/api/draw/(\d{4}-\d{2}-\d{2})/(participants|verify|payout)$")
@@ -251,6 +283,11 @@ class H(BaseHTTPRequestHandler):
             return self._rewards_get(u.path, q)
         if u.path == "/api/config":  # фронт: какие сети включены (Solana — флаг SOLANA_ENABLED)
             return self._send(200, {"solana": engine.solana_enabled()})
+        if u.path == "/api/chart":
+            try:
+                return self._send(200, get_chart((q.get("token") or [""])[0]))
+            except engine.ScanError as e:
+                return self._send(400, {"error": str(e)})
         if u.path == "/api/events":
             job = self._job(q)
             if job is None:

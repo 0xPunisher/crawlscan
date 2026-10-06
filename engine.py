@@ -153,7 +153,8 @@ def scan(token, emit=lambda e: None):
     futs = {ex.submit(_history, a, w, entries[w]["block"], token): w for w in hs if entries[w]["kind"] is not None}
 
     def flag(w):
-        s = d.wallet_signals({w: data[w]}, ts[launch["block"]], launch["deployer"])[w]
+        s = d.wallet_signals({w: data[w]}, ts[launch["block"]], launch["deployer"],
+                             launch["block"], a.BUNDLE_WINDOW)[w]
         eth = "" if s["eth_in"] is None else f" {s['eth_in'] / scale:.4f} {unit}"
         fl = _flags(s)
         when = "entry not found" if data[w]["entry_ts"] is None else f"+{data[w]['entry_ts'] - ts[launch['block']]}s"
@@ -179,7 +180,7 @@ def scan(token, emit=lambda e: None):
         flag(w)
 
     ev("stage", "links")
-    sig = d.wallet_signals(data, ts[launch["block"]], launch["deployer"])
+    sig = d.wallet_signals(data, ts[launch["block"]], launch["deployer"], launch["block"], a.BUNDLE_WINDOW)
     packs = d.find_packs(sig, window=a.PACK_WINDOW)
     # раздатчики токена, общие для ≥ 2 холдеров: проверяем только на контракт
     hset, by_src = set(hs), {}
@@ -205,6 +206,10 @@ def scan(token, emit=lambda e: None):
     gt = dict(mkt_box)   # снимок: поздний ответ GT не меняет уже посчитанный результат
     sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"))
     reason = _reason(sc, base)
+    # probably rug: только вычисления на уже собранных данных, без запросов в сеть
+    rug = d.rug_projection(holders, sig, ops, base, facts["reserve"], sc["band"], snipers=a.RUG_SNIPERS)
+    if rug:
+        rug["level_usd"] = gt["price_usd"] * rug["level_factor"] if gt.get("price_usd") else None
     meta = {}
     if not gt.get("name"):
         meta = a.token_meta(token)
@@ -213,7 +218,7 @@ def scan(token, emit=lambda e: None):
               "liquidity_usd": gt.get("liquidity_usd"), "vol24h_usd": gt.get("vol24h_usd"),
               "age_h": round((time.time() - ts[launch["block"]]) / 3600, 1)}
     elapsed = round(time.time() - t0, 1)
-    ev("done", reason, score=sc["score"], band=sc["band"], headline=sc["headline"])
+    ev("done", reason, score=sc["score"], band=sc["band"], headline=sc["headline"], rug=rug)
 
     return {
         "token": token, "chain": chain, "header": header,
@@ -224,6 +229,7 @@ def scan(token, emit=lambda e: None):
         "links": links, "packs": packs, "operators": ops,
         "score": sc["score"], "band": sc["band"], "parts": sc["parts"], "gates": sc["gates"],
         "metrics": sc["metrics"], "headline": sc["headline"], "reason": reason, "reserve": facts["reserve"],
+        "rug": rug,
         "unread": unread, "use_funding": USE_FUNDING,
         "elapsed_s": elapsed, "rpc_requests": a.REQUESTS[0] - r0,
     }

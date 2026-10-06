@@ -14,6 +14,8 @@ RPC = os.environ["CRAWLER_RPC"]  # Alchemy PAYG endpoint
 
 CHAIN = "robinhood"
 PACK_WINDOW = 0           # окно стаи (detect.find_packs): тот же блок
+BUNDLE_WINDOW = 0         # launch_bundle: вход в блоке запуска
+RUG_SNIPERS = True        # probably rug: непроданные снайперы (первые 30 с) входят в запас
 FRESH_WINDOW = 1_000_000  # окно (блоков) для свежести кошелька
 FRESH_CAP    = 4          # считаем разные токены до стольких, дальше не нужно
 
