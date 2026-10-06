@@ -35,10 +35,11 @@
     номера how/roadmap сдвигаются, только когда секция есть.
   - Token Burn & Holder Rewards: секция сразу после «the token», только если /api/rewards/status ->
     enabled: true. Две карточки: Burn (таймер до next_burn, последнее сжигание, всего сожжено и % сапплая,
-    адрес сжиганий с copy) и Holder Rewards (таймер до next_draw, блок доверия с Verify по
+    кошелёк разработчика «burns from» и адрес сжиганий с copy) и Holder Rewards (таймер до next_draw, блок доверия с Verify по
     /api/rewards/<day>/*, последний победитель с copy, шанс, выплата или payout pending).
     Таймер в нуле — «Waiting for burn transaction…» / «Picking the winner…»; новое сжигание — вспышка
-    «Tokens burned: N», новый розыгрыш — появление победителя. Ссылки — Blockscout Robinhood Chain.
+    «Tokens burned: N», новый розыгрыш — появление победителя. Большие таймеры — цифры в зелёных плитках
+    (моноширинные, фиксированной ширины), двоеточия без плиток. Ссылки — Blockscout Robinhood Chain.
 
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
 и index.html не перезаписывает.
@@ -808,6 +809,7 @@ const fmtUnits=(raw,dec)=>{
 const fmtPctOf=(a,b)=>{if(a==null||!b) return null; const p=Number(BigInt(a)*1000000n/BigInt(b))/10000; return p>=0.01?p.toFixed(2)+'%':p>0?'<0.01%':'0%';};
 const fmtUtcTs=ms=>{const s=new Date(ms).toISOString(); return s.slice(0,10)+' '+s.slice(11,16)+' UTC';};
 const RW_GRACE=1800000;   // сжигание за 30 минут до планового времени засчитывается этому времени
+const rwTiles=ms=>fmtLeft(ms).split('').map(c=>({c,digit:c!==':',colon:c===':'}));   // таймер плитками: цифры в плитках, двоеточия без
 const burnKey=st=>st.last_burn?st.last_burn.tx+':'+st.last_burn.log_index:null;
 const burnedFor=(st,target)=>!!st.last_burn&&st.last_burn.time*1000>=target-RW_GRACE;
 
@@ -877,6 +879,9 @@ rep("  blank(ca){return {", r"""  loadRewards(){   // статус Rewards & Bur
       rwLastTxUrl:lb?RH_TX(lb.tx):'#', rwLastTx:lb?rwShort(lb.tx):'',
       rwTotal:tb?fmtUnits(tb.amount,dec):fmtUnits(st.burned_by_dev.amount,dec),
       rwTotalPct:tb&&tb.minted?fmtPctOf(tb.amount,tb.minted)+' of supply':'',
+      rwBurnTiles:rwTiles(b.target-now), rwDrawTiles:rwTiles(d.target-now),
+      rwDevs:(st.dev_wallets||[]).map((a,i)=>({full:a, short:rwShort(a), url:RH_ADDR(a), copy:()=>this.copyText('dev'+i,a),
+        idle:cp!=='dev'+i, done:cp==='dev'+i})), rwHasDevs:!!(st.dev_wallets&&st.dev_wallets.length),
       rwBurnAddr:st.burn_address, rwBurnAddrUrl:RH_ADDR(st.burn_address),
       copyRwBurn:()=>this.copyText('burn',st.burn_address), rwBurnDone:cp==='burn', rwBurnIdle:cp!=='burn',
       rwDrawCount:!picking, rwDrawPick:picking, rwDrawLeft:fmtLeft(d.target-now), rwDrawAt:fmtUtcTs(d.target),
@@ -918,7 +923,14 @@ def rw_copy(key, idle, done, label):
 def sif(cond, body, ph="false"):
     return f'<sc-if value="{{{{{cond}}}}}" hint-placeholder-val="{{{{{ph}}}}}">{body}</sc-if>'
 
-TIMER = f'{MONO};font-size:clamp(34px,4vw,44px);letter-spacing:-0.02em;color:#eef1f3;line-height:1.1'
+TIMER = f'{MONO};font-size:clamp(32px,3.6vw,42px);line-height:1;display:flex;align-items:center;gap:0.1em;font-variant-numeric:tabular-nums'
+TILE = ('display:inline-flex;align-items:center;justify-content:center;width:1em;height:1.32em;border-radius:0.2em;'
+        'background:rgba(0,200,5,0.16);border:1px solid rgba(0,200,5,0.42);color:#d9ffd4;box-sizing:border-box;'
+        'box-shadow:inset 0 1px 0 rgba(255,255,255,0.06);text-shadow:0 0 12px rgba(0,200,5,0.35)')
+COLON = 'display:inline-block;width:0.5em;text-align:center;color:#00c805;margin-top:-0.08em'
+tiles = lambda key: (f'<sc-for list="{{{{{key}}}}}" as="c" hint-placeholder-count="8">'
+                     f'<sc-if value="{{{{c.digit}}}}" hint-placeholder-val="{{{{true}}}}"><span class="cs-rw-tile" style="{TILE}">{{{{c.c}}}}</span></sc-if>'
+                     f'<sc-if value="{{{{c.colon}}}}" hint-placeholder-val="{{{{false}}}}"><span style="{COLON}">:</span></sc-if></sc-for>')
 BUSY = f'{MONO};font-size:clamp(20px,2.4vw,26px);letter-spacing:-0.01em;color:#f5a623;line-height:1.3'
 TEXT = 'margin:0;font-size:15px;line-height:1.6;color:#8a959c;text-wrap:pretty'
 BURN_TEXT = ("Every 12 hours the developer burns tokens from his personal supply. Burning makes tokens more valuable "
@@ -943,7 +955,7 @@ REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{
             <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">burn</span><span style="color:#5f6b72">every 12 hours</span></div>
             <div style="display:flex;flex-direction:column;gap:6px;min-height:76px">
               <span style="{LABEL}">next burn</span>
-              {sif("rwBurnCount", f'<span data-rw-burn-timer="1" style="{TIMER}">{{{{rwBurnLeft}}}}</span>', "true")}
+              {sif("rwBurnCount", f'<div data-rw-burn-timer="1" class="cs-rw-timer" role="timer" aria-label="{{{{rwBurnLeft}}}}" style="{TIMER}">{tiles("rwBurnTiles")}</div>', "true")}
               {sif("rwBurnWait", f'<span data-rw-burn-wait="1" class="cs-rw-pulse" style="{BUSY}">Waiting for burn transaction…</span>')}
               <span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwBurnAt}}}}</span>
             </div>
@@ -954,6 +966,7 @@ REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{
               {stat("total burned", f'<span data-rw-total="1" style="{MONO};font-size:18px;color:#eef1f3">{{{{rwTotal}}}} tokens</span><span style="{MONO};font-size:12px;color:#00c805">{{{{rwTotalPct}}}}</span>')}
             </div>
             <div style="display:flex;flex-direction:column;gap:8px;margin-top:auto;border-top:1px solid #141b20;padding-top:18px">
+              {sif("rwHasDevs", f'<span style="{LABEL}">burns from</span><sc-for list="{{{{rwDevs}}}}" as="w" hint-placeholder-count="1"><div data-rw-dev="1" style="display:flex;align-items:center;gap:10px;min-width:0"><a href="{{{{w.url}}}}" title="{{{{w.full}}}}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#dfe5e8;overflow-wrap:anywhere;min-width:0" style-hover="color:#9fd9ff"><span class="cs-rw-full">{{{{w.full}}}}</span><span class="cs-rw-short">{{{{w.short}}}}</span> ↗</a><button sc-camel-on-click="{{{{w.copy}}}}" title="copy developer wallet" aria-label="copy developer wallet" style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px solid #1c252b;border-radius:7px;background:#0b1013;color:#8a959c;cursor:pointer;flex-shrink:0" style-hover="color:#ffffff;border-color:#2c353b"><sc-if value="{{{{w.idle}}}}" hint-placeholder-val="{{{{true}}}}">{ICON_COPY}</sc-if><sc-if value="{{{{w.done}}}}" hint-placeholder-val="{{{{false}}}}">{ICON_CHECK}</sc-if></button></div></sc-for><span style="height:6px"></span>')}
               <span style="{LABEL}">burn address</span>
               <div style="display:flex;align-items:center;gap:10px;min-width:0">
                 <a href="{{{{rwBurnAddrUrl}}}}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#dfe5e8;overflow-wrap:anywhere;min-width:0" style-hover="color:#9fd9ff">{{{{rwBurnAddr}}}} ↗</a>
@@ -965,7 +978,7 @@ REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{
             <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">holder rewards</span><span style="color:#5f6b72">every 24 hours</span></div>
             <div style="display:flex;flex-direction:column;gap:6px;min-height:76px">
               <span style="{LABEL}">next draw</span>
-              {sif("rwDrawCount", f'<span data-rw-draw-timer="1" style="{TIMER}">{{{{rwDrawLeft}}}}</span>', "true")}
+              {sif("rwDrawCount", f'<div data-rw-draw-timer="1" class="cs-rw-timer" role="timer" aria-label="{{{{rwDrawLeft}}}}" style="{TIMER}">{tiles("rwDrawTiles")}</div>', "true")}
               {sif("rwDrawPick", f'<span data-rw-draw-pick="1" class="cs-rw-pulse" style="{BUSY}">Picking the winner…</span>')}
               <span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwDrawAt}}}}</span>
             </div>
@@ -1004,6 +1017,8 @@ rep("@media (max-width:640px){\n",
     ".cs-rw-flash{animation:cs-rw-flash 6s ease-out both}\n"
     ".cs-rw-reveal{animation:cs-rw-reveal 4s ease-out both}\n"
     "@media (max-width:900px){.cs-rw-grid{grid-template-columns:minmax(0,1fr)!important}}\n"
+    ".cs-rw-short{display:none}\n"
+    "@media (max-width:640px){.cs-rw-full{display:none}.cs-rw-short{display:inline}.cs-rw-timer{font-size:28px!important}}\n"
     "@media (prefers-reduced-motion:reduce){.cs-rw-pulse,.cs-rw-flash,.cs-rw-reveal{animation:none}}\n"
     "@media (max-width:640px){\n")
 
