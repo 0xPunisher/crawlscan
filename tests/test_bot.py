@@ -253,6 +253,19 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(msg["reply_markup"]["inline_keyboard"][0][0],
                          {"text": "Full report", "url": f"https://crawlscan.fun/?ca={RH.lower()}"})
 
+    def test_probably_rug(self):
+        rug = {"drop": 0.867, "level_factor": 0.133, "level_usd": 1e-4, "share": 0.187, "share_supply": 0.15,
+               "parts": [{"kind": "linked", "wallets": ["a"] * 6, "share": 0.115, "share_supply": 0.09},
+                         {"kind": "transfer", "wallets": ["b"], "share": 0.012, "share_supply": 0.01},
+                         {"kind": "virgin", "wallets": ["c", "d"], "share": 0.06, "share_supply": 0.05}],
+               "wallets": []}
+        t = self.scan(FakeAPI(result(band="DANGER", score=45, rug=rug)))["text"]
+        self.assertIn("⚠️ <b>Probably rug: −87% if suspicious holders sell</b>\n"
+                      "• linked wallets: 6 wallets, 11.5% of float\n"
+                      "• fresh wallets: 2 wallets, 6.0% of float", t)       # две главные причины по доле
+        self.assertNotIn("received by transfer", t)
+        self.assertNotIn("Probably rug", self.scan(FakeAPI(result(rug=None)))["text"])
+
     def test_small_impact_and_zero_signals(self):
         t = self.scan(FakeAPI(result(metrics={"impact": 0.004, "virgin": 0, "transfer": 0, "sniper": 0.00001},
                                      operators=[{"wallets": ["a"]}] * 20)))["text"]

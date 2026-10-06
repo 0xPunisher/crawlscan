@@ -146,6 +146,20 @@ def title(res):
     return f"{t} · {CHAIN_NAME.get(res.get('chain'), e(res.get('chain', '')))}"
 
 
+RUG_KIND = {"linked": "linked wallets", "transfer": "received by transfer", "virgin": "fresh wallets",
+            "bundle": "bundle / snipers"}
+
+
+def rug_lines(rug):
+    """Проекция «probably rug» (только при DANGER): строка с падением и две главные причины по доле."""
+    lines = [f"⚠️ <b>Probably rug: −{_pct(rug['drop'], 0)}% if suspicious holders sell</b>"]
+    for p in sorted(rug.get("parts") or [], key=lambda p: -p["share"])[:2]:
+        n = len(p.get("wallets") or [])
+        lines.append(f"• {RUG_KIND.get(p['kind'], e(p['kind']))}: {n} wallet{'' if n == 1 else 's'}, "
+                     f"{_pct(p['share'], 1)}% of float")
+    return lines
+
+
 def verdict(res):
     """Результат скана сайта → HTML-текст вердикта."""
     lines = [title(res), ""]
@@ -164,6 +178,8 @@ def verdict(res):
         n = len(ops[0].get("wallets") or [])
         who = f"Biggest operator ({n} wallets)" if n > 1 else "Biggest operator"
         lines.append(f"{who} could move price {impact_phrase(m['impact'])} if sold")
+    if res.get("rug"):
+        lines += [""] + rug_lines(res["rug"])
 
     signals = []
     if float(_pct(m.get("virgin") or 0, 0)):

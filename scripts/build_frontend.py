@@ -42,6 +42,12 @@
     «Tokens burned: N», новый розыгрыш — появление победителя. Большие таймеры — цифры в зелёных плитках
     (моноширинные, фиксированной ширины), двоеточия без плиток. Ссылки — Blockscout Robinhood Chain.
 
+  - чарт цены на странице результата: блок между фактами и таблицей холдеров, свечи из /api/chart
+    отдельным запросом после вердикта (skeleton, пока грузится), SVG без библиотек; если в результате
+    есть rug — красная пунктирная стрелка от now до уровня с подписью «probably rug −X%» и причины
+    (parts) под чартом. Меньше 5 свечей — линия now и «not enough trades to chart yet»; нет данных
+    GeckoTerminal — текстовая карточка.
+
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
 и index.html не перезаписывает.
 
@@ -1037,6 +1043,142 @@ rep("@media (max-width:640px){\n",
     "@media (max-width:640px){.cs-rw-full{display:none}.cs-rw-short{display:inline}.cs-rw-timer{font-size:28px!important}}\n"
     "@media (prefers-reduced-motion:reduce){.cs-rw-pulse,.cs-rw-flash,.cs-rw-reveal{animation:none}}\n"
     "@media (max-width:640px){\n")
+
+# ---------------------------------------------------------------------------
+# чарт цены и «probably rug» на странице результата: блок между фактами и таблицей холдеров.
+# Свечи — GET /api/chart?token= отдельным запросом после вердикта (handleResult), пока грузится — skeleton.
+# SVG собирается строкой (chartHtml) в div с ref и перерисовывается при смене ширины.
+# rug из результата: красная пунктирная стрелка от now до now × level_factor, подпись и причины (parts).
+# ---------------------------------------------------------------------------
+CHART_JS = r"""// ---- price chart + probably rug (GET /api/chart after the verdict) ----
+const RUG_LABEL={linked:'linked wallets',transfer:'received by transfer',virgin:'fresh wallets',bundle:'bundle / snipers'};
+const MONO_F="'JetBrains Mono',monospace";
+const SUBD='₀₁₂₃₄₅₆₇₈₉';
+const escH=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtP=p=>{   // цена: $0.000131, мелкие — $0.0₅441
+  if(!(p>0)) return '$0';
+  if(p>=1) return '$'+p.toFixed(p>=100?0:2);
+  const z=Math.floor(-Math.log10(p));
+  if(z<4) return '$'+p.toFixed(z+3);
+  return '$0.0'+String(z).split('').map(c=>SUBD[c]).join('')+String(Math.round(p*Math.pow(10,z+3))).replace(/0+$/,'');
+};
+const dropPct=r=>Math.round(r.drop*100);
+function rugReasons(rug){
+  if(!rug) return '';
+  const tot=rug.share||1;
+  const rows=(rug.parts||[]).map(p=>{const n=(p.wallets||[]).length;
+    return `<div class="cs-rug-row" style="display:grid;grid-template-columns:minmax(0,200px) minmax(0,1fr) auto;gap:8px 16px;align-items:center;font-family:${MONO_F};font-size:12.5px">`
+      +`<span style="color:#c9d1d6">${RUG_LABEL[p.kind]||escH(p.kind)}</span>`
+      +`<div style="height:4px;background:#141b20;border-radius:2px;overflow:hidden"><div style="height:100%;width:${Math.max(2,p.share/tot*100).toFixed(1)}%;background:#ff4d4d"></div></div>`
+      +`<span style="color:#8a959c;white-space:nowrap">${n} wallet${n===1?'':'s'} · <span style="color:#eef1f3">${(p.share*100).toFixed(1)}%</span></span></div>`;}).join('');
+  return `<div data-rug-reasons="1" style="display:flex;flex-direction:column;gap:12px;padding:18px 20px 20px;border-top:1px solid #141b20">`
+    +`<div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px 16px;font-family:${MONO_F};font-size:11px;color:#5f6b72"><span>why probably rug</span><span>suspicious supply · ${(rug.share*100).toFixed(1)}% of float</span></div>`
+    +rows
+    +`<p style="margin:2px 0 0;font-size:14px;line-height:1.5;color:#8a959c;text-wrap:pretty">If these wallets sell into the current liquidity, the price could fall about ${dropPct(rug)}%.</p></div>`;
+}
+function chartHtml(st,rug,hdrPrice,W){
+  const mob=W<640, H=mob?230:300, sw=W-24;
+  const head=tf=>`<div style="display:flex;justify-content:space-between;gap:12px;padding:14px 20px 0;font-family:${MONO_F};font-size:11px;color:#5f6b72"><span>price${tf?' · '+escH(tf):''}</span><span>GeckoTerminal</span></div>`;
+  if(!st||st.status==='loading') return head('')+`<div style="padding:14px 20px 20px"><div class="cs-skel" data-chart-loading="1" style="height:${H-40}px;border-radius:8px"></div></div>`;
+  const d=st.data||{}, cs=(d.candles||[]).filter(c=>c&&c.length>=5&&c[4]>0);
+  const now=d.price_usd>0?d.price_usd:cs.length?cs[cs.length-1][4]:(hdrPrice>0?hdrPrice:null);
+  if(!now){   // нет данных GeckoTerminal: текстовая карточка, rug строкой
+    return head('')+`<div data-chart-empty="1" style="display:flex;flex-direction:column;gap:10px;padding:26px 20px 24px;font-family:${MONO_F}">`
+      +`<span style="font-size:13px;color:#8a959c">no price data from GeckoTerminal for this token yet</span>`
+      +(rug?`<span style="font-size:15px;color:#ff4d4d">probably rug −${dropPct(rug)}% if suspicious holders sell</span>`:'')+`</div>`+rugReasons(rug);
+  }
+  const few=cs.length<5;
+  const pl=6, pr=mob?70:82, pt=22, pb=26, pw=sw-pl-pr, ph=H-pt-pb;
+  const xEnd=pl+pw*(rug?0.74:0.97), xArrow=pl+pw*0.96;
+  const level=rug?now*rug.level_factor:null;
+  const vals=(few?[]:cs.map(c=>c[4])).concat([now]);
+  let lo=Math.min(...vals), hi=Math.max(...vals);
+  if(level!=null) lo=Math.min(lo,level);
+  if(hi<=lo){hi=now*1.25; lo=Math.min(lo,now*0.75);}
+  const pad=(hi-lo)*0.08; hi+=pad; lo=Math.max(0,lo-pad);
+  const gap=rug?24:0;   // под уровнем rug — место для подписи
+  const y=v=>pt+(1-(v-lo)/(hi-lo))*(ph-gap);
+  const t0=few?0:cs[0][0], t1=few?1:cs[cs.length-1][0];
+  const x=t=>pl+(t1>t0?(t-t0)/(t1-t0):1)*(xEnd-pl);
+  const yn=y(now), yl=level!=null?y(level):null;
+  let g='';
+  const nt=mob?3:4;
+  for(let i=0;i<=nt;i++){   // сетка и ось цены
+    const v=lo+(hi-lo)*i/nt, yy=y(v);
+    g+=`<line x1="${pl}" x2="${pl+pw}" y1="${yy.toFixed(1)}" y2="${yy.toFixed(1)}" stroke="#11171b" stroke-width="1"/>`;
+    if(Math.abs(yy-yn)>16&&(yl==null||Math.abs(yy-yl)>16)) g+=`<text x="${pl+pw+8}" y="${(yy+3.5).toFixed(1)}" fill="#5f6b72" font-size="10.5">${fmtP(v)}</text>`;
+  }
+  if(!few){   // ось времени
+    const span=t1-t0, nx=mob?3:5;
+    const lab=t=>{const dt=new Date(t*1000), hm=dt.toTimeString().slice(0,5), md=dt.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+      return span<172800?hm:span<518400&&!mob?md+' '+hm:md;};
+    for(let i=0;i<nx;i++){const t=t0+span*i/(nx-1); g+=`<text x="${x(t).toFixed(1)}" y="${H-8}" fill="#5f6b72" font-size="10.5" text-anchor="${i===0?'start':i===nx-1?'end':'middle'}">${lab(t)}</text>`;}
+    const pts=cs.map(c=>[x(c[0]),y(c[4])]); pts.push([xEnd,yn]);
+    const line=pts.map((q,i)=>(i?'L':'M')+q[0].toFixed(1)+' '+q[1].toFixed(1)).join(' ');
+    g+=`<defs><linearGradient id="cs-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#00c805" stop-opacity="0.16"/><stop offset="1" stop-color="#00c805" stop-opacity="0"/></linearGradient></defs>`;
+    g+=`<path d="${line} L${xEnd.toFixed(1)} ${pt+ph} L${pts[0][0].toFixed(1)} ${pt+ph} Z" fill="url(#cs-fill)"/>`;
+    g+=`<path d="${line}" fill="none" stroke="#00c805" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>`;
+  } else {   // меньше 5 свечей: линия now и подпись
+    g+=`<line x1="${pl}" x2="${xEnd}" y1="${yn.toFixed(1)}" y2="${yn.toFixed(1)}" stroke="#00c805" stroke-width="1.4" stroke-dasharray="4 4" opacity="0.8"/>`;
+    g+=`<text data-chart-few="1" x="${(pl+(xEnd-pl)/2).toFixed(1)}" y="${(yn>pt+ph/2?yn-14:yn+24).toFixed(1)}" fill="#8a959c" font-size="12" text-anchor="middle">not enough trades to chart yet</text>`;
+  }
+  if(rug){   // probably rug: стрелка от now до уровня
+    const dx=xArrow-xEnd, dy=yl-yn, len=Math.hypot(dx,dy)||1, ux=dx/len, uy=dy/len, ah=10;
+    const bx=xArrow-ux*ah, by=yl-uy*ah;
+    g+=`<line x1="${pl}" x2="${pl+pw}" y1="${yl.toFixed(1)}" y2="${yl.toFixed(1)}" stroke="#ff4d4d" stroke-width="1" stroke-dasharray="3 5" opacity="0.4"/>`;
+    g+=`<line data-rug-arrow="1" x1="${xEnd.toFixed(1)}" y1="${yn.toFixed(1)}" x2="${bx.toFixed(1)}" y2="${by.toFixed(1)}" stroke="#ff4d4d" stroke-width="1.8" stroke-dasharray="6 5"/>`;
+    g+=`<path d="M${xArrow.toFixed(1)} ${yl.toFixed(1)} L${(bx-uy*5).toFixed(1)} ${(by+ux*5).toFixed(1)} L${(bx+uy*5).toFixed(1)} ${(by-ux*5).toFixed(1)} Z" fill="#ff4d4d"/>`;
+    const ly=yl+19;   // под линией уровня (место — gap), чтобы не задевать стрелку
+    g+=`<text x="${(xArrow+4).toFixed(1)}" y="${ly.toFixed(1)}" fill="#ff4d4d" font-size="${mob?11.5:13}" font-weight="600" text-anchor="end">probably rug −${dropPct(rug)}%</text>`;
+    g+=`<rect x="${pl+pw+3}" y="${(yl-9).toFixed(1)}" width="${pr-4}" height="18" rx="3" fill="#ff4d4d"/><text x="${pl+pw+8}" y="${(yl+3.8).toFixed(1)}" fill="#1a0707" font-size="10.5" font-weight="600">${fmtP(level)}</text>`;
+  }
+  g+=`<circle cx="${xEnd.toFixed(1)}" cy="${yn.toFixed(1)}" r="8" fill="#00c805" opacity="0.18"/><circle cx="${xEnd.toFixed(1)}" cy="${yn.toFixed(1)}" r="3.6" fill="#00c805"/>`;
+  g+=`<rect x="${pl+pw+3}" y="${(yn-9).toFixed(1)}" width="${pr-4}" height="18" rx="3" fill="#00c805"/><text x="${pl+pw+8}" y="${(yn+3.8).toFixed(1)}" fill="#04140a" font-size="10.5" font-weight="600">${fmtP(now)}</text>`;
+  const rec=few?[]:cs.slice(-6).map(c=>y(c[4]));   // «now» с той стороны точки, где нет последних свечей
+  const below=!few&&!rug&&rec.filter(v=>v<yn-3).length>rec.filter(v=>v>yn+3).length&&yn+20<=pt+ph-4;
+  g+=rug?`<text x="${(xEnd+10).toFixed(1)}" y="${(yn-8).toFixed(1)}" fill="#00c805" font-size="10.5">now</text>`   // справа над стрелкой — свободно
+       :`<text x="${(xEnd-6).toFixed(1)}" y="${(below?yn+20:yn-12).toFixed(1)}" fill="#00c805" font-size="10.5" text-anchor="end">now</text>`;
+  return head(d.timeframe)+`<div style="padding:8px 12px 10px"><svg data-chart="1" width="${sw}" height="${H}" viewBox="0 0 ${sw} ${H}" style="display:block;max-width:100%" font-family="${MONO_F}" role="img" aria-label="price chart${rug?', probably rug −'+dropPct(rug)+'%':''}">${g}</svg></div>`+rugReasons(rug);
+}
+
+"""
+rep("class Component extends DCLogic {", CHART_JS + "class Component extends DCLogic {")
+CHART_BOX = ('        <div data-chart-box="1" style="display:{{chartDisplay}};margin-top:28px;border:1px solid #141b20;border-radius:12px;'
+             'background:#090c0f;overflow:hidden"><div ref="{{chartRef}}" style="min-height:120px"></div></div>\n\n')
+rep('        <div style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:28px;padding-top:32px">',
+    CHART_BOX + '        <div style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:28px;padding-top:32px">')
+rep("canvasRef=React.createRef(); logRef=React.createRef();",
+    "canvasRef=React.createRef(); logRef=React.createRef(); chartRef=React.createRef();")
+rep("  handleResult(r){this.m.result=r; this.bump();}",
+    "  handleResult(r){this.m.result=r; this.loadChart(); this.bump();}\n"
+    "  loadChart(){   // чарт — отдельным запросом, вердикт его не ждёт\n"
+    "    const m=this.m; m.chart={status:'loading'};\n"
+    "    fetch('/api/chart?token='+encodeURIComponent(m.ca)).then(r=>r.ok?r.json():null).catch(()=>null)\n"
+    "      .then(d=>{if(this.m!==m) return; m.chart={status:d?'ok':'none',data:d||{}}; this.bump();});\n"
+    "  }\n"
+    "  paintChart(){\n"
+    "    const el=this.chartRef.current, m=this.m; if(!el||!m.chart||!el.clientWidth) return;\n"
+    "    const raw=(m.result&&m.result.raw)||{}, rug=raw.rug||null, W=el.clientWidth;\n"
+    "    const key=[m.ca,m.chart.status,W,rug?rug.drop:0].join('|'); if(el.dataset.k===key) return;\n"
+    "    el.dataset.k=key; el.innerHTML=chartHtml(m.chart,rug,(raw.header||{}).price_usd,W);\n"
+    "  }")
+rep("  componentDidUpdate(){const el=this.logRef.current;",
+    "  componentDidUpdate(){this.paintChart(); const el=this.logRef.current;")
+rep("    window.addEventListener('popstate',this._pop);\n",
+    "    window.addEventListener('popstate',this._pop);\n"
+    "    this._chartRs=()=>this.paintChart(); window.addEventListener('resize',this._chartRs);\n")
+rep("window.removeEventListener('popstate',this._pop);",
+    "window.removeEventListener('popstate',this._pop); window.removeEventListener('resize',this._chartRs);")
+rep("      canvasRef:this.canvasRef, logRef:this.logRef,\n",
+    "      canvasRef:this.canvasRef, logRef:this.logRef, chartRef:this.chartRef,\n"
+    "      chartDisplay:m.done&&m.result&&!m.error&&m.chart?'block':'none',\n")
+CHART_CSS = """
+@keyframes cs-skel{0%{background-position:100% 0}100%{background-position:-100% 0}}
+.cs-skel{background:linear-gradient(90deg,#0c1114 30%,#131b20 50%,#0c1114 70%);background-size:200% 100%;animation:cs-skel 1.4s linear infinite}
+@media (prefers-reduced-motion:reduce){.cs-skel{animation:none}}
+@media (max-width:640px){.cs-rug-row{grid-template-columns:minmax(0,1fr) auto!important}.cs-rug-row>:nth-child(2){grid-column:1/-1;grid-row:2}}
+"""
+rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}" + CHART_CSS)
 
 # суммы меньше $1K — без хвоста знаков (тонкая ликвидность на Solana)
 rep("':'$'+v;", "':'$'+(v>=10?Math.round(v):v.toFixed(2));")
