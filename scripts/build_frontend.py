@@ -28,6 +28,18 @@
     бейдж сети у тикера, ссылки solscan для Solana (у Robinhood ссылок нет, как в дизайне),
     слот вместо блока, unread-кошельки серым, «operator (dump impact)», сообщение
     «Solana support is coming soon» под полем (флаг из /api/config).
+  - розыгрыш: секция «daily draw» после «the token», только если /api/draw/status -> enabled: true:
+    победитель последнего розыгрыша (solscan, шанс, приз, транзакция выплаты или payout pending),
+    таймер до next_draw, участники и снимки за сегодня, правила, Verify (пересчёт list_hash и
+    победителя в браузере: SubtleCrypto sha256 + BigInt, формула draw.py), история за 7 дней;
+    номера how/roadmap сдвигаются, только когда секция есть.
+  - Token Burn & Holder Rewards: секция сразу после «the token», только если /api/rewards/status ->
+    enabled: true. Две карточки: Burn (таймер до next_burn, последнее сжигание, всего сожжено и % сапплая,
+    кошелёк разработчика «burns from» и адрес сжиганий с copy) и Holder Rewards (кошелёк «rewards paid from», таймер до next_draw, блок доверия с Verify по
+    /api/rewards/<day>/*, последний победитель с copy, шанс, выплата или payout pending).
+    Таймер в нуле — «Waiting for burn transaction…» / «Picking the winner…»; новое сжигание — вспышка
+    «Tokens burned: N», новый розыгрыш — появление победителя. Большие таймеры — цифры в зелёных плитках
+    (моноширинные, фиксированной ширины), двоеточия без плиток. Ссылки — Blockscout Robinhood Chain.
 
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
 и index.html не перезаписывает.
@@ -572,6 +584,445 @@ rep("      onInput:e=>this.setState({input:e.target.value,inputError:''}),",
     "      onInput:e=>{const v=e.target.value, c=chainOf(v.trim()); this.setState(c?{input:v,inputError:'',inputNotice:'',net:c}:{input:v,inputError:'',inputNotice:''});},\n"
     "      ...this.netVals(),")
 
+
+# ---------------------------------------------------------------------------
+# розыгрыш: секция «daily draw» после «the token». Есть только если GET /api/draw/status
+# вернул enabled: true (иначе секции нет, номера следующих секций не сдвигаются).
+# Победитель последнего розыгрыша, таймер до next_draw, участники и снимки за сегодня,
+# правила, Verify (пересчёт list_hash и победителя в браузере по формуле draw.py), история за 7 дней.
+# ---------------------------------------------------------------------------
+DRAW_JS = r'''// ---- daily draw (/api/draw/*) ----
+const SOL_ACC=a=>'https://solscan.io/account/'+a, SOL_TX=t=>'https://solscan.io/tx/'+t;
+const drawShort=a=>a?a.slice(0,4)+'…'+a.slice(-4):'—';
+const BIG_KEYS=['weight','total_weight','r','winner_weight','total'];   // веса — целые базовые единицы: BigInt, без потери точности
+const parseBig=txt=>JSON.parse(txt,(k,v,ctx)=>BIG_KEYS.includes(k)&&typeof v==='number'?BigInt(ctx&&ctx.source!=null?ctx.source:v):v);
+async function sha256hex(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s)); return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('');}
+const fmtChance=(w,t)=>{if(w==null||!Number(t)) return '—'; const p=Number(w)/Number(t)*100; return p>=10?p.toFixed(1)+'%':p>=0.01?p.toFixed(2)+'%':'<0.01%';};
+const fmtLeft=ms=>{const s=Math.max(0,Math.floor(ms/1000)); return [Math.floor(s/3600),Math.floor(s/60)%60,s%60].map(x=>String(x).padStart(2,'0')).join(':');};
+// пересчёт розыгрыша в браузере, та же формула, что draw.py:
+// list_hash = sha256(канонический JSON [[адрес, вес], ...] по адресу, без пробелов);
+// r = int(sha256(blockhash + list_hash), 16) mod сумма_весов; победитель — первый адрес, у которого накопленная сумма > r
+async function verifyDraw(day,base='/api/draw'){   // base: /api/draw (Solana) или /api/rewards (Robinhood)
+  const get=async u=>{const r=await fetch(u); if(!r.ok) throw new Error('http '+r.status); return parseBig(await r.text());};
+  const [p,v]=await Promise.all([get(`${base}/${day}/participants`),get(`${base}/${day}/verify`)]);
+  const rows=p.participants.map(x=>[String(x.address),BigInt(x.weight)]).sort((a,b)=>a[0]<b[0]?-1:a[0]>b[0]?1:0);
+  const canon='['+rows.map(([a,w])=>'['+JSON.stringify(a)+','+w.toString()+']').join(',')+']';
+  const lh=await sha256hex(canon), total=rows.reduce((s,[,w])=>s+w,0n);
+  let r=null, winner=null;
+  if(rows.length&&total>0n){
+    r=BigInt('0x'+await sha256hex((v.inputs.blockhash||'')+lh))%total;
+    let acc=0n; for(const [a,w] of rows){acc+=w; if(acc>r){winner=a; break;}}
+  }
+  const str=x=>x==null?null:x.toString(), bad=[];
+  if(lh!==v.inputs.list_hash||lh!==p.list_hash) bad.push('list_hash');
+  if(str(total)!==str(v.inputs.total_weight)) bad.push('total weight');
+  if(str(r)!==str(v.stored.r)) bad.push('r');
+  if(winner!==v.stored.winner) bad.push('winner');
+  return {ok:!bad.length,bad,lh,r,winner,n:rows.length};
+}
+
+class Component extends DCLogic {'''
+rep("class Component extends DCLogic {", DRAW_JS)
+
+rep("  blank(ca){return {", r"""  loadDraw(){   // статус розыгрыша; выключен — секции нет и больше никаких запросов
+    const j=u=>fetch(u).then(r=>r.ok?r.json():null).catch(()=>null);
+    this._drawAt=Date.now();
+    j('/api/draw/status').then(st=>{
+      if(!st||!st.enabled){this.setState({draw:null}); clearInterval(this._drawT); this._drawT=null; return;}
+      j('/api/draw/history?limit=7').then(h=>{
+        this.setState({draw:{st,hist:(h&&h.draws)||[]},drawNow:Date.now()});
+        if(!this._drawT) this._drawT=setInterval(()=>this.drawTick(),1000);
+      });
+    });
+  }
+  drawTick(){   // таймер раз в секунду; после розыгрыша и раз в 5 минут — свежие данные
+    const d=this.state.draw, now=Date.now(); if(!d) return;
+    const since=now-this._drawAt, past=Date.parse(d.st.next_draw)<now-60000;
+    if((past&&since>60000)||since>300000) this.loadDraw();
+    this.setState({drawNow:now});
+  }
+  runVerify(){
+    const L=this.state.draw&&this.state.draw.hist[0]; if(!L) return;
+    const day=L.day, set=v=>this.setState({drawVerify:{day,...v}});
+    if(!(window.crypto&&crypto.subtle)){set({s:'err',text:'verification needs a secure (https) page'}); return;}
+    set({s:'busy',text:'recomputing…'});
+    verifyDraw(day).then(v=>set({s:v.ok?'ok':'bad',text:v.ok?'verified: matches':'mismatch: '+v.bad.join(', '),
+        detail:`${v.n} participants · list_hash ${v.lh.slice(0,12)}… · winner ${v.winner?drawShort(v.winner):'none'}`}))
+      .catch(e=>set({s:'err',text:'could not verify: '+e.message}));
+  }
+  drawVals(){
+    const d=this.state.draw;
+    if(!d) return {drawOn:false};
+    const st=d.st, now=this.state.drawNow||Date.now(), next=Date.parse(st.next_draw), left=next-now;
+    const L=d.hist[0]||null, won=!!(L&&L.winner), paid=!!(L&&L.payout_tx);
+    const vf=L&&this.state.drawVerify&&this.state.drawVerify.day===L.day?this.state.drawVerify:null;
+    const iso=new Date(next).toISOString(), prize=h=>`${h.prize_amount} ${h.prize_currency}`;
+    const hist=d.hist.map(h=>({day:h.day, hasWinner:!!h.winner, noWinner:!h.winner,
+      winner:h.winner?drawShort(h.winner):'no eligible holders', winnerUrl:h.winner?SOL_ACC(h.winner):'#',
+      chance:h.winner?fmtChance(h.winner_weight,h.total_weight):'—',
+      prize:h.payout_tx?prize(h):h.winner?'payout pending':'carries over', prizeColor:h.payout_tx?'#dfe5e8':'#5f6b72',
+      hasTx:!!h.payout_tx, noTx:!h.payout_tx, txUrl:h.payout_tx?SOL_TX(h.payout_tx):'#', txShort:h.payout_tx?drawShort(h.payout_tx):'—'}));
+    const vc={ok:G,bad:RD}[vf&&vf.s]||'#8a959c';
+    return {drawOn:true,
+      drawFirst:!L, drawWon:won, drawNone:!!L&&!won, dDayLabel:L?'draw of '+L.day:'no draws yet',
+      dWinner:won?drawShort(L.winner):'', dWinnerFull:won?L.winner:'', dWinnerUrl:won?SOL_ACC(L.winner):'#',
+      dChance:won?fmtChance(L.winner_weight,L.total_weight):'—',
+      dPaid:won&&paid, dPending:won&&!paid, dPrize:paid?prize(L):'', dTxUrl:paid?SOL_TX(L.payout_tx):'#', dTxShort:paid?drawShort(L.payout_tx):'',
+      dCountdown:left>0?fmtLeft(left):'drawing…', dNextUtc:`${iso.slice(11,16)} UTC · ${iso.slice(0,10)}`,
+      dParticipants:Number(st.participants_so_far||0).toLocaleString('en-US'), dSnaps:`${st.snapshots_today||0} / 24`,
+      dMinUsd:'$'+(st.min_usd!=null?st.min_usd:10),
+      dHist:hist, dHistAny:hist.length>0, dHistEmpty:!hist.length,
+      dCanVerify:!!L, onVerify:()=>this.runVerify(), dVerifyBusy:!!vf&&vf.s==='busy',
+      dVerifyShow:!!vf, dVerifyText:vf?vf.text:'', dVerifyColor:vc, dVerifyDetail:vf&&vf.detail?vf.detail:'',
+      dRawP:L?`/api/draw/${L.day}/participants`:'#', dRawV:L?`/api/draw/${L.day}/verify`:'#'};
+  }
+  blank(ca){return {""")
+rep("  state={view:'landing',input:'',inputError:'',inputNotice:'',net:'robinhood',solanaOn:null,copied:false,v:0};",
+    "  state={view:'landing',input:'',inputError:'',inputNotice:'',net:'robinhood',solanaOn:null,copied:false,v:0,draw:null,drawNow:0,drawVerify:null};")
+rep("    this.cfg=fetch('/api/config').then(r=>r.json()).then(d=>this.setState({solanaOn:!!d.solana})).catch(()=>{});\n",
+    "    this.cfg=fetch('/api/config').then(r=>r.json()).then(d=>this.setState({solanaOn:!!d.solana})).catch(()=>{});\n"
+    "    this.loadDraw();\n")
+rep("this.stopFeed(); this.stopLanding(); clearInterval(this.timer);",
+    "this.stopFeed(); this.stopLanding(); clearInterval(this.timer); clearInterval(this._drawT);")
+rep("      ...this.netVals(),\n", "      ...this.netVals(),\n      ...this.drawVals(),\n")
+
+# номера секций: с розыгрышем how/roadmap сдвигаются на один
+rep('''color:#eef1f3">how it works</h2>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72">03</span>''',
+    '''color:#eef1f3">how it works</h2>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72">{{numHow}}</span>''')
+mr = re.search(r'''(color:#eef1f3">roadmap</h2>\s*<span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72">)04(</span>)''', t)
+if not mr:
+    sys.exit("design.html: не найден номер секции roadmap (04) — сборка остановлена")
+t = t[:mr.start()] + mr.group(1) + "{{numRoadmap}}" + mr.group(2) + t[mr.end():]
+
+CARD = ('display:flex;flex-direction:column;gap:18px;padding:28px 26px;border:1px solid #141b20;border-radius:14px;'
+        'background:linear-gradient(180deg,#0c1114,#090c0f);box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);box-sizing:border-box;min-width:0')
+LABEL = f'{MONO};font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:#5f6b72'
+LINK = f'{MONO};color:#9fd9ff'
+stat = lambda label, body: (f'<div style="display:flex;flex-direction:column;gap:6px;min-width:0"><span style="{LABEL}">{label}</span>{body}</div>')
+STEPS = [
+    "Hold the token. Your chance is your average balance over the day: 1 token = 1 ticket.",
+    "Wallets holding under {{dMinUsd}} on average are not eligible. Pools and programs never are.",
+    "The winner is picked from a Solana block hash that nobody knows in advance.",
+    "Prizes are sent manually from a public wallet. Every payout links to its transaction.",
+]
+steps = "".join(
+    f'<div style="display:flex;gap:14px;align-items:baseline"><span style="{MONO};font-size:12px;color:#00c805;flex-shrink:0">0{i + 1}</span>'
+    f'<span style="font-size:15px;line-height:1.55;color:#aab4ba;text-wrap:pretty">{s}</span></div>' for i, s in enumerate(STEPS))
+HIST_COLS = "grid-template-columns:110px minmax(0,1fr) 90px minmax(0,1fr) minmax(0,1fr);gap:16px"
+DRAW_SECTION = f'''      <sc-if value="{{{{drawOn}}}}" hint-placeholder-val="{{{{false}}}}"><section id="draw" class="cs-wrap" style="max-width:1280px;margin:0 auto;padding:40px 32px 120px;box-sizing:border-box">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;gap:24px;border-top:1px solid #12181c;padding-top:22px;margin-bottom:44px">
+          <h2 data-grip="1" style="margin:0;font-size:34px;font-weight:500;letter-spacing:-0.03em;color:#eef1f3">daily draw</h2>
+          <span style="{MONO};font-size:12px;color:#5f6b72">{{{{numDraw}}}}</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:24px;align-items:stretch">
+          <div data-grip="1" style="flex:1 1 560px;{CARD}">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">today's winner</span><span style="color:#5f6b72">{{{{dDayLabel}}}}</span></div>
+            <sc-if value="{{{{drawFirst}}}}" hint-placeholder-val="{{{{false}}}}"><h3 style="margin:0;font-size:28px;font-weight:500;letter-spacing:-0.02em;color:#eef1f3">first draw in <span style="{MONO};color:#00c805">{{{{dCountdown}}}}</span></h3>
+              <p style="margin:0;font-size:15px;line-height:1.6;color:#8a959c">The first winner is drawn from today's hourly snapshots at {{{{dNextUtc}}}}.</p></sc-if>
+            <sc-if value="{{{{drawNone}}}}" hint-placeholder-val="{{{{false}}}}"><h3 style="margin:0;font-size:28px;font-weight:500;letter-spacing:-0.02em;color:#eef1f3">no eligible holders</h3>
+              <p style="margin:0;font-size:15px;line-height:1.6;color:#8a959c">No wallet held enough on average that day. The prize carries over to the next draw.</p></sc-if>
+            <sc-if value="{{{{drawWon}}}}" hint-placeholder-val="{{{{false}}}}"><a href="{{{{dWinnerUrl}}}}" title="{{{{dWinnerFull}}}}" target="_blank" rel="noopener" data-draw-winner="1" style="{MONO};font-size:clamp(28px,4vw,40px);letter-spacing:-0.02em;color:#eef1f3" style-hover="color:#9fd9ff">{{{{dWinner}}}} ↗</a>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:18px;border-top:1px solid #141b20;padding-top:18px">
+                {stat("chance", f'<span data-draw-chance="1" style="{MONO};font-size:18px;color:#eef1f3">{{{{dChance}}}}</span>')}
+                {stat("prize", f'<sc-if value="{{{{dPaid}}}}" hint-placeholder-val="{{{{false}}}}"><span style="{MONO};font-size:18px;color:#00c805">{{{{dPrize}}}}</span></sc-if><sc-if value="{{{{dPending}}}}" hint-placeholder-val="{{{{false}}}}"><span style="{MONO};font-size:18px;color:#8a959c">payout pending</span></sc-if>')}
+                {stat("payout", f'<sc-if value="{{{{dPaid}}}}" hint-placeholder-val="{{{{false}}}}"><a href="{{{{dTxUrl}}}}" target="_blank" rel="noopener" style="{LINK};font-size:15px" style-hover="color:#ffffff">{{{{dTxShort}}}} ↗</a></sc-if><sc-if value="{{{{dPending}}}}" hint-placeholder-val="{{{{false}}}}"><span style="{MONO};font-size:15px;color:#5f6b72">—</span></sc-if>')}
+              </div></sc-if>
+          </div>
+          <div data-grip="1" style="flex:1 1 320px;{CARD}">
+            <span style="{MONO};font-size:13px;color:#00c805">next draw</span>
+            <span data-draw-timer="1" style="{MONO};font-size:clamp(34px,4vw,44px);letter-spacing:-0.02em;color:#eef1f3">{{{{dCountdown}}}}</span>
+            <span style="{MONO};font-size:12px;color:#5f6b72">{{{{dNextUtc}}}}</span>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;border-top:1px solid #141b20;padding-top:18px;margin-top:auto">
+              {stat("participants today", f'<span style="{MONO};font-size:18px;color:#eef1f3">{{{{dParticipants}}}}</span>')}
+              {stat("snapshots today", f'<span style="{MONO};font-size:18px;color:#eef1f3">{{{{dSnaps}}}}</span>')}
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:24px;align-items:stretch;margin-top:24px">
+          <div data-grip="1" style="flex:1 1 560px;{CARD}">
+            <span style="{MONO};font-size:13px;color:#00c805">how it's picked</span>
+            {steps}
+          </div>
+          <div data-grip="1" style="flex:1 1 320px;{CARD}">
+            <span style="{MONO};font-size:13px;color:#00c805">verify</span>
+            <p style="margin:0;font-size:15px;line-height:1.6;color:#8a959c">Recompute the latest draw in your browser from the raw data: the list hash, the random number and the winner.</p>
+            <sc-if value="{{{{dCanVerify}}}}" hint-placeholder-val="{{{{false}}}}"><div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px 18px">
+              <button sc-camel-on-click="{{{{onVerify}}}}" data-draw-verify="1" style="{MONO};font-size:13px;color:#04140a;background:#00c805;border:0;padding:10px 18px;border-radius:8px;cursor:pointer" style-hover="background:#19dd1f">Verify</button>
+              <a href="{{{{dRawP}}}}" target="_blank" rel="noopener" style="{LINK};font-size:12px" style-hover="color:#ffffff">participants.json ↗</a>
+              <a href="{{{{dRawV}}}}" target="_blank" rel="noopener" style="{LINK};font-size:12px" style-hover="color:#ffffff">verify.json ↗</a>
+            </div></sc-if>
+            <sc-if value="{{{{drawFirst}}}}" hint-placeholder-val="{{{{false}}}}"><span style="{MONO};font-size:12px;color:#5f6b72">available after the first draw</span></sc-if>
+            <sc-if value="{{{{dVerifyShow}}}}" hint-placeholder-val="{{{{false}}}}"><div style="display:flex;flex-direction:column;gap:6px">
+              <span data-draw-verdict="1" style="{MONO};font-size:14px;color:{{{{dVerifyColor}}}}">{{{{dVerifyText}}}}</span>
+              <span style="{MONO};font-size:11.5px;line-height:1.6;color:#5f6b72;overflow-wrap:anywhere">{{{{dVerifyDetail}}}}</span>
+            </div></sc-if>
+          </div>
+        </div>
+        <div data-grip="1" style="margin-top:24px;border:1px solid #141b20;border-radius:14px;background:#090c0f;padding:8px 14px;box-sizing:border-box">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 12px 8px;{MONO};font-size:13px"><span style="color:#00c805">history</span><span style="color:#5f6b72">last 7 draws</span></div>
+          <div class="cs-draw-head" style="display:grid;{HIST_COLS};padding:10px 12px;border-bottom:1px solid #141b20;{LABEL}"><span>day</span><span>winner</span><span>chance</span><span>prize</span><span>payout tx</span></div>
+          <sc-if value="{{{{dHistEmpty}}}}" hint-placeholder-val="{{{{false}}}}"><div style="padding:16px 12px;{MONO};font-size:13px;color:#5f6b72">no draws yet</div></sc-if>
+          <sc-for list="{{{{dHist}}}}" as="h" hint-placeholder-count="3"><div class="cs-draw-row" style="display:grid;{HIST_COLS};align-items:center;padding:12px;border-bottom:1px solid #12181c;{MONO};font-size:13px">
+            <span style="color:#8a959c">{{{{h.day}}}}</span>
+            <span style="min-width:0"><sc-if value="{{{{h.hasWinner}}}}" hint-placeholder-val="{{{{true}}}}"><a href="{{{{h.winnerUrl}}}}" target="_blank" rel="noopener" style="color:#dfe5e8" style-hover="color:#9fd9ff">{{{{h.winner}}}} ↗</a></sc-if><sc-if value="{{{{h.noWinner}}}}" hint-placeholder-val="{{{{false}}}}"><span style="color:#5f6b72">{{{{h.winner}}}}</span></sc-if></span>
+            <span style="color:#dfe5e8">{{{{h.chance}}}}</span>
+            <span style="color:{{{{h.prizeColor}}}}">{{{{h.prize}}}}</span>
+            <span style="min-width:0"><sc-if value="{{{{h.hasTx}}}}" hint-placeholder-val="{{{{false}}}}"><a href="{{{{h.txUrl}}}}" target="_blank" rel="noopener" style="color:#9fd9ff" style-hover="color:#ffffff">{{{{h.txShort}}}} ↗</a></sc-if><sc-if value="{{{{h.noTx}}}}" hint-placeholder-val="{{{{true}}}}"><span style="color:#5f6b72">—</span></sc-if></span>
+          </div></sc-for>
+        </div>
+      </section></sc-if>
+
+'''
+rep('      <section id="how" ', DRAW_SECTION + '      <section id="how" ')
+# история на телефоне: день во всю строку, под ним победитель · шанс, приз · транзакция
+rep("@media (max-width:640px){\n", "@media (max-width:640px){\n"
+    "  .cs-draw-head{display:none!important}\n"
+    "  .cs-draw-row{grid-template-columns:minmax(0,1fr) auto!important;gap:6px 12px!important}\n"
+    "  .cs-draw-row>:first-child{grid-column:1/-1}\n")
+
+# ---------------------------------------------------------------------------
+# Token Burn & Holder Rewards: секция сразу после «the token», только если GET /api/rewards/status
+# вернул enabled: true. Две карточки одинакового размера (на телефоне друг под другом):
+#   Burn — таймер до next_burn, последнее сжигание, всего сожжено (% сапплая), адрес сжиганий;
+#   Holder Rewards — таймер до next_draw, блок доверия с Verify (пересчёт по /api/rewards/<day>/*),
+#   последний победитель, шанс и статус выплаты.
+# Таймер в нуле: «Waiting for burn transaction…» до новой транзакции сжигания (сжигание не раньше чем
+# за 30 минут до планового времени засчитывается ему), «Picking the winner…» до розыгрыша этих суток.
+# Новое сжигание за время на странице — вспышка «Tokens burned: N», новый розыгрыш — появление победителя.
+# Ссылки — эксплорер Robinhood Chain (Blockscout). Суммы — BigInt из базовых единиц и decimals.
+# ---------------------------------------------------------------------------
+RH_EXPLORER = "https://robinhoodchain.blockscout.com"
+RW_JS = r'''// ---- token burn & holder rewards (/api/rewards/*) ----
+const RH_ADDR=a=>'__RH__/address/'+a, RH_TX=t=>'__RH__/tx/'+t;
+const rwShort=a=>a?a.slice(0,6)+'…'+a.slice(-4):'—';
+const RW_BIG=['amount','total_supply','minted','dead_balance','weight','total_weight','payout_amount'];   // базовые единицы: BigInt
+const parseRw=txt=>JSON.parse(txt,(k,v,ctx)=>RW_BIG.includes(k)&&typeof v==='number'?BigInt(ctx&&ctx.source!=null?ctx.source:v):v);
+// базовые единицы -> токены с разделителями; меньше 1000 — до двух знаков после точки
+const fmtUnits=(raw,dec)=>{
+  if(raw==null) return '—';
+  const base=10n**BigInt(dec??18), b=BigInt(raw), i=b/base, f=(b%base)*100n/base;
+  const s=i.toLocaleString('en-US'); if(i>=1000n||f===0n) return s;
+  return s+'.'+f.toString().padStart(2,'0').replace(/0$/,'');
+};
+const fmtPctOf=(a,b)=>{if(a==null||!b) return null; const p=Number(BigInt(a)*1000000n/BigInt(b))/10000; return p>=0.01?p.toFixed(2)+'%':p>0?'<0.01%':'0%';};
+const fmtUtcTs=ms=>{const s=new Date(ms).toISOString(); return s.slice(0,10)+' '+s.slice(11,16)+' UTC';};
+const RW_GRACE=1800000;   // сжигание за 30 минут до планового времени засчитывается этому времени
+const rwTiles=ms=>fmtLeft(ms).split('').map(c=>({c,digit:c!==':',colon:c===':'}));   // таймер плитками: цифры в плитках, двоеточия без
+const burnKey=st=>st.last_burn?st.last_burn.tx+':'+st.last_burn.log_index:null;
+const burnedFor=(st,target)=>!!st.last_burn&&st.last_burn.time*1000>=target-RW_GRACE;
+
+class Component extends DCLogic {'''.replace("__RH__", RH_EXPLORER)
+rep("class Component extends DCLogic {", RW_JS)
+
+rep("  blank(ca){return {", r"""  loadRewards(){   // статус Rewards & Burns; выключено — секции нет и больше никаких запросов
+    this._rwAt=Date.now();
+    fetch('/api/rewards/status').then(r=>r.ok?r.text():null).then(txt=>{
+      const st=txt?parseRw(txt):null;
+      if(!st||!st.enabled){this.setState({rw:null}); clearInterval(this._rwT); this._rwT=null; return;}
+      this.rwUpdate(st);
+      if(!this._rwT) this._rwT=setInterval(()=>this.rwTick(),1000);
+    }).catch(()=>{});
+  }
+  rwUpdate(st){
+    const now=Date.now(), prev=this.state.rw, s={rw:st,rwNow:now};
+    if(!prev){   // первая загрузка: цели таймеров; только что прошедшее время (< 1 ч) без результата — ждём его
+      const nb=Date.parse(st.next_burn), slot=(Date.parse(st.next_burns[1])-nb)||43200000;
+      this._rwBurn={target:now-(nb-slot)<3600000&&!burnedFor(st,nb-slot)?nb-slot:nb, slot, seen:burnKey(st)};
+      const nd=Date.parse(st.next_draw), pd=nd-86400000, pday=new Date(pd).toISOString().slice(0,10);
+      const late=now-pd<3600000&&st.last_draw&&st.last_draw.day<pday;
+      this._rwDraw={target:late?pd:nd, day:late?pday:st.next_draw_day, seen:st.last_draw?st.last_draw.day:null};
+    }else{
+      const b=this._rwBurn, d=this._rwDraw, key=burnKey(st), day=st.last_draw?st.last_draw.day:null;
+      if(key&&key!==b.seen){b.seen=key; s.rwBurnFlash={text:fmtUnits(st.last_burn.amount,st.decimals),until:now+6000};}
+      if(day&&day!==d.seen){d.seen=day; s.rwReveal=now+4000;}
+    }
+    this.setState(s); this.rwTick(st);
+  }
+  rwTick(fresh){   // таймеры раз в секунду; свежий статус раз в минуту, в нуле таймера — каждые 10 секунд
+    const st=fresh||this.state.rw, now=Date.now(); if(!st) return;
+    const b=this._rwBurn, d=this._rwDraw;
+    while(now>=b.target&&burnedFor(st,b.target)) b.target+=b.slot;
+    if(now>=d.target&&st.last_draw&&st.last_draw.day>=d.day){d.target=Date.parse(st.next_draw); d.day=st.next_draw_day;}
+    const busy=now>=b.target||now>=d.target, since=now-this._rwAt;
+    if(since>(busy?10000:60000)) this.loadRewards();
+    this.setState({rwNow:now});
+  }
+  copyText(key,text){   // copy с галочкой на 1.5 с
+    const fallback=()=>{const t=document.createElement('textarea'); t.value=text; t.style.position='fixed'; t.style.opacity='0'; document.body.appendChild(t); t.select(); try{document.execCommand('copy');}catch(e){} t.remove();};
+    try{ if(navigator.clipboard&&window.isSecureContext) navigator.clipboard.writeText(text).catch(fallback); else fallback(); }catch(e){fallback();}
+    this.setState({rwCopied:key}); clearTimeout(this._rwCT); this._rwCT=setTimeout(()=>this.setState({rwCopied:''}),1500);
+  }
+  runRwVerify(){
+    const L=this.state.rw&&this.state.rw.last_draw; if(!L) return;
+    const day=L.day, set=v=>this.setState({rwVerify:{day,...v}});
+    if(!(window.crypto&&crypto.subtle)){set({s:'err',text:'verification needs a secure (https) page'}); return;}
+    set({s:'busy',text:'recomputing…'});
+    verifyDraw(day,'/api/rewards').then(v=>set({s:v.ok?'ok':'bad',text:v.ok?'verified: matches':'mismatch: '+v.bad.join(', '),
+        detail:`draw of ${day} · ${v.n} participants · list_hash ${v.lh.slice(0,12)}… · winner ${v.winner?rwShort(v.winner):'none'}`}))
+      .catch(e=>set({s:'err',text:'could not verify: '+e.message}));
+  }
+  rwVals(){
+    const st=this.state.rw;
+    if(!st) return {rwOn:false};
+    const now=this.state.rwNow||Date.now(), dec=st.decimals, b=this._rwBurn, d=this._rwDraw;
+    const waiting=now>=b.target, picking=now>=d.target;
+    const lb=st.last_burn, tb=st.total_burned, L=st.last_draw, won=!!(L&&L.winner), paid=!!(L&&L.payout_tx);
+    const fl=this.state.rwBurnFlash, flash=!!fl&&now<fl.until, reveal=!!this.state.rwReveal&&now<this.state.rwReveal;
+    const vf=L&&this.state.rwVerify&&this.state.rwVerify.day===L.day?this.state.rwVerify:null;
+    const cp=this.state.rwCopied, devs=k=>(st.dev_wallets||[]).map((a,i)=>({full:a, short:rwShort(a), url:RH_ADDR(a),
+      copy:()=>this.copyText(k+i,a), idle:cp!==k+i, done:cp===k+i})), drawLeft=picking?'Picking the winner…':fmtLeft(d.target-now);
+    return {rwOn:true,
+      rwBurnCount:!waiting, rwBurnWait:waiting, rwBurnLeft:fmtLeft(b.target-now), rwBurnAt:fmtUtcTs(b.target),
+      rwBurnFlash:flash, rwBurnFlashText:flash?fl.text:'',
+      rwHasBurn:!!lb, rwNoBurn:!lb, rwLastAmt:lb?fmtUnits(lb.amount,dec):'', rwLastTime:lb?fmtUtcTs(lb.time*1000):'',
+      rwLastTxUrl:lb?RH_TX(lb.tx):'#', rwLastTx:lb?rwShort(lb.tx):'',
+      rwTotal:tb?fmtUnits(tb.amount,dec):fmtUnits(st.burned_by_dev.amount,dec),
+      rwTotalPct:tb&&tb.minted?fmtPctOf(tb.amount,tb.minted)+' of supply':'',
+      rwBurnTiles:rwTiles(b.target-now), rwDrawTiles:rwTiles(d.target-now),
+      rwDevs:devs('burn'), rwPayDevs:devs('pay'), rwHasDevs:!!(st.dev_wallets&&st.dev_wallets.length),
+      rwBurnAddr:st.burn_address, rwBurnAddrUrl:RH_ADDR(st.burn_address),
+      copyRwBurn:()=>this.copyText('burn',st.burn_address), rwBurnDone:cp==='burn', rwBurnIdle:cp!=='burn',
+      rwDrawCount:!picking, rwDrawPick:picking, rwDrawLeft:fmtLeft(d.target-now), rwDrawAt:fmtUtcTs(d.target),
+      rwFirst:!L, rwFirstText:'First draw in '+drawLeft,
+      rwWon:won&&!reveal, rwWonNew:won&&reveal, rwNone:!!L&&!won,
+      rwWinner:won?rwShort(L.winner):'', rwWinnerFull:won?L.winner:'', rwWinnerUrl:won?RH_ADDR(L.winner):'#',
+      copyRwWinner:()=>this.copyText('winner',won?L.winner:''), rwWinDone:cp==='winner', rwWinIdle:cp!=='winner',
+      rwChance:won?fmtChance(L.weight,L.total_weight)+' chance':'', rwDayLabel:L?'draw of '+L.day:'',
+      rwPaid:won&&paid, rwPending:won&&!paid, rwPrize:paid?fmtUnits(L.payout_amount,dec):'',
+      rwTxUrl:paid?RH_TX(L.payout_tx):'#', rwTxShort:paid?rwShort(L.payout_tx):'',
+      rwCanVerify:!!L, onRwVerify:()=>this.runRwVerify(), rwVerifyShow:!!vf, rwVerifyText:vf?vf.text:'',
+      rwVerifyColor:{ok:G,bad:RD}[vf&&vf.s]||'#8a959c', rwVerifyDetail:vf&&vf.detail?vf.detail:''};
+  }
+  secVals(){   // номера секций: the token 02, дальше — только показанные
+    let n=2; const next=()=>String(++n).padStart(2,'0');
+    const out={};
+    if(this.state.rw) out.numRewards=next();
+    if(this.state.draw) out.numDraw=next();
+    out.numHow=next(); out.numRoadmap=next();
+    return out;
+  }
+  blank(ca){return {""")
+rep("  state={view:'landing',input:'',inputError:'',inputNotice:'',net:'robinhood',solanaOn:null,copied:false,v:0,draw:null,drawNow:0,drawVerify:null};",
+    "  state={view:'landing',input:'',inputError:'',inputNotice:'',net:'robinhood',solanaOn:null,copied:false,v:0,draw:null,drawNow:0,drawVerify:null,"
+    "rw:null,rwNow:0,rwVerify:null,rwBurnFlash:null,rwReveal:0,rwCopied:''};")
+rep("    this.loadDraw();\n", "    this.loadDraw();\n    this.loadRewards();\n")
+rep("this.stopLanding(); clearInterval(this.timer); clearInterval(this._drawT);",
+    "this.stopLanding(); clearInterval(this.timer); clearInterval(this._drawT); clearInterval(this._rwT);")
+rep("      ...this.drawVals(),\n", "      ...this.drawVals(),\n      ...this.rwVals(),\n      ...this.secVals(),\n")
+
+def rw_copy(key, idle, done, label):
+    return (f'<button sc-camel-on-click="{{{{copyRw{key}}}}}" title="{label}" aria-label="{label}" '
+            f'style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;'
+            f'border:1px solid #1c252b;border-radius:7px;background:#0b1013;color:#8a959c;cursor:pointer;flex-shrink:0" '
+            f'style-hover="color:#ffffff;border-color:#2c353b">'
+            f'<sc-if value="{{{{{idle}}}}}" hint-placeholder-val="{{{{true}}}}">{ICON_COPY}</sc-if>'
+            f'<sc-if value="{{{{{done}}}}}" hint-placeholder-val="{{{{false}}}}">{ICON_CHECK}</sc-if></button>')
+
+def sif(cond, body, ph="false"):
+    return f'<sc-if value="{{{{{cond}}}}}" hint-placeholder-val="{{{{{ph}}}}}">{body}</sc-if>'
+
+TIMER = f'{MONO};font-size:clamp(32px,3.6vw,42px);line-height:1;display:flex;align-items:center;gap:0.1em;font-variant-numeric:tabular-nums'
+TILE = ('display:inline-flex;align-items:center;justify-content:center;width:1em;height:1.32em;border-radius:0.2em;'
+        'background:rgba(0,200,5,0.16);border:1px solid rgba(0,200,5,0.42);color:#d9ffd4;box-sizing:border-box;'
+        'box-shadow:inset 0 1px 0 rgba(255,255,255,0.06);text-shadow:0 0 12px rgba(0,200,5,0.35)')
+COLON = 'display:inline-block;width:0.5em;text-align:center;color:#00c805;margin-top:-0.08em'
+tiles = lambda key: (f'<sc-for list="{{{{{key}}}}}" as="c" hint-placeholder-count="8">'
+                     f'<sc-if value="{{{{c.digit}}}}" hint-placeholder-val="{{{{true}}}}"><span class="cs-rw-tile" style="{TILE}">{{{{c.c}}}}</span></sc-if>'
+                     f'<sc-if value="{{{{c.colon}}}}" hint-placeholder-val="{{{{false}}}}"><span style="{COLON}">:</span></sc-if></sc-for>')
+BUSY = f'{MONO};font-size:clamp(20px,2.4vw,26px);letter-spacing:-0.01em;color:#f5a623;line-height:1.3'
+TEXT = 'margin:0;font-size:15px;line-height:1.6;color:#8a959c;text-wrap:pretty'
+BURN_TEXT = ("Every 12 hours the developer burns tokens from his personal supply. Burning makes tokens more valuable "
+             "because the supply gets smaller and smaller day by day.")
+DRAW_TEXT = ("Every 24 hours one holder is picked at random and receives 10% of the token's fees, paid in tokens. "
+             "Every holder takes part, even the smallest. Your chance = your average balance over the day "
+             "(1 token = 1 ticket), so buying right before the draw doesn't help.")
+TRUST_TEXT = ("The winner is picked from the hash of a Robinhood Chain block produced after the holder list is locked. "
+              "Nobody, including the developer, can know or change it in advance.")
+winner_line = lambda cls: (
+    f'<div class="{cls}" style="display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;{MONO};font-size:15px">'
+    f'<span style="color:#8a959c">Last winner:</span>'
+    f'<a href="{{{{rwWinnerUrl}}}}" title="{{{{rwWinnerFull}}}}" target="_blank" rel="noopener" data-rw-winner="1" style="color:#eef1f3" style-hover="color:#9fd9ff">{{{{rwWinner}}}} ↗</a>'
+    + rw_copy("Winner", "rwWinIdle", "rwWinDone", "copy winner address") + '</div>')
+dev_rows = lambda key, label, attr: sif("rwHasDevs", f'<span style="{LABEL}">{label}</span><sc-for list="{{{{{key}}}}}" as="w" hint-placeholder-count="1"><div {attr}="1" style="display:flex;align-items:center;gap:10px;min-width:0"><a href="{{{{w.url}}}}" title="{{{{w.full}}}}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#dfe5e8;overflow-wrap:anywhere;min-width:0" style-hover="color:#9fd9ff"><span class="cs-rw-full">{{{{w.full}}}}</span><span class="cs-rw-short">{{{{w.short}}}}</span> ↗</a><button sc-camel-on-click="{{{{w.copy}}}}" title="copy developer wallet" aria-label="copy developer wallet" style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px solid #1c252b;border-radius:7px;background:#0b1013;color:#8a959c;cursor:pointer;flex-shrink:0" style-hover="color:#ffffff;border-color:#2c353b"><sc-if value="{{{{w.idle}}}}" hint-placeholder-val="{{{{true}}}}">{ICON_COPY}</sc-if><sc-if value="{{{{w.done}}}}" hint-placeholder-val="{{{{false}}}}">{ICON_CHECK}</sc-if></button></div></sc-for><span style="height:6px"></span>')
+REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{{{false}}}}"><section id="rewards" class="cs-wrap" style="max-width:1280px;margin:0 auto;padding:40px 32px 120px;box-sizing:border-box">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;gap:24px;border-top:1px solid #12181c;padding-top:22px;margin-bottom:44px">
+          <h2 data-grip="1" style="margin:0;font-size:34px;font-weight:500;letter-spacing:-0.03em;color:#eef1f3">token burn &amp; holder rewards</h2>
+          <span style="{MONO};font-size:12px;color:#5f6b72">{{{{numRewards}}}}</span>
+        </div>
+        <div class="cs-rw-grid" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;align-items:stretch">
+          <div data-grip="1" data-rw-burn="1" style="{CARD}">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">burn</span><span style="color:#5f6b72">every 12 hours</span></div>
+            <div style="display:flex;flex-direction:column;gap:6px;min-height:76px">
+              <span style="{LABEL}">next burn</span>
+              {sif("rwBurnCount", f'<div data-rw-burn-timer="1" class="cs-rw-timer" role="timer" aria-label="{{{{rwBurnLeft}}}}" style="{TIMER}">{tiles("rwBurnTiles")}</div>', "true")}
+              {sif("rwBurnWait", f'<span data-rw-burn-wait="1" class="cs-rw-pulse" style="{BUSY}">Waiting for burn transaction…</span>')}
+              <span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwBurnAt}}}}</span>
+            </div>
+            {sif("rwBurnFlash", f'<div class="cs-rw-flash" data-rw-flash="1" style="{MONO};font-size:15px;color:#04140a;background:#00c805;padding:10px 14px;border-radius:8px;overflow-wrap:anywhere">Tokens burned: {{{{rwBurnFlashText}}}}</div>')}
+            <p style="{TEXT}">{BURN_TEXT}</p>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:18px;border-top:1px solid #141b20;padding-top:18px">
+              {stat("last burn", sif("rwHasBurn", f'<span data-rw-last-burn="1" style="{MONO};font-size:18px;color:#eef1f3">{{{{rwLastAmt}}}} tokens</span><span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwLastTime}}}}</span><a href="{{{{rwLastTxUrl}}}}" target="_blank" rel="noopener" style="{LINK};font-size:13px" style-hover="color:#ffffff">{{{{rwLastTx}}}} ↗</a>') + sif("rwNoBurn", f'<span style="{MONO};font-size:15px;color:#5f6b72">no burns yet</span>'))}
+              {stat("total burned", f'<span data-rw-total="1" style="{MONO};font-size:18px;color:#eef1f3">{{{{rwTotal}}}} tokens</span><span style="{MONO};font-size:12px;color:#00c805">{{{{rwTotalPct}}}}</span>')}
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px;margin-top:auto;border-top:1px solid #141b20;padding-top:18px">
+              {dev_rows("rwDevs", "burns from", "data-rw-dev")}
+              <span style="{LABEL}">burn address</span>
+              <div style="display:flex;align-items:center;gap:10px;min-width:0">
+                <a href="{{{{rwBurnAddrUrl}}}}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#dfe5e8;overflow-wrap:anywhere;min-width:0" style-hover="color:#9fd9ff">{{{{rwBurnAddr}}}} ↗</a>
+                {rw_copy("Burn", "rwBurnIdle", "rwBurnDone", "copy burn address")}
+              </div>
+            </div>
+          </div>
+          <div data-grip="1" data-rw-draw="1" style="{CARD}">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">holder rewards</span><span style="color:#5f6b72">every 24 hours</span></div>
+            <div style="display:flex;flex-direction:column;gap:6px;min-height:76px">
+              <span style="{LABEL}">next draw</span>
+              {sif("rwDrawCount", f'<div data-rw-draw-timer="1" class="cs-rw-timer" role="timer" aria-label="{{{{rwDrawLeft}}}}" style="{TIMER}">{tiles("rwDrawTiles")}</div>', "true")}
+              {sif("rwDrawPick", f'<span data-rw-draw-pick="1" class="cs-rw-pulse" style="{BUSY}">Picking the winner…</span>')}
+              <span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwDrawAt}}}}</span>
+            </div>
+            <p style="{TEXT}">{DRAW_TEXT}</p>
+            <div style="display:flex;flex-direction:column;gap:14px;padding:16px 18px;border:1px solid #1c252b;border-radius:10px;background:#0a0e11">
+              <p style="margin:0;font-size:14px;line-height:1.6;color:#aab4ba;text-wrap:pretty">{TRUST_TEXT}</p>
+              {sif("rwCanVerify", f'<div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px 18px"><button sc-camel-on-click="{{{{onRwVerify}}}}" data-rw-verify="1" style="{MONO};font-size:13px;color:#04140a;background:#00c805;border:0;padding:10px 18px;border-radius:8px;cursor:pointer" style-hover="background:#19dd1f">Verify</button><span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwDayLabel}}}}</span></div>')}
+              {sif("rwFirst", f'<span style="{MONO};font-size:12px;color:#5f6b72">Verify is available after the first draw</span>')}
+              {sif("rwVerifyShow", f'<div style="display:flex;flex-direction:column;gap:6px"><span data-rw-verdict="1" style="{MONO};font-size:14px;color:{{{{rwVerifyColor}}}}">{{{{rwVerifyText}}}}</span><span style="{MONO};font-size:11.5px;line-height:1.6;color:#5f6b72;overflow-wrap:anywhere">{{{{rwVerifyDetail}}}}</span></div>')}
+            </div>
+            <div data-rw-last="1" style="display:flex;flex-direction:column;gap:8px;margin-top:auto;border-top:1px solid #141b20;padding-top:18px">
+              {dev_rows("rwPayDevs", "rewards paid from", "data-rw-paydev")}
+              {sif("rwFirst", f'<span data-rw-first="1" style="{MONO};font-size:15px;color:#8a959c">{{{{rwFirstText}}}}</span>')}
+              {sif("rwNone", f'<span style="{MONO};font-size:15px;color:#8a959c">Last draw: no eligible holders</span>')}
+              {sif("rwWon", winner_line("cs-rw-win"))}
+              {sif("rwWonNew", winner_line("cs-rw-win cs-rw-reveal"))}
+              {sif("rwWon", f'<span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwChance}}}} · {{{{rwDayLabel}}}}</span>')}
+              {sif("rwWonNew", f'<span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwChance}}}} · {{{{rwDayLabel}}}}</span>')}
+              {sif("rwPaid", f'<span data-rw-payout="1" style="{MONO};font-size:13px;color:#00c805;overflow-wrap:anywhere">reward sent: {{{{rwPrize}}}} tokens · <a href="{{{{rwTxUrl}}}}" target="_blank" rel="noopener" style="color:#9fd9ff" style-hover="color:#ffffff">{{{{rwTxShort}}}} ↗</a></span>')}
+              {sif("rwPending", f'<span data-rw-payout="1" style="{MONO};font-size:13px;color:#8a959c">payout pending</span>')}
+            </div>
+          </div>
+        </div>
+      </section></sc-if>
+
+'''
+rep('      <sc-if value="{{drawOn}}" hint-placeholder-val="{{false}}"><section id="draw"',
+    REWARDS_SECTION + '      <sc-if value="{{drawOn}}" hint-placeholder-val="{{false}}"><section id="draw"')
+# анимации и телефон: карточки друг под другом
+rep("@media (max-width:640px){\n",
+    "@keyframes cs-rw-pulse{0%,100%{opacity:1}50%{opacity:0.45}}\n"
+    "@keyframes cs-rw-flash{0%{opacity:0;transform:translateY(6px) scale(0.96)}12%{opacity:1;transform:none}"
+    "85%{opacity:1}100%{opacity:0;transform:translateY(-4px)}}\n"
+    "@keyframes cs-rw-reveal{0%{opacity:0;filter:blur(6px);transform:translateY(8px)}35%{opacity:1;filter:none;transform:none}"
+    "55%{text-shadow:0 0 18px rgba(0,200,5,0.9)}100%{text-shadow:none}}\n"
+    ".cs-rw-pulse{animation:cs-rw-pulse 1.6s ease-in-out infinite}\n"
+    ".cs-rw-flash{animation:cs-rw-flash 6s ease-out both}\n"
+    ".cs-rw-reveal{animation:cs-rw-reveal 4s ease-out both}\n"
+    "@media (max-width:900px){.cs-rw-grid{grid-template-columns:minmax(0,1fr)!important}}\n"
+    ".cs-rw-short{display:none}\n"
+    "@media (max-width:640px){.cs-rw-full{display:none}.cs-rw-short{display:inline}.cs-rw-timer{font-size:28px!important}}\n"
+    "@media (prefers-reduced-motion:reduce){.cs-rw-pulse,.cs-rw-flash,.cs-rw-reveal{animation:none}}\n"
+    "@media (max-width:640px){\n")
 
 # суммы меньше $1K — без хвоста знаков (тонкая ликвидность на Solana)
 rep("':'$'+v;", "':'$'+(v>=10?Math.round(v):v.toFixed(2));")

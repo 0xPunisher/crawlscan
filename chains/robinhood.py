@@ -319,15 +319,27 @@ def token_facts(token, launch):
             "market": market_addresses(launch["curve"]), "reserve": max(0, reserve), "base": None}
 
 
-def get_token_transfers(token, from_block):
-    """Все переводы токена от from_block до текущего блока, в порядке чейна."""
+def get_token_transfers(token, from_block, to_block=None, frm=None, to=None):
+    """Переводы токена в блоках [from_block, to_block] (to_block=None — до текущего), в порядке чейна.
+    frm / to — фильтр по отправителю / получателю: адрес или список адресов (OR), по топикам getLogs.
+    ts — время блока из поля лога blockTimestamp, если RPC его отдаёт (Alchemy отдаёт), иначе ключа нет."""
     out = []
-    for lg in get_logs(from_block, block_number(), address=token.lower(), topics=[TRANSFER_TOPIC]):
+    pick = lambda a: None if a is None else [topic_for(x) for x in ([a] if isinstance(a, str) else sorted(a))]
+    topics = [TRANSFER_TOPIC, pick(frm), pick(to)]
+    while topics[-1] is None:
+        topics.pop()
+    hi = block_number() if to_block is None else to_block
+    if hi < from_block:
+        return out
+    for lg in get_logs(from_block, hi, address=token.lower(), topics=topics):
         p = parse_transfer(lg)
         if not p or len(lg["data"]) <= 2:
             continue
-        out.append({"frm": p["frm"], "to": p["to"], "amount": int(lg["data"], 16),
-                    "tx": p["tx"], "block": p["block"], "log_index": int(lg["logIndex"], 16)})
+        t = {"frm": p["frm"], "to": p["to"], "amount": int(lg["data"], 16),
+             "tx": p["tx"], "block": p["block"], "log_index": int(lg["logIndex"], 16)}
+        if lg.get("blockTimestamp"):
+            t["ts"] = int(lg["blockTimestamp"], 16)
+        out.append(t)
     out.sort(key=lambda t: (t["block"], t["log_index"]))
     return out
 
@@ -346,6 +358,62 @@ def block_timestamps(blocks, chunk=100):
 
 def token_supply(token):
     return int(rpc("eth_call", [{"to": token.lower(), "data": "0x18160ddd"}, "latest"]), 16)
+
+
+def token_balance(token, address):
+    return int(rpc("eth_call", [{"to": token.lower(), "data": "0x70a08231" + "0" * 24 + address.lower()[2:]}, "latest"]), 16)
+
+
+def token_decimals(token):
+    return int(rpc("eth_call", [{"to": token.lower(), "data": "0x313ce567"}, "latest"]), 16)
+
+
+def block_info(block):
+    """{"number", "hash", "timestamp"} блока (eth_getBlockByNumber, без транзакций)."""
+    b = rpc("eth_getBlockByNumber", [hex(block) if isinstance(block, int) else block, False])
+    return {"number": int(b["number"], 16), "hash": b["hash"], "timestamp": int(b["timestamp"], 16)}
+
+
+_AT_TIME = {}  # ts -> блок (ответ не меняется: блоки с timestamp >= ts уже есть)
+
+def block_at_time(ts):
+    """Первый блок с timestamp >= ts: {"number", "hash", "timestamp"}. Бинарный поиск по номеру блока
+    (timestamp не убывает). Голова цепи ещё раньше ts — LookupError (рано)."""
+    if ts in _AT_TIME:
+        return _AT_TIME[ts]
+    head = block_info("latest")
+    if head["timestamp"] < ts:
+        raise LookupError("no block at this time yet")
+    lo, hi = 0, head["number"]               # инвариант: блок hi подходит; ищем первый подходящий
+    hi_info = head
+    while lo < hi:
+        mid = (lo + hi) // 2
+        b = block_info(mid)
+        if b["timestamp"] >= ts:
+            hi, hi_info = mid, b
+        else:
+            lo = mid + 1
+    if hi_info["number"] != hi:
+        hi_info = block_info(hi)
+    _AT_TIME[ts] = hi_info
+    return hi_info
+
+
+DELEGATION_PREFIX = "0xef0100"   # EIP-7702: код делегирования у обычного кошелька (EOA), не контракт
+
+def is_contract_at(addresses, block, chunk=100):
+    """{addr: контракт ли} на блоке block (eth_getCode на этом блоке: ответ детерминирован).
+    Код EIP-7702-делегирования (0xef0100 + адрес) — обычный кошелёк."""
+    addrs = sorted({a.lower() for a in addresses})
+    out = {}
+    for i in range(0, len(addrs), chunk):
+        part = addrs[i:i + chunk]
+        for a, code in zip(part, rpc_batch([("eth_getCode", [a, hex(block)]) for a in part])):
+            if code is None:
+                raise RuntimeError(f"eth_getCode failed for {a}")
+            code = code.lower()
+            out[a] = code not in ("0x", "0x0", "") and not code.startswith(DELEGATION_PREFIX)
+    return out
 
 
 BATCH_MAX = 10           # eth_getLogs в одном HTTP-батче при скане по окну
