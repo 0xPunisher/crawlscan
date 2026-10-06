@@ -258,6 +258,22 @@ Run the tests:
 python3 -m unittest discover -s tests -v
 ```
 
+## Telegram bot
+
+A separate service in `bot/` (standard library only). It is a thin client of the CRAWLSCAN API: it never talks to a blockchain, it starts a scan on the website and turns the result into a short verdict with a link to the full report.
+
+* In a private chat: send a token address (Robinhood Chain or Solana), or `/scan <address>`. `/start` and `/help` explain the bot and the verdict.
+* In groups: only `/scan <address>`.
+
+```sh
+# .env
+# TG_BOT_TOKEN=<token from @BotFather>
+# CRAWLSCAN_API=https://crawlscan.fun   # optional, this is the default
+python3 bot/main.py
+```
+
+Only one copy of the bot can poll Telegram at a time.
+
 ## Roadmap
 
 ### ✅ Shipped

@@ -1,0 +1,328 @@
+"""Тесты Telegram-бота: подставные Telegram и API сайта, никакой сети."""
+import os, sys, threading, time, unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from bot import main as bm, text as T   # noqa: E402
+from bot.api import ApiError, Rejected  # noqa: E402
+from bot.tg import TelegramError        # noqa: E402
+
+RH = "0x19dCb63C4d2F29A6f077F094a4f858fC790145e1"
+SOL = "So11111111111111111111111111111111111111112"
+PUMP = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"
+
+
+class FakeTG:
+    def __init__(self):
+        self.calls, self.n, self.lock = [], 100, threading.Lock()
+
+    def redact(self, s):
+        return str(s)
+
+    def call(self, method, **params):
+        with self.lock:
+            self.calls.append((method, params))
+            if method == "sendMessage":
+                self.n += 1
+                return {"message_id": self.n}
+        return True
+
+    def of(self, method):
+        with self.lock:
+            return [p for m, p in self.calls if m == method]
+
+    def texts(self):
+        return [p["text"] for p in self.of("sendMessage") + self.of("editMessageText")]
+
+
+def result(**kw):
+    r = {"token": RH.lower(), "chain": "robinhood", "header": {"name": "CrawlScan", "ticker": "CRAWL"},
+         "holders_total": 700, "holders": [{}] * 20, "operators": [{"wallets": ["a", "b"]}] + [{"wallets": ["c"]}] * 15,
+         "score": 79, "band": "OK", "gates": [],
+         "metrics": {"impact": 0.311, "virgin": 0.15, "transfer": 0, "sniper": 0.0004, "operator": 0.04}}
+    r.update(kw)
+    return r
+
+
+class FakeAPI:
+    base = "https://crawlscan.test"
+
+    def __init__(self, res=None, error=None, reject=None, down=False, pending=0):
+        self.res, self.error, self.reject, self.down, self.pending = res or result(), error, reject, down, pending
+        self.scans = []
+
+    def scan(self, token):
+        if self.down:
+            raise ApiError("connection refused")
+        if self.reject:
+            raise Rejected(self.reject)
+        self.scans.append(token)
+        return "job1"
+
+    def result(self, job):
+        if self.pending:
+            self.pending -= 1
+            return {"done": False}
+        if self.error:
+            return {"done": True, "error": self.error}
+        return {"done": True, "result": self.res}
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def private(text, user=1):
+    return {"message": {"message_id": 5, "chat": {"id": user, "type": "private"}, "from": {"id": user}, "text": text}}
+
+
+def group(text, user=1):
+    return {"message": {"message_id": 7, "chat": {"id": -100, "type": "supergroup"}, "from": {"id": user},
+                        "text": text}}
+
+
+def make(api=None, **kw):
+    tg, clock = FakeTG(), Clock()
+    bot = bm.Bot(tg, api or FakeAPI(), username="CrawlScanBot", clock=clock, sleep=clock.sleep,
+                 log=lambda m: None, **kw)
+    return bot, tg, clock
+
+
+def drain(bot):
+    """Выполнить сканы из очереди в текущем потоке."""
+    while not bot.jobs.empty():
+        bot.run_scan(*bot.jobs.get())
+
+
+class TestAddress(unittest.TestCase):
+
+    def test_chains(self):
+        self.assertEqual(T.find_address(RH), ("robinhood", RH))
+        self.assertEqual(T.find_address(f"  {RH.lower()}\n"), ("robinhood", RH.lower()))
+        self.assertEqual(T.find_address(SOL), ("solana", SOL))
+        self.assertEqual(T.find_address(PUMP), ("solana", PUMP))
+
+    def test_inside_link(self):
+        self.assertEqual(T.find_address(f"https://pump.fun/coin/{PUMP}"), ("solana", PUMP))
+        self.assertEqual(T.find_address(f"look at https://crawlscan.fun/?ca={RH}&x=1"), ("robinhood", RH))
+
+    def test_not_address(self):
+        for s in ["", "hello", "0x1234", RH + "00", "0x" + "g" * 40, "1" * 44, "I0O" + "a" * 40,
+                  "this is just a long sentence without any address"]:
+            self.assertIsNone(T.find_address(s), s)
+
+    def test_same_as_site(self):
+        from chains import solana as sol
+        for s in [SOL, PUMP, "1" * 32, "11111111111111111111111111111111", "z" * 44, "2" * 33]:
+            self.assertEqual(T.chain_of(s) == "solana", sol.is_address(s), s)
+
+
+class TestCommands(unittest.TestCase):
+
+    def test_start_buttons(self):
+        bot, tg, _ = make()
+        bot.handle_update(private("/start"))
+        (msg,) = tg.of("sendMessage")
+        self.assertEqual(msg["parse_mode"], "HTML")
+        self.assertIn(f"<code>{T.OFFICIAL_CA}</code>", msg["text"])
+        self.assertIn("$CrawlScan, the official token of the project", msg["text"])
+        buttons = [b for row in msg["reply_markup"]["inline_keyboard"] for b in row]
+        by = {b["text"]: b for b in buttons}
+        self.assertEqual(by["Scan a token"]["callback_data"], "scan")
+        self.assertEqual(by["Help"]["callback_data"], "help")
+        self.assertEqual(by["Website"]["url"], "https://crawlscan.fun")
+        self.assertEqual(by["Buy $CrawlScan"]["url"],
+                         "https://www.ponsfamily.com/launchpad/0x19dCb63C4d2F29A6f077F094a4f858fC790145e1")
+
+    def test_callbacks(self):
+        bot, tg, _ = make()
+        bot.handle_update({"callback_query": {"id": "q1", "data": "scan", "message": {"chat": {"id": 1}}}})
+        bot.handle_update({"callback_query": {"id": "q2", "data": "help", "message": {"chat": {"id": 1}}}})
+        self.assertEqual([p["callback_query_id"] for p in tg.of("answerCallbackQuery")], ["q1", "q2"])
+        self.assertEqual(tg.texts(), ["Send me a token address from Robinhood Chain or Solana", T.HELP])
+
+    def test_help_and_hint(self):
+        bot, tg, _ = make()
+        bot.handle_update(private("/help"))
+        bot.handle_update(private("gm"))
+        bot.handle_update(private("/scan"))
+        self.assertEqual(tg.texts(), [T.HELP, T.HINT, T.SCAN_USAGE])
+        self.assertTrue(bot.jobs.empty())
+
+    def test_private_address_and_scan_command(self):
+        bot, tg, _ = make()
+        bot.handle_update(private(RH, user=1))
+        bot.handle_update(private(f"/scan {SOL}", user=2))
+        self.assertEqual([j[2] for j in list(bot.jobs.queue)], [RH, SOL])
+        self.assertEqual(tg.texts(), [T.crawling(RH), T.crawling(SOL)])
+        self.assertIn("0x19dC…45e1", tg.texts()[0])
+
+    def test_group_only_scan(self):
+        bot, tg, _ = make()
+        for t in [RH, "/start", "/help", "hello", f"/scan@OtherBot {RH}", "/scan"]:
+            bot.handle_update(group(t, user=3 if t == "/scan" else 1))
+        self.assertEqual(tg.texts(), [T.SCAN_USAGE])         # только /scan без адреса — подсказка
+        self.assertTrue(bot.jobs.empty())
+        bot.handle_update(group(f"/scan {RH}", user=1))
+        bot.handle_update(group(f"/scan@crawlscanbot {PUMP}", user=2))
+        self.assertEqual([j[2] for j in list(bot.jobs.queue)], [RH, PUMP])
+        self.assertEqual(tg.of("sendMessage")[-1]["reply_parameters"]["message_id"], 7)
+
+
+class TestVerdict(unittest.TestCase):
+
+    def scan(self, api):
+        bot, tg, _ = make(api)
+        bot.handle_update(private(RH))
+        drain(bot)
+        return tg.of("editMessageText")[-1]
+
+    def test_verdict(self):
+        res = result(gates=["biggest operator could move price −62% if sold (≥ 50%; 9.0% of float)",
+                            "soft: liquidity too thin ($512)"], band="DANGER", score=31,
+                     header={"name": "<b>Evil</b> & co", "ticker": "EV<IL"},
+                     metrics={"impact": 0.62, "virgin": 0.35, "transfer": 0.042, "sniper": 0.031})
+        msg = self.scan(FakeAPI(res))
+        t = msg["text"]
+        self.assertEqual(msg["parse_mode"], "HTML")
+        self.assertIn("<b>$EV&lt;IL</b> · &lt;b&gt;Evil&lt;/b&gt; &amp; co · Robinhood Chain", t)
+        self.assertIn("🔴 <b>Score 31/100 · DANGER</b>", t)
+        self.assertIn("20 top holders → 16 operators", t)
+        self.assertIn("Biggest operator (2 wallets) could move price −62% if sold", t)
+        self.assertIn("• 35% virgin wallets in top", t)
+        self.assertIn("• 4.2% of float received by transfer", t)
+        self.assertIn("• snipers still hold 3.1% of float", t)
+        self.assertIn("<b>Why:</b>\n• biggest operator could move price −62% if sold (≥ 50%; 9.0% of float)", t)
+        self.assertIn("• liquidity too thin ($512)", t)
+        self.assertNotIn("soft:", t)
+        self.assertEqual(msg["reply_markup"]["inline_keyboard"][0][0],
+                         {"text": "Full report", "url": f"https://crawlscan.fun/?ca={RH.lower()}"})
+
+    def test_small_impact_and_zero_signals(self):
+        t = self.scan(FakeAPI(result(metrics={"impact": 0.004, "virgin": 0, "transfer": 0, "sniper": 0.00001},
+                                     operators=[{"wallets": ["a"]}] * 20)))["text"]
+        self.assertIn("Biggest operator could move price <1% if sold", t)
+        self.assertIn("🟡 <b>Score 79/100 · OK</b>", t)
+        for word in ["virgin", "transfer", "snipers", "Why"]:
+            self.assertNotIn(word, t)
+
+    def test_too_early(self):
+        res = result(band="TOO_EARLY_OR_LATE", score=None, metrics={}, gates=[], holders_total=6,
+                     holders=[{}] * 6, chain="solana", token=PUMP)
+        msg = self.scan(FakeAPI(res))
+        self.assertIn("Too early or too late", msg["text"])
+        self.assertIn("Only 6 holders", msg["text"])
+        self.assertIn("· Solana", msg["text"])
+        self.assertNotIn("Score", msg["text"])
+        self.assertIn(PUMP, msg["reply_markup"]["inline_keyboard"][0][0]["url"])
+
+    def test_errors(self):
+        cases = [(FakeAPI(reject="not a token address"), "is not a token address"),
+                 (FakeAPI(reject="Solana support is coming soon"), "Solana support is coming soon"),
+                 (FakeAPI(error="not a Pons V2 token"), "not a Pons V2 token"),
+                 (FakeAPI(error="scan failed: rpc <boom>"), T.FAILED),
+                 (FakeAPI(down=True), T.UNREACHABLE)]
+        for api, want in cases:
+            msg = self.scan(api)
+            self.assertIn(want, msg["text"])
+            self.assertNotIn("boom", msg["text"])
+            self.assertIsNone(msg.get("reply_markup"))
+
+    def test_timeout(self):
+        api = FakeAPI(pending=10 ** 6)
+        bot, tg, clock = make(api)
+        bot.handle_update(private(RH))
+        t0 = clock.t
+        drain(bot)
+        self.assertEqual(tg.of("editMessageText")[-1]["text"], T.TIMEOUT)
+        self.assertGreaterEqual(clock.t - t0, 60)
+        self.assertLess(clock.t - t0, 63)
+
+
+class TestLimits(unittest.TestCase):
+
+    def test_user_cooldown(self):
+        bot, tg, clock = make()
+        bot.handle_update(private(RH))
+        clock.t += 5
+        bot.handle_update(private(SOL))
+        self.assertEqual(tg.texts()[-1], "⏳ please wait 15 s")
+        bot.handle_update(private(SOL, user=2))             # другой пользователь — без ожидания
+        clock.t += 15
+        bot.handle_update(private(SOL))
+        self.assertEqual(len(bot.jobs.queue), 3)
+
+    def test_bad_address_not_counted(self):
+        bot, tg, _ = make()
+        bot.handle_update(private("/scan nope"))
+        bot.handle_update(private(RH))
+        self.assertEqual(len(bot.jobs.queue), 1)
+
+    def test_three_at_once_rest_queued(self):
+        gate, running, peak = threading.Event(), [0], [0]
+        lock = threading.Lock()
+
+        class SlowAPI(FakeAPI):
+            def scan(self, token):
+                with lock:
+                    running[0] += 1
+                    peak[0] = max(peak[0], running[0])
+                gate.wait(5)
+                with lock:
+                    running[0] -= 1
+                return "job"
+
+        tg = FakeTG()
+        bot = bm.Bot(tg, SlowAPI(), username="CrawlScanBot", log=lambda m: None, poll_every=0.01)
+        bot.start_workers()
+        addrs = ["0x" + f"{i:040x}" for i in range(5)]
+        for i, a in enumerate(addrs):
+            bot.handle_update(private(a, user=i))
+            time.sleep(0.05)                               # рабочий поток успевает взять скан
+        sent = [p["text"] for p in tg.of("sendMessage")]
+        self.assertEqual(sent[:3], [T.crawling(a) for a in addrs[:3]])
+        self.assertEqual(sent[3:], [T.queued(a) for a in addrs[3:]])
+        with lock:
+            self.assertEqual(running[0], 3)
+        gate.set()
+        bot.jobs.join()
+        self.assertEqual(peak[0], 3)
+        edits = [p["text"] for p in tg.of("editMessageText")]
+        self.assertEqual(sum(t.startswith("🕷 crawling") for t in edits), 2)   # из очереди → crawling
+        self.assertEqual(sum("Score 79/100" in t for t in edits), 5)
+
+
+class TestResilience(unittest.TestCase):
+
+    def test_telegram_errors_do_not_raise(self):
+        class BadTG(FakeTG):
+            def call(self, method, **params):
+                raise TelegramError(0, "network down")
+
+        bot = bm.Bot(BadTG(), FakeAPI(), username="CrawlScanBot", log=lambda m: None)
+        bot.handle_update(private("/start"))
+        bot.handle_update(private(RH))                     # сообщение не ушло — скан не ставится
+        self.assertTrue(bot.jobs.empty())
+
+    def test_poll_survives_bad_update(self):
+        bot, tg, _ = make()
+        updates = [{"update_id": 10, "message": None}, {"update_id": 11, **private("/help")}]
+        tg.call = lambda method, **p: updates if method == "getUpdates" else FakeTG.call(tg, method, **p)
+        self.assertEqual(bot.poll_once(None), 12)
+        self.assertEqual(tg.texts(), [T.HELP])
+
+    def test_parse_command(self):
+        self.assertEqual(bm.parse_command("/scan@CrawlScanBot  0xab "), ("scan", "CrawlScanBot", "0xab"))
+        self.assertEqual(bm.parse_command("/START"), ("start", None, ""))
+        self.assertEqual(bm.parse_command("hi"), (None, None, "hi"))
+
+
+if __name__ == "__main__":
+    unittest.main()
