@@ -199,6 +199,7 @@ def refresh_supply(store, cfg):
     """Сожжённый сапплай: выпущено (переводы с 0x0) − totalSupply + баланс dead (см. rewards.total_burned)."""
     token = cfg["token"]
     launch = launch_info(store, token)
+    decimals(store, token)   # статусу нужны decimals до первого розыгрыша (суммы *_tokens для фронта)
     minted = sum(t["amount"] for t in ch.get_token_transfers(token, launch["block"], None, frm=rw.ZERO))
     supply, dead = ch.token_supply(token), ch.token_balance(token, rw.DEAD)
     val = {"minted": str(minted), "total_supply": str(supply), "dead_balance": str(dead),

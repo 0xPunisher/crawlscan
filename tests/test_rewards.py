@@ -295,6 +295,14 @@ class TestService(unittest.TestCase):
         self.assertEqual((row["payout_tx"], row["payout_amount"], row["payout_from"]), (pay["tx"], 25, DEV))
         self.assertEqual(rs.draw_json(row)["payout_status"], "paid")
 
+    def test_status_decimals_before_first_draw(self):
+        rs.check_burns(self.store, self.cfg)
+        rs.refresh_supply(self.store, self.cfg)   # кэширует decimals: фронту нужны суммы *_tokens до первого розыгрыша
+        st = rs.status_json(self.store, self.cfg, now=DAY_END - 3600)
+        self.assertIsNone(st["last_draw"])
+        self.assertEqual(st["decimals"], 18)
+        self.assertEqual(st["last_burn"]["amount_tokens"], 100 / 10 ** 18)
+
     def test_supply_and_status(self):
         rs.check_burns(self.store, self.cfg)
         rs.refresh_supply(self.store, self.cfg)
@@ -311,6 +319,7 @@ class TestService(unittest.TestCase):
         self.assertEqual(st["next_draw_runs_at"], "2026-10-05T22:05:00+00:00")
         self.assertEqual((st["period_start"], st["period_end"]), ("2026-10-04T22:00:00+00:00", "2026-10-05T22:00:00+00:00"))
         self.assertEqual(st["burn_address"], "0x000000000000000000000000000000000000dEaD")
+        self.assertEqual(st["last_burn"]["amount_tokens"], 100 / 10 ** 18)
         self.assertEqual((st["last_draw"]["day"], st["participants_last"], st["last_draw"]["payout_status"]), (DAY, 3, "pending"))
         self.assertAlmostEqual(st["last_draw"]["chance"], st["last_draw"]["weight"] / 1500)
 
