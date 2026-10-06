@@ -35,7 +35,7 @@
     номера how/roadmap сдвигаются, только когда секция есть.
   - Token Burn & Holder Rewards: секция сразу после «the token», только если /api/rewards/status ->
     enabled: true. Две карточки: Burn (таймер до next_burn, последнее сжигание, всего сожжено и % сапплая,
-    кошелёк разработчика «burns from» и адрес сжиганий с copy) и Holder Rewards (таймер до next_draw, блок доверия с Verify по
+    кошелёк разработчика «burns from» и адрес сжиганий с copy) и Holder Rewards (кошелёк «rewards paid from», таймер до next_draw, блок доверия с Verify по
     /api/rewards/<day>/*, последний победитель с copy, шанс, выплата или payout pending).
     Таймер в нуле — «Waiting for burn transaction…» / «Picking the winner…»; новое сжигание — вспышка
     «Tokens burned: N», новый розыгрыш — появление победителя. Большие таймеры — цифры в зелёных плитках
@@ -871,7 +871,8 @@ rep("  blank(ca){return {", r"""  loadRewards(){   // статус Rewards & Bur
     const lb=st.last_burn, tb=st.total_burned, L=st.last_draw, won=!!(L&&L.winner), paid=!!(L&&L.payout_tx);
     const fl=this.state.rwBurnFlash, flash=!!fl&&now<fl.until, reveal=!!this.state.rwReveal&&now<this.state.rwReveal;
     const vf=L&&this.state.rwVerify&&this.state.rwVerify.day===L.day?this.state.rwVerify:null;
-    const cp=this.state.rwCopied, drawLeft=picking?'Picking the winner…':fmtLeft(d.target-now);
+    const cp=this.state.rwCopied, devs=k=>(st.dev_wallets||[]).map((a,i)=>({full:a, short:rwShort(a), url:RH_ADDR(a),
+      copy:()=>this.copyText(k+i,a), idle:cp!==k+i, done:cp===k+i})), drawLeft=picking?'Picking the winner…':fmtLeft(d.target-now);
     return {rwOn:true,
       rwBurnCount:!waiting, rwBurnWait:waiting, rwBurnLeft:fmtLeft(b.target-now), rwBurnAt:fmtUtcTs(b.target),
       rwBurnFlash:flash, rwBurnFlashText:flash?fl.text:'',
@@ -880,8 +881,7 @@ rep("  blank(ca){return {", r"""  loadRewards(){   // статус Rewards & Bur
       rwTotal:tb?fmtUnits(tb.amount,dec):fmtUnits(st.burned_by_dev.amount,dec),
       rwTotalPct:tb&&tb.minted?fmtPctOf(tb.amount,tb.minted)+' of supply':'',
       rwBurnTiles:rwTiles(b.target-now), rwDrawTiles:rwTiles(d.target-now),
-      rwDevs:(st.dev_wallets||[]).map((a,i)=>({full:a, short:rwShort(a), url:RH_ADDR(a), copy:()=>this.copyText('dev'+i,a),
-        idle:cp!=='dev'+i, done:cp==='dev'+i})), rwHasDevs:!!(st.dev_wallets&&st.dev_wallets.length),
+      rwDevs:devs('burn'), rwPayDevs:devs('pay'), rwHasDevs:!!(st.dev_wallets&&st.dev_wallets.length),
       rwBurnAddr:st.burn_address, rwBurnAddrUrl:RH_ADDR(st.burn_address),
       copyRwBurn:()=>this.copyText('burn',st.burn_address), rwBurnDone:cp==='burn', rwBurnIdle:cp!=='burn',
       rwDrawCount:!picking, rwDrawPick:picking, rwDrawLeft:fmtLeft(d.target-now), rwDrawAt:fmtUtcTs(d.target),
@@ -945,6 +945,7 @@ winner_line = lambda cls: (
     f'<span style="color:#8a959c">Last winner:</span>'
     f'<a href="{{{{rwWinnerUrl}}}}" title="{{{{rwWinnerFull}}}}" target="_blank" rel="noopener" data-rw-winner="1" style="color:#eef1f3" style-hover="color:#9fd9ff">{{{{rwWinner}}}} ↗</a>'
     + rw_copy("Winner", "rwWinIdle", "rwWinDone", "copy winner address") + '</div>')
+dev_rows = lambda key, label, attr: sif("rwHasDevs", f'<span style="{LABEL}">{label}</span><sc-for list="{{{{{key}}}}}" as="w" hint-placeholder-count="1"><div {attr}="1" style="display:flex;align-items:center;gap:10px;min-width:0"><a href="{{{{w.url}}}}" title="{{{{w.full}}}}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#dfe5e8;overflow-wrap:anywhere;min-width:0" style-hover="color:#9fd9ff"><span class="cs-rw-full">{{{{w.full}}}}</span><span class="cs-rw-short">{{{{w.short}}}}</span> ↗</a><button sc-camel-on-click="{{{{w.copy}}}}" title="copy developer wallet" aria-label="copy developer wallet" style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px solid #1c252b;border-radius:7px;background:#0b1013;color:#8a959c;cursor:pointer;flex-shrink:0" style-hover="color:#ffffff;border-color:#2c353b"><sc-if value="{{{{w.idle}}}}" hint-placeholder-val="{{{{true}}}}">{ICON_COPY}</sc-if><sc-if value="{{{{w.done}}}}" hint-placeholder-val="{{{{false}}}}">{ICON_CHECK}</sc-if></button></div></sc-for><span style="height:6px"></span>')
 REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{{{false}}}}"><section id="rewards" class="cs-wrap" style="max-width:1280px;margin:0 auto;padding:40px 32px 120px;box-sizing:border-box">
         <div style="display:flex;align-items:baseline;justify-content:space-between;gap:24px;border-top:1px solid #12181c;padding-top:22px;margin-bottom:44px">
           <h2 data-grip="1" style="margin:0;font-size:34px;font-weight:500;letter-spacing:-0.03em;color:#eef1f3">token burn &amp; holder rewards</h2>
@@ -966,7 +967,7 @@ REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{
               {stat("total burned", f'<span data-rw-total="1" style="{MONO};font-size:18px;color:#eef1f3">{{{{rwTotal}}}} tokens</span><span style="{MONO};font-size:12px;color:#00c805">{{{{rwTotalPct}}}}</span>')}
             </div>
             <div style="display:flex;flex-direction:column;gap:8px;margin-top:auto;border-top:1px solid #141b20;padding-top:18px">
-              {sif("rwHasDevs", f'<span style="{LABEL}">burns from</span><sc-for list="{{{{rwDevs}}}}" as="w" hint-placeholder-count="1"><div data-rw-dev="1" style="display:flex;align-items:center;gap:10px;min-width:0"><a href="{{{{w.url}}}}" title="{{{{w.full}}}}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#dfe5e8;overflow-wrap:anywhere;min-width:0" style-hover="color:#9fd9ff"><span class="cs-rw-full">{{{{w.full}}}}</span><span class="cs-rw-short">{{{{w.short}}}}</span> ↗</a><button sc-camel-on-click="{{{{w.copy}}}}" title="copy developer wallet" aria-label="copy developer wallet" style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px solid #1c252b;border-radius:7px;background:#0b1013;color:#8a959c;cursor:pointer;flex-shrink:0" style-hover="color:#ffffff;border-color:#2c353b"><sc-if value="{{{{w.idle}}}}" hint-placeholder-val="{{{{true}}}}">{ICON_COPY}</sc-if><sc-if value="{{{{w.done}}}}" hint-placeholder-val="{{{{false}}}}">{ICON_CHECK}</sc-if></button></div></sc-for><span style="height:6px"></span>')}
+              {dev_rows("rwDevs", "burns from", "data-rw-dev")}
               <span style="{LABEL}">burn address</span>
               <div style="display:flex;align-items:center;gap:10px;min-width:0">
                 <a href="{{{{rwBurnAddrUrl}}}}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#dfe5e8;overflow-wrap:anywhere;min-width:0" style-hover="color:#9fd9ff">{{{{rwBurnAddr}}}} ↗</a>
@@ -990,6 +991,7 @@ REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{
               {sif("rwVerifyShow", f'<div style="display:flex;flex-direction:column;gap:6px"><span data-rw-verdict="1" style="{MONO};font-size:14px;color:{{{{rwVerifyColor}}}}">{{{{rwVerifyText}}}}</span><span style="{MONO};font-size:11.5px;line-height:1.6;color:#5f6b72;overflow-wrap:anywhere">{{{{rwVerifyDetail}}}}</span></div>')}
             </div>
             <div data-rw-last="1" style="display:flex;flex-direction:column;gap:8px;margin-top:auto;border-top:1px solid #141b20;padding-top:18px">
+              {dev_rows("rwPayDevs", "rewards paid from", "data-rw-paydev")}
               {sif("rwFirst", f'<span data-rw-first="1" style="{MONO};font-size:15px;color:#8a959c">{{{{rwFirstText}}}}</span>')}
               {sif("rwNone", f'<span style="{MONO};font-size:15px;color:#8a959c">Last draw: no eligible holders</span>')}
               {sif("rwWon", winner_line("cs-rw-win"))}
