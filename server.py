@@ -17,6 +17,13 @@ Read-only: скан идёт в фоне, браузер опрашивает с
   POST /api/draw/<YYYY-MM-DD>/payout     -> админ: X-Admin-Token == ADMIN_TOKEN,
                                             {"prize_amount", "prize_currency", "payout_tx"}; иначе 403
 
+Token Burn & Holder Rewards, Robinhood (только при REWARDS_ENABLED=true, иначе 404; status отвечает всегда):
+  GET  /api/rewards/status               -> токен, следующий розыгрыш и плановое сжигание, последнее сжигание,
+                                            всего сожжено, последний победитель (вес, шанс, выплата), участники
+  GET  /api/rewards/history?limit=30     -> розыгрыши и сжигания, новые первыми (limit до 365)
+  GET  /api/rewards/<YYYY-MM-DD>/participants -> полный список участников с весами
+  GET  /api/rewards/<YYYY-MM-DD>/verify  -> входные данные и пересчёт победителя
+
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
 """
@@ -26,7 +33,9 @@ from urllib.parse import urlparse, parse_qs
 
 import engine
 import draw_service as ds
+import rewards_service as rs
 from draw_store import Store
+from rewards_store import RewardsStore
 
 CACHE_TTL = 600            # секунд: кэш результата по токену
 MAX_CONCURRENT = 3         # одновременных сканов
@@ -109,6 +118,21 @@ def draw_store():
         return _stores[path]
 
 
+REWARDS_PATH = re.compile(r"^/api/rewards/(\d{4}-\d{2}-\d{2})/(participants|verify)$")
+_rw_stores = {}
+
+
+def rewards_store():
+    """Хранилище Rewards & Burns (файл DRAW_DB_PATH) или None, если выключено."""
+    if not rs.enabled():
+        return None
+    path = os.environ.get("DRAW_DB_PATH") or ""
+    with _stores_lock:
+        if path not in _rw_stores:
+            _rw_stores[path] = RewardsStore(path or None)
+        return _rw_stores[path]
+
+
 def admin_ok(header):
     """X-Admin-Token совпадает с ADMIN_TOKEN (сравнение за постоянное время). Не задан ADMIN_TOKEN — всегда нет."""
     token = os.environ.get("ADMIN_TOKEN") or ""
@@ -181,6 +205,26 @@ class H(BaseHTTPRequestHandler):
                                     "participants": [{"address": a, "weight": w} for a, w in sorted(parts.items())]})
         return self._send(200, ds.verify_json(store, day))
 
+    def _rewards_get(self, path, q):
+        cfg = rs.config()
+        if path == "/api/rewards/status":
+            return self._send(200, rs.status_json(rewards_store(), cfg))
+        store = rewards_store()
+        if store is None:
+            return self._send(404, {"error": "rewards are disabled"})
+        if path == "/api/rewards/history":
+            try:
+                limit = min(365, max(1, int((q.get("limit") or ["30"])[0])))
+            except ValueError:
+                limit = 30
+            return self._send(200, rs.history_json(store, cfg, limit))
+        m = REWARDS_PATH.match(path)
+        if not m:
+            return self._send(404, {"error": "not found"})
+        day, what = m.groups()
+        body = rs.participants_json(store, day) if what == "participants" else rs.verify_json(store, day)
+        return self._send(200, body) if body else self._send(404, {"error": "no draw for this day"})
+
     def do_POST(self):
         m = DRAW_PATH.match(urlparse(self.path).path)
         if m and m.group(2) == "payout":
@@ -203,6 +247,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
         if u.path.startswith("/api/draw/"):
             return self._draw_get(u.path, q)
+        if u.path.startswith("/api/rewards/"):
+            return self._rewards_get(u.path, q)
         if u.path == "/api/config":  # фронт: какие сети включены (Solana — флаг SOLANA_ENABLED)
             return self._send(200, {"solana": engine.solana_enabled()})
         if u.path == "/api/events":
@@ -257,8 +303,19 @@ def start_draw_scheduler():
     return sch
 
 
+def start_rewards_scheduler():
+    """Фоновый поток Rewards & Burns — только при REWARDS_ENABLED=true."""
+    cfg = rs.config()
+    if not cfg["enabled"]:
+        return None
+    sch = rs.Scheduler(rewards_store(), cfg)
+    sch.start()
+    return sch
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"rh-crawler on http://0.0.0.0:{port}", flush=True)
     start_draw_scheduler()
+    start_rewards_scheduler()
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
