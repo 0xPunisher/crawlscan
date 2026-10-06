@@ -172,6 +172,21 @@ Hard rules cover cases where a weighted score alone would be misleading:
 <img src="assets/mobile.jpg" alt="CRAWLSCAN scan result on mobile" width="21%">
 </div>
 
+## Price chart and probably rug
+
+Every scan result has a price chart from GeckoTerminal. It loads separately after the verdict, so it never slows a scan down. The timeframe follows the token's age, and for pump.fun tokens that have migrated, the bonding curve history and the pool are joined into one chart.
+
+When the verdict is `DANGER`, CRAWLSCAN also projects a **probably rug** level. It collects the suspicious supply held by the top holders:
+
+* fresh wallets with no trading history;
+* wallets linked into one operator;
+* tokens received by transfer instead of bought;
+* the launch bundle and snipers that have not sold.
+
+Each wallet is counted once. CRAWLSCAN then estimates how far the price would fall if all of that supply were sold into the current liquidity. If the drop is 40% or more, the chart shows a red dashed arrow from the current price down to that level, labelled `probably rug -X%`, with the reasons and their share of the float below the chart.
+
+How to read it: the arrow is not a prediction of when or whether a dump will happen. It shows how much damage the suspicious holders *could* do right now. The score and the verdict are not affected by the projection. The Telegram bot shows the same projection as one line.
+
 ## Built for speed
 
 Analysing wallets one by one would take minutes. CRAWLSCAN runs multiple wallet crawlers in parallel under a hard time budget, so a full verdict arrives in seconds while the interface streams the crawl live.
@@ -285,6 +300,7 @@ Only one copy of the bot can poll Telegram at a time.
 * [x] **Solana support (pump.fun)**: automatic chain detection, Solscan links
 * [x] **Dump-impact scoring** and liquidity guard
 * [x] **Telegram bot**: send a token address and get the verdict, score and key holder signals
+* [x] **Price chart and probably rug projection**
 
 ### 🟢 In progress
 

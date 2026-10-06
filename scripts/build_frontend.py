@@ -14,7 +14,8 @@
   - кнопка «try a sample» -> настоящий токен Pons V2;
   - ссылки X и GitHub -> реальные адреса, в новой вкладке (target="_blank" rel="noopener");
     иконка Telegram-бота (t.me/CrawlScanBot) сразу после X в шапке и футере;
-  - роадмап: «Solana support (pump.fun)», «Telegram bot», «Burns & holder rewards» — в SHIPPED; в NEXT первым «Early buyers crawl», за ним
+  - роадмап: «Solana support (pump.fun)», «Telegram bot», «Burns & holder rewards»,
+    «Price chart and probably rug projection» — в SHIPPED; в NEXT первым «Early buyers crawl», за ним
     «All-chain support» (больше EVM-сетей и не только); Launch radar — в конец LATER;
   - герой: обе сети — бейдж «memecoin holder scanner · Robinhood and Solana», заголовок «for Robinhood and
     Solana memecoins», подпись под полем «… · Robinhood and Solana»; Solana — цветом Solana (#9945FF);
@@ -255,7 +256,10 @@ telegram_card = ITEM + TITLE + 'Telegram bot</span>' + DESC + 'Send a CA to @Cra
 rewards_card = (ITEM + TITLE + 'Burns &amp; holder rewards</span>' + DESC
                 + 'Dev burns every 12 hours, one holder wins daily rewards, all verifiable onchain.</span></div>\n')
 rep(browser, browser + radar)
-rep(operator_card, operator_card + solana_card + telegram_card + rewards_card)
+# v1.4.0: Price chart and probably rug projection — в конец SHIPPED
+chart_card = (ITEM + TITLE + 'Price chart and probably rug projection</span>' + DESC
+              + 'A price chart on every scan; on DANGER, how far the price could fall if suspicious holders sell.</span></div>\n')
+rep(operator_card, operator_card + solana_card + telegram_card + rewards_card + chart_card)
 
 # герой: «for Robinhood and Solana memecoins», «and» — цветом заголовка, Solana — фиолетовым Solana
 rep('<span data-grip="1" style="color:#00c805">Robinhood</span><span data-grip="1" style="color:#00c805">memecoins</span>',

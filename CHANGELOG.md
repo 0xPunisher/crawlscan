@@ -9,6 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Early buyers crawl: see how much supply was bundled at launch, even after bundlers exit.
 
+## [1.4.0] - 2026-10-06
+
+### Added
+
+- Price chart on every scan result, from GeckoTerminal. It loads from a separate cached endpoint (`/api/chart`), so the scan is not slowed down. The timeframe is picked by token age, and for migrated pump.fun tokens the bonding curve history is joined with the pool.
+- Probably rug projection, shown only when the verdict is `DANGER`. Suspicious supply is collected from the top holders: fresh wallets, linked operators, tokens received by transfer, the launch bundle and unsold snipers, with each wallet counted once. If selling it into the current liquidity would drop the price by 40% or more, the chart shows an arrow down to that level with the reasons below it. The score and the verdict are unchanged.
+- Solana launch bundle signal: wallets that bought in the launch bundle.
+- Probably rug line in the Telegram bot, with the main reasons.
+
 ## [1.3.0] - 2026-10-06
 
 ### Added
