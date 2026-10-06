@@ -16,6 +16,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Telegram bot [@CrawlScanBot](https://t.me/CrawlScanBot): send a token address from Robinhood Chain or Solana and get the score, verdict and key holder signals in seconds. `/scan <address>` works in groups. Runs as a separate service on the site's scan API and shares its cache, with rate limits per user.
 - Telegram links on the website, in the header and footer.
 
+## [1.2.0] - 2026-10-06
+
+### Added
+
+- Token burn tracking: burns from the developer wallet to `0x…dEaD` are detected onchain. Next burn timer (10:00 and 22:00 UTC), last burn and total burned.
+- Daily holder rewards: every day at 22:00 UTC one holder wins 10% of the last 24h creator fees, paid in $CrawlScan. The chance is proportional to the time-weighted average balance over the day, so every holder takes part. Developer wallets and infrastructure are excluded.
+- Verifiable draw: the winner comes from a Robinhood Chain block hash produced after the holder list is locked, and the Verify button recomputes it in the browser. Payouts are detected onchain.
+
 ## [1.1.0] - 2026-10-05
 
 ### Added
