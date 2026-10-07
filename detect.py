@@ -58,6 +58,7 @@ TOO_EARLY = "TOO_EARLY_OR_LATE"
 TOO_ESTABLISHED = "TOO_ESTABLISHED"
 ESTABLISHED = {"min_age_days": 30.0, "min_liquidity_usd": 750_000.0, "min_mcap_usd": 10_000_000.0}
 ESTABLISHED_HEADLINE = "This token is too established for CrawlScan."
+LIMITED_NOTE = " — market data unavailable, older token: holder signals are limited"
 ESTABLISHED_TEXT = ("CrawlScan is built for fresh memecoins. On large, older tokens the top holders are mostly "
                     "exchanges and big liquidity pools: tokens reach exchange wallets by transfer, not by buying, "
                     "and liquidity is spread across many pools, so holder patterns don't mean what they mean "
@@ -292,7 +293,7 @@ def _impact_phrase(impact, ops):
     return f", could move price −{impact * 100:.0f}% if sold"
 
 
-def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True):
+def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True, limited=False):
     """Скор 0–100 (100 = чисто): {"score", "band", "parts", "gates", "metrics", "headline"}.
     reserve — резерв токенов ликвидности (сырые единицы): баланс пула после миграции или кривой до.
     Часть "operator" и её стоп-правило — от dump_impact крупнейшего оператора (q = взвешенная доля
@@ -304,13 +305,15 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     применяется, часть "operator" — по взвешенной доле оборота (SCALE["operator_share"]).
     gates — сработавшие стоп-правила: жёсткие (→ DANGER) и мягкие с префиксом "soft:"
     (стая или доказанный оператор из ≥ 3 кошельков → score не выше 59, band не лучше RISKY).
+    limited=True — данных рынка нет (GT не ответил), а токен старый (сигналы холдеров ограничены):
+    жёсткие правила по impact и transfer не применяются, к headline добавляется LIMITED_NOTE.
     Меньше MIN_HOLDERS холдеров (base["holders_total"]) → score None, band TOO_EARLY_OR_LATE."""
     n = len(holders)
     big = ops[0] if ops else {"share": 0.0, "share_supply": 0.0, "weighted": 0.0, "wallets": []}
     impact = dump_impact(big["weighted"] * base["circulating"], reserve) if reserve_ok else None
     headline = (f"{n} wallets → {len(ops)} operators, biggest holds "
                 f"{big['share'] * 100:.1f}% of float ({big['share_supply'] * 100:.1f}% of supply)"
-                + _impact_phrase(impact, ops))
+                + _impact_phrase(impact, ops) + (LIMITED_NOTE if limited else ""))
     if base["holders_total"] < MIN_HOLDERS:
         return {"score": None, "band": TOO_EARLY, "parts": {}, "gates": [], "metrics": {}, "headline": headline}
 
@@ -330,12 +333,12 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
                          else _part("operator", m["operator"], "operator_share"))
     parts = {k: parts[k] for k in WEIGHTS}
     gates = []
-    if impact is not None and impact >= GATE_IMPACT:
+    if impact is not None and impact >= GATE_IMPACT and not limited:
         gates.append(f"biggest operator could move price −{m['impact'] * 100:.0f}% if sold "
                      f"(≥ {GATE_IMPACT * 100:.0f}%; {m['operator'] * 100:.1f}% of float)")
     if len(non_dev) >= GATE_VIRGIN_MIN and m["virgin"] >= GATE_VIRGIN:
         gates.append(f"{m['virgin'] * 100:.0f}% virgin wallets in top (≥ {GATE_VIRGIN * 100:.0f}%)")
-    if m["transfer"] >= GATE_TRANSFER:
+    if m["transfer"] >= GATE_TRANSFER and not limited:
         gates.append(f"{m['transfer'] * 100:.1f}% of float received by transfer (≥ {GATE_TRANSFER * 100:.0f}%)")
     hard = bool(gates)
     total = round(sum(parts.values()))

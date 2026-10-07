@@ -15,6 +15,8 @@ import market
 BUDGET = 25.0          # секунд на весь скан (README)
 DETECT_RESERVE = 1.0   # секунд оставляем на detect и события после чтения кошельков
 MARKET_WAIT = 3.0      # шапку GeckoTerminal ждём до первого RPC не дольше стольких секунд от старта скана
+MARKET_LATE = 20.0     # не дождались — запрос GT продолжается в фоне (до стольких секунд на все попытки),
+                       # поздний ответ проверяется перед вердиктом
 RESERVE_MIN_SEEN = 0.25  # резерв в $ < 25% токенной стороны ликвидности GT (liquidity / 2) — пулы не найдены
 ESTABLISHED_ENV = {"min_age_days": "ESTABLISHED_MIN_AGE_DAYS", "min_liquidity_usd": "ESTABLISHED_MIN_LIQUIDITY_USD",
                    "min_mcap_usd": "ESTABLISHED_MIN_MCAP_USD"}
@@ -82,8 +84,9 @@ def _header(gt, meta=None, age_h=None):
             "liquidity_usd": gt.get("liquidity_usd"), "vol24h_usd": gt.get("vol24h_usd"), "age_h": age_h}
 
 
-def established_result(token, chain, gt, limits, ev, t0):
-    """Результат без полного скана: токен старый и большой (detect.too_established). Без скора."""
+def established_result(token, chain, gt, limits, ev, t0, rpc_requests=0):
+    """Результат без полного скана: токен старый и большой (detect.too_established). Без скора.
+    rpc_requests > 0 — вердикт по позднему ответу GT, скан уже шёл."""
     ev("done", d.ESTABLISHED_TEXT, score=None, band=d.TOO_ESTABLISHED, headline=d.ESTABLISHED_HEADLINE, rug=None)
     age = gt.get("age_days")
     return {"token": token, "chain": chain, "header": _header(gt, age_h=None if age is None else round(age * 24, 1)),
@@ -92,7 +95,7 @@ def established_result(token, chain, gt, limits, ev, t0):
             "holders": [], "holders_total": None, "operators": [], "links": [], "packs": [], "unread": [],
             "established": {"liquidity_usd": gt.get("liquidity_usd"), "mcap_usd": gt.get("mcap_usd"),
                             "age_days": age, "limits": limits},
-            "elapsed_s": round(time.time() - t0, 1), "rpc_requests": 0}
+            "elapsed_s": round(time.time() - t0, 1), "rpc_requests": rpc_requests}
 
 
 def validate(token):
@@ -163,22 +166,42 @@ def scan(token, emit=lambda e: None):
         seq[0] += 1
         emit(e)
 
-    # GeckoTerminal — до первого RPC: шапка и проверка «too established». Не ответил за MARKET_WAIT —
-    # обычный скан без шапки (поздний ответ не используется), GT недоступен — тоже обычный скан.
+    # GeckoTerminal — до первого RPC: шапка и проверка «too established». Вердикт too established
+    # в кэше (market.ESTABLISHED_TTL) — сразу он, без GT. Не ответил за MARKET_WAIT — скан идёт, запрос GT
+    # продолжается в фоне; поздний ответ проверяем между этапами и перед вердиктом. GT недоступен — обычный скан.
+    network = GT_NETWORK[chain]
+    limits = established_limits()
+    cached = market.established_get(token, network)
+    if cached is not None and d.too_established(cached, limits):
+        return established_result(token, chain, cached, limits, ev, t0)
     mkt_box = {}
-    mkt_thread = threading.Thread(target=lambda: mkt_box.update(market.fetch_market(token, GT_NETWORK[chain])),
+    mkt_thread = threading.Thread(target=lambda: mkt_box.update(market.fetch_market(token, network,
+                                                                                    budget=MARKET_LATE)),
                                   daemon=True)
     mkt_thread.start()
     mkt_thread.join(timeout=max(0.0, t0 + MARKET_WAIT - time.time()))
-    gt = dict(mkt_box)   # снимок: поздний ответ GT не меняет результат
-    limits = established_limits()
+    gt = dict(mkt_box)
+    late = mkt_thread.is_alive()
+    if late:
+        print(f"gt: no answer in {MARKET_WAIT:g}s for {token}, scanning; late check before verdict", flush=True)
     if d.too_established(gt, limits):
+        market.established_put(token, network, gt)
         return established_result(token, chain, gt, limits, ev, t0)
+
+    def late_established():
+        """Поздний ответ GT уже пришёл и токен too established — результат (скан дальше не идёт), иначе None."""
+        if not late or mkt_thread.is_alive() or not d.too_established(mkt_box, limits):
+            return None
+        print(f"gt: late answer for {token} at {time.time() - t0:.1f}s: too established", flush=True)
+        market.established_put(token, network, mkt_box)
+        return established_result(token, chain, dict(mkt_box), limits, ev, t0, a.REQUESTS[0] - r0)
 
     ev("stage", "launch")
     launch = a.get_launch(token)
     if launch is None:
         raise ScanError(NOT_LAUNCHPAD[chain])
+    if est := late_established():
+        return est
 
     ev("stage", "transfers")
     facts = a.token_facts(token, launch)
@@ -188,6 +211,9 @@ def scan(token, emit=lambda e: None):
     hs = [w for w, _, _ in holders]
     ratio = base["circulating"] / supply if supply else 0.0
 
+    if est := late_established():
+        return est
+
     ev("stage", "entries")
     entries = a.classify_entries(token, transfers, hs)
     ts = a.block_timestamps([launch["block"]] + [e["block"] for e in entries.values() if e["block"] is not None])
@@ -196,6 +222,9 @@ def scan(token, emit=lambda e: None):
     data = {w: entries[w] | {"entry_ts": ts.get(entries[w]["block"]), "inflows": [], "sold": w in sold,
                              "distinct_tokens": None} for w in hs}
     unit, scale = NATIVE[chain]
+
+    if est := late_established():
+        return est
 
     ev("stage", "wallets")
     spider = {w: i % SPIDERS for i, w in enumerate(hs)}
@@ -254,13 +283,25 @@ def scan(token, emit=lambda e: None):
                wallet=o["wallets"][0], wallets=o["wallets"], level=o["level"],
                share=o["share"], share_supply=o["share_supply"])
 
+    # поздний ответ GT (не дождались за MARKET_WAIT): если пришёл — используем, too established — вердикт он
+    if est := late_established():
+        return est
+    if late:
+        if not mkt_thread.is_alive():
+            gt = dict(mkt_box)
+        print(f"gt: late answer for {token} at {time.time() - t0:.1f}s: "
+              + ("ok" if gt else "still none" if mkt_thread.is_alive() else "failed"), flush=True)
+    # подстраховка без GT: рынка не знаем, а токен по блокчейну старше порога too established —
+    # сигналы холдеров ограничены: без жёстких правил по impact и transfer и без probably rug
+    limited = not gt and time.time() - ts[launch["block"]] > limits["min_age_days"] * 86400
     # резерв надёжен: адаптер нашёл пул (на кривой — всегда) и он согласуется с ликвидностью GT
     reserve_ok = facts.get("reserve_ok", True) and reserve_seen(facts["reserve"], supply, gt)
-    sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"), reserve_ok=reserve_ok)
+    sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"), reserve_ok=reserve_ok,
+                 limited=limited)
     reason = _reason(sc, base)
     # probably rug: только вычисления на уже собранных данных, без запросов в сеть
-    rug = d.rug_projection(holders, sig, ops, base, facts["reserve"], sc["band"], snipers=a.RUG_SNIPERS,
-                           reserve_ok=reserve_ok)
+    rug = None if limited else d.rug_projection(holders, sig, ops, base, facts["reserve"], sc["band"],
+                                                snipers=a.RUG_SNIPERS, reserve_ok=reserve_ok)
     if rug:
         rug["level_usd"] = gt["price_usd"] * rug["level_factor"] if gt.get("price_usd") else None
     meta = {}
@@ -279,7 +320,7 @@ def scan(token, emit=lambda e: None):
         "links": links, "packs": packs, "operators": ops,
         "score": sc["score"], "band": sc["band"], "parts": sc["parts"], "gates": sc["gates"],
         "metrics": sc["metrics"], "headline": sc["headline"], "reason": reason, "reserve": facts["reserve"],
-        "reserve_ok": reserve_ok,
+        "reserve_ok": reserve_ok, "limited": limited,
         "rug": rug,
         "unread": unread, "use_funding": USE_FUNDING,
         "elapsed_s": elapsed, "rpc_requests": a.REQUESTS[0] - r0,
