@@ -109,8 +109,12 @@ def wait(seconds):
     return f"⏳ please wait {seconds} s"
 
 
-def report_button(addr):
-    return {"inline_keyboard": [[{"text": "Full report", "url": f"{WEBSITE}/?ca={addr}"}]]}
+def report_button(addr, trade_url=None):
+    """[Full report] и, если есть ссылка, [Trade on Axiom] в одном ряду."""
+    row = [{"text": "Full report", "url": f"{WEBSITE}/?ca={addr}"}]
+    if trade_url:
+        row.append({"text": "Trade on Axiom", "url": trade_url})
+    return {"inline_keyboard": [row]}
 
 
 def rejected(addr, error):

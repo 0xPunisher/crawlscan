@@ -269,8 +269,21 @@ class TestVerdict(unittest.TestCase):
         self.assertIn("<b>Why:</b>\n• biggest operator could move price −62% if sold (≥ 50%; 9.0% of float)", t)
         self.assertIn("• liquidity too thin ($512)", t)
         self.assertNotIn("soft:", t)
-        self.assertEqual(msg["reply_markup"]["inline_keyboard"][0][0],
-                         {"text": "Full report", "url": f"https://crawlscan.fun/?ca={RH.lower()}"})
+        self.assertEqual(msg["reply_markup"]["inline_keyboard"],
+                         [[{"text": "Full report", "url": f"https://crawlscan.fun/?ca={RH.lower()}"},
+                           {"text": "Trade on Axiom",
+                            "url": f"https://axiom.trade/t/{RH.lower()}/@crawlscan?chain=robinhood"}]])
+
+    def test_trade_button_templates(self):
+        res = result(chain="solana", token=PUMP)
+        msg = self.scan(FakeAPI(res))
+        self.assertEqual(msg["reply_markup"]["inline_keyboard"][0][1],
+                         {"text": "Trade on Axiom", "url": f"https://axiom.trade/t/{PUMP}/@crawlscan"})
+        bot, tg, _ = make(FakeAPI(res), trade_urls={"robinhood": "https://r/{address}", "solana": "https://s/{address}?x=1"})
+        bot.handle_update(private(PUMP))
+        drain(bot)
+        self.assertEqual(tg.of("editMessageText")[-1]["reply_markup"]["inline_keyboard"][0][1]["url"],
+                         f"https://s/{PUMP}?x=1")
 
     def test_probably_rug(self):
         rug = {"drop": 0.867, "level_factor": 0.133, "level_usd": 1e-4, "share": 0.187, "share_supply": 0.15,

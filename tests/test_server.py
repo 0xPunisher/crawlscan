@@ -69,7 +69,19 @@ class TestServer(unittest.TestCase):
         for value, on in (("true", True), ("false", False)):
             with mock.patch.dict(os.environ, {"SOLANA_ENABLED": value}):
                 code, d, _ = self.request("/api/config")
-            self.assertEqual((code, d), (200, {"solana": on}))
+            self.assertEqual((code, d["solana"]), (200, on))
+
+    def test_config_trade_templates(self):
+        import trade
+        with mock.patch.dict(os.environ, {"TRADE_URL_ROBINHOOD": "", "TRADE_URL_SOLANA": ""}):
+            _, d, _ = self.request("/api/config")
+        self.assertEqual(d["trade"], trade.DEFAULTS)
+        env = {"TRADE_URL_ROBINHOOD": "https://x.example/{address}?c=rh", "TRADE_URL_SOLANA": "javascript:alert(1)//{address}"}
+        with mock.patch.dict(os.environ, env):
+            _, d, _ = self.request("/api/config")
+        self.assertEqual(d["trade"], {"robinhood": "https://x.example/{address}?c=rh", "solana": trade.DEFAULTS["solana"]})
+        self.assertEqual(trade.url("robinhood", "0xab", d["trade"]), "https://x.example/0xab?c=rh")
+        self.assertIsNone(trade.url("base", "0xab"))
 
     def test_solana_coming_soon(self):
         sol_ca = "fjKUqPWK9m331Y5TZZNFismtqoP2MGWAMHEkB62pump"

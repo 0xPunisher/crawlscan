@@ -8,6 +8,8 @@ Read-only: скан идёт в фоне, браузер опрашивает с
                                             свечи GeckoTerminal [[ts, o, h, l, c, v]] от старых к новым; в скан не входит
   GET  /api/recent?limit=12              -> {"items": [{"token", "chain", "ticker", "name", "score", "band", "rug", "ts"}]}
                                             лента «Recently scanned»: последние уникальные токены, новые сверху
+  GET  /api/config                       -> {"solana": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
+                                            шаблоны ссылки Trade on Axiom ({address}), env TRADE_URL_* (trade.py)
   GET  /                                 -> index.html
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
   GET  /health
@@ -39,6 +41,7 @@ from urllib.parse import urlparse, parse_qs
 
 import engine
 import market
+import trade
 import draw_service as ds
 import rewards_service as rs
 from draw_store import Store
@@ -330,8 +333,8 @@ class H(BaseHTTPRequestHandler):
             return self._draw_get(u.path, q)
         if u.path.startswith("/api/rewards/"):
             return self._rewards_get(u.path, q)
-        if u.path == "/api/config":  # фронт: какие сети включены (Solana — флаг SOLANA_ENABLED)
-            return self._send(200, {"solana": engine.solana_enabled()})
+        if u.path == "/api/config":  # фронт: какие сети включены (Solana — флаг SOLANA_ENABLED), шаблоны Trade on Axiom
+            return self._send(200, {"solana": engine.solana_enabled(), "trade": trade.templates()})
         if u.path == "/api/chart":
             try:
                 return self._send(200, get_chart((q.get("token") or [""])[0]))

@@ -51,7 +51,9 @@
 
   - лента «recently scanned» в герое под полем поиска: GET /api/recent?limit=12 при загрузке, раз в 30 с
     (только при открытой вкладке) и при возврате на лендинг; строка — тикер, сеть, адрес, скор, вердикт,
-    probably rug, «2m ago»; клик запускает скан токена. Пусто — секции нет.
+    probably rug, «2m ago»; клик запускает скан токена, клик по адресу копирует его. Пусто — секции нет.
+  - «Trade on Axiom» под вердиктом: шаблоны ссылок по сети из /api/config (env TRADE_URL_*), новая вкладка;
+    адрес токена в шапке результата — копируется кликом (иконка copy, галочка «copied»), без ссылки на эксплорер.
 
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
 и index.html не перезаписывает.
@@ -391,9 +393,9 @@ rep('          <span>read-only · no wallet connect · Robinhood Chain</span>\n'
     f'          <span style="display:inline-flex;align-items:center;gap:8px"><span style="color:#00c805">${TOKEN_TICKER}</span>'
     f'<span>CA:</span><span title="{TOKEN_CA}" style="color:#aab4ba">{TOKEN_CA_SHORT}</span>{copy_button("Hero", "copy token contract address")}</span>\n')
 
-# логика copy в компоненте: CA в исходном регистре, галочка на 1.5 с
-rep("  blank(ca){return {", f"""  copyCa(key){{
-    const ca={json.dumps(TOKEN_CA)};
+# логика copy в компоненте: CA в исходном регистре, галочка на 1.5 с; один ключ caCopied на всю страницу
+rep("  blank(ca){return {", f"""  copyCa(key,text){{   // text — любой адрес (шапка скана, лента); без него — CA проекта
+    const ca=text||{json.dumps(TOKEN_CA)};
     const fallback=()=>{{const t=document.createElement('textarea'); t.value=ca; t.style.position='fixed'; t.style.opacity='0'; document.body.appendChild(t); t.select(); try{{document.execCommand('copy');}}catch(e){{}} t.remove();}};
     try{{ if(navigator.clipboard&&window.isSecureContext) navigator.clipboard.writeText(ca).catch(fallback); else fallback(); }}catch(e){{fallback();}}
     this.setState({{caCopied:key}}); clearTimeout(this._caT); this._caT=setTimeout(()=>this.setState({{caCopied:''}}),1500);
@@ -531,14 +533,17 @@ rep('<sc-if value="{{inputError}}" hint-placeholder-val="{{false}}"><span style=
     '<sc-if value="{{inputNotice}}" hint-placeholder-val="{{false}}"><span data-notice="1" style="display:inline-flex;align-items:center;gap:8px;color:#9fd9ff">'
     '<span style="width:6px;height:6px;border-radius:50%;background:#9fd9ff;box-shadow:0 0 6px #9fd9ff"></span>{{inputNotice}}</span></sc-if>')
 
-# бейдж сети у тикера и ссылка на токен
+# бейдж сети у тикера; адрес токена — копируется кликом (ссылки на эксплорер у токена нет, у кошельков — есть)
 TICKER = "<span data-grip=\"1\" style=\"font-family:'JetBrains Mono',monospace;font-size:14px;color:#9fd9ff\">${{hTicker}}</span>"
 rep(TICKER, TICKER + f'<span data-chain="1" style="align-self:center;{MONO};font-size:10.5px;padding:2px 8px;border-radius:999px;color:#c9d1d6;'
     'border:1px solid #2c353b;background:#0b1013">{{chainLabel}}</span>')
 CA_STYLE = f"{MONO};font-size:12px;color:#5f6b72;word-break:break-all"
 rep("<span style=\"font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72\">{{ca}}</span>",
-    f'<sc-if value="{{{{caLink}}}}" hint-placeholder-val="{{{{false}}}}"><a href="{{{{caUrl}}}}" target="_blank" rel="noopener" style="{CA_STYLE}" style-hover="color:#9fd9ff">{{{{ca}}}} ↗</a></sc-if>'
-    f'<sc-if value="{{{{caPlain}}}}" hint-placeholder-val="{{{{true}}}}"><span style="{CA_STYLE}">{{{{ca}}}}</span></sc-if>')
+    f'<button sc-camel-on-click="{{{{copyScanCa}}}}" data-copy-ca="1" title="copy full address" aria-label="copy token address" '
+    f'style="display:inline-flex;align-items:center;gap:8px;padding:0;border:0;background:transparent;cursor:pointer;text-align:left;{CA_STYLE}" '
+    f'style-hover="color:#9fd9ff"><span style="min-width:0">{{{{ca}}}}</span>'
+    f'<sc-if value="{{{{caScanIdle}}}}" hint-placeholder-val="{{{{true}}}}">{ICON_COPY}</sc-if>'
+    f'<sc-if value="{{{{caScanDone}}}}" hint-placeholder-val="{{{{false}}}}"><span style="display:inline-flex;align-items:center;gap:4px;color:#00c805;white-space:nowrap">{ICON_CHECK}copied</span></sc-if></button>')
 
 # адрес кошелька в таблице: ссылка solscan для Solana, иначе текст
 ADDR = "font-family:'JetBrains Mono',monospace;font-size:13px;color:{{r.addrColor}}"
@@ -598,14 +603,15 @@ rep("  blank(ca){return {", """  soon(ca){   // Solana выключена: ле�
     if(was!=='landing'){window.scrollTo(0,0); this.startLanding();}
   }
   netVals(){
-    const net=this.state.net, ch=chainOf(this.m.ca)||'robinhood', ex=EXPLORER[ch];
+    const net=this.state.net, ch=chainOf(this.m.ca)||'robinhood';
     const st=on=>on?{c:'#eef1f3',b:'rgba(0,200,5,0.55)',g:'rgba(0,200,5,0.1)'}:{c:'#5f6b72',b:'#1c252b',g:'transparent'};
     const rh=st(net==='robinhood'), so=st(net==='solana');
     const pick=n=>()=>this.setState({net:n,inputError:'',inputNotice:''});
     return {placeholder:PLACEHOLDER[net], inputNotice:this.state.inputNotice,
       rhColor:rh.c, rhBorder:rh.b, rhBg:rh.g, solColor:so.c, solBorder:so.b, solBg:so.g,
       solSoon:this.state.solanaOn===false, pickRh:pick('robinhood'), pickSol:pick('solana'),
-      chainLabel:CHAIN_NAME[ch], caUrl:ex?ex.token(this.m.ca):'', caLink:!!ex, caPlain:!ex};
+      chainLabel:CHAIN_NAME[ch], copyScanCa:()=>this.copyCa('scan',this.m.ca),
+      caScanDone:this.state.caCopied==='scan', caScanIdle:this.state.caCopied!=='scan'};
   }
   blank(ca){return {""")
 rep("      onInput:e=>this.setState({input:e.target.value,inputError:''}),",
@@ -1192,7 +1198,8 @@ rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:no
 # лента «recently scanned» в герое, сразу под полем поиска (внутри data-nocrawl: пауки лендинга
 # её не закрывают). GET /api/recent?limit=12 при загрузке, раз в 30 с, при возврате на вкладку и
 # на лендинг; вкладка скрыта — запросов нет. Пусто или ошибка — секции нет.
-# Строка: тикер, сеть, адрес, скор и вердикт цветом полосы, «probably rug», «2m ago»; клик — скан (?ca=).
+# Строка: тикер, сеть, адрес, скор и вердикт цветом полосы, «probably rug», «2m ago»; клик — скан (?ca=),
+# клик по адресу — копирует полный адрес (скан не открывает).
 # ---------------------------------------------------------------------------
 rep("  blank(ca){return {", r"""  loadRecent(){   // лента «recently scanned»: только при открытой вкладке
     if(document.hidden) return;
@@ -1209,7 +1216,9 @@ rep("  blank(ca){return {", r"""  loadRecent(){   // лента «recently scann
         addr:x.token.slice(0,6)+'…'+x.token.slice(-4), full:x.token,
         score:x.score!=null&&!early?String(x.score):'—', band:early?'too early':band, color:col,
         rug:!!x.rug, ago:ago(x.ts), href:'/?ca='+encodeURIComponent(x.token),
-        go:e=>{e.preventDefault(); this.startScan(x.token);}};
+        go:e=>{e.preventDefault(); this.startScan(x.token);},
+        copy:e=>{e.preventDefault(); e.stopPropagation(); this.copyCa('r:'+x.token,x.token);},
+        copied:this.state.caCopied==='r:'+x.token, idle:this.state.caCopied!=='r:'+x.token};
     });
     return {recentOn:rows.length>0, recentRows:rows};
   }
@@ -1230,7 +1239,7 @@ RECENT_BLOCK = f'''          <sc-if value="{{{{recentOn}}}}" hint-placeholder-va
             <sc-for list="{{{{recentRows}}}}" as="r" hint-placeholder-count="4"><a href="{{{{r.href}}}}" sc-camel-on-click="{{{{r.go}}}}" title="{{{{r.full}}}}" class="cs-recent-row" style="display:grid;align-items:center;padding:10px 4px;border-top:1px solid #12181c;{MONO};font-size:13px;color:#dfe5e8;text-decoration:none" style-hover="background:#0d1317">
               <span class="cs-rc-t" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#eef1f3">{{{{r.ticker}}}}</span>
               <span class="cs-rc-c" style="{PILL};color:{{{{r.chainColor}}}};border:1px solid {{{{r.chainColor}}}};justify-self:start">{{{{r.chain}}}}</span>
-              <span class="cs-rc-a" style="color:#5f6b72;font-size:12px;white-space:nowrap">{{{{r.addr}}}}</span>
+              <button class="cs-rc-a" sc-camel-on-click="{{{{r.copy}}}}" title="copy full address" aria-label="copy token address" style="justify-self:start;display:inline-flex;align-items:center;gap:6px;padding:0;border:0;background:transparent;cursor:pointer;{MONO};color:#5f6b72;font-size:12px;white-space:nowrap" style-hover="color:#9fd9ff"><sc-if value="{{{{r.idle}}}}" hint-placeholder-val="{{{{true}}}}">{{{{r.addr}}}}{ICON_COPY.replace('width="14" height="14"', 'width="12" height="12"')}</sc-if><sc-if value="{{{{r.copied}}}}" hint-placeholder-val="{{{{false}}}}"><span style="display:inline-flex;align-items:center;gap:4px;color:#00c805">{ICON_CHECK.replace('width="14" height="14"', 'width="12" height="12"')}copied</span></sc-if></button>
               <span class="cs-rc-s" style="color:{{{{r.color}}}};text-align:right;font-variant-numeric:tabular-nums">{{{{r.score}}}}</span>
               <span class="cs-rc-v" style="color:{{{{r.color}}}};font-size:11.5px;letter-spacing:0.04em;white-space:nowrap">{{{{r.band}}}}</span>
               <span class="cs-rc-r" style="justify-self:start"><sc-if value="{{{{r.rug}}}}" hint-placeholder-val="{{{{false}}}}"><span style="{PILL};color:#ff4d4d;background:rgba(255,77,77,0.1);border:1px solid rgba(255,77,77,0.45)">▼ <span class="cs-rc-pw">probably </span>rug</span></sc-if></span>
@@ -1245,6 +1254,25 @@ RECENT_CSS = """
 @media (max-width:640px){.cs-recent-row{grid-template-columns:auto auto minmax(0,1fr) auto!important;grid-template-areas:"t t s v" "c a r g"!important;row-gap:6px}.cs-rc-r{justify-self:end!important}.cs-rc-pw{display:none}}
 """
 rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}" + RECENT_CSS)
+
+# ---------------------------------------------------------------------------
+# «Trade on Axiom» под вердиктом: шаблон ссылки по сети из /api/config (trade, env TRADE_URL_*),
+# {address} — адрес токена из результата. Только когда есть результат; новая вкладка, rel="noopener".
+# ---------------------------------------------------------------------------
+rep(".then(d=>this.setState({solanaOn:!!d.solana}))", ".then(d=>this.setState({solanaOn:!!d.solana,trade:d.trade||null}))")
+rep("  blank(ca){return {", """  tradeVals(){
+    const raw=this.m&&this.m.result&&this.m.result.raw, t=this.state.trade, tpl=raw&&t&&t[raw.chain];
+    if(this.state.view!=='scan'||!raw||!raw.token||!tpl||this.m.error) return {tradeOn:false,tradeUrl:'#'};
+    return {tradeOn:true,tradeUrl:tpl.split('{address}').join(encodeURIComponent(raw.token))};
+  }
+  blank(ca){return {""")
+rep("      ...this.recentVals(),", "      ...this.recentVals(),\n      ...this.tradeVals(),")
+TRADE_BTN = (f'<sc-if value="{{{{tradeOn}}}}" hint-placeholder-val="{{{{false}}}}"><a href="{{{{tradeUrl}}}}" target="_blank" rel="noopener" data-trade="1" '
+             f'style="display:flex;align-items:center;justify-content:center;gap:8px;height:44px;border:1px solid rgba(0,200,5,0.55);border-radius:8px;'
+             f'background:rgba(0,200,5,0.08);color:#eef1f3;{MONO};font-size:13px;font-weight:600;text-decoration:none" '
+             f'style-hover="background:rgba(0,200,5,0.16);border-color:#00c805">Trade on Axiom ↗</a></sc-if>\n')
+REASON = '{{reason}}</span>\n              <div style="display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid #141b20">'
+rep(REASON, REASON.replace('</span>\n', '</span>\n              ' + TRADE_BTN, 1))
 
 # суммы меньше $1K — без хвоста знаков (тонкая ликвидность на Solana)
 rep("':'$'+v;", "':'$'+(v>=10?Math.round(v):v.toFixed(2));")

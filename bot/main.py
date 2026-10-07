@@ -3,7 +3,7 @@
   python bot/main.py
 
 env: TG_BOT_TOKEN (обязателен, из .env через env.py; нигде не печатается), CRAWLSCAN_API (по умолчанию
-https://crawlscan.fun). Long polling getUpdates (timeout=30): одновременно может работать только один
+https://crawlscan.fun), TRADE_URL_ROBINHOOD / TRADE_URL_SOLANA — шаблоны кнопки Trade on Axiom (trade.py). Long polling getUpdates (timeout=30): одновременно может работать только один
 экземпляр бота, второй получает 409 Conflict.
 
 Личка: адрес токена (или /scan <адрес>) → скан; /start, /help, /rewards. Группы: только /scan <адрес>
@@ -17,6 +17,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import env                                          # noqa: E402
+import trade                                        # noqa: E402
 from bot import text as T                           # noqa: E402
 from bot.api import ApiError, CrawlScan, Rejected   # noqa: E402
 from bot.tg import Telegram, TelegramError          # noqa: E402
@@ -52,7 +53,7 @@ def parse_command(text):
 
 class Bot:
     def __init__(self, tg, api, username="", workers=WORKERS, cooldown=USER_COOLDOWN, scan_timeout=SCAN_TIMEOUT,
-                 poll_every=POLL_EVERY, clock=time.monotonic, sleep=time.sleep, log=log, banner=BANNER, spawn=None):
+                 poll_every=POLL_EVERY, clock=time.monotonic, sleep=time.sleep, log=log, banner=BANNER, spawn=None, trade_urls=None):
         self.tg, self.api, self.username = tg, api, username
         self.workers, self.cooldown, self.scan_timeout, self.poll_every = workers, cooldown, scan_timeout, poll_every
         self.clock, self.sleep, self.log = clock, sleep, log
@@ -63,6 +64,7 @@ class Bot:
         self.banner = banner
         self.banner_id = None        # file_id баннера после первой загрузки: дальше шлём без файла
         # запросы к сайту вне цикла опроса (/rewards): по умолчанию — свой поток
+        self.trade_urls = trade_urls or trade.templates()   # {сеть: шаблон} для [Trade on Axiom]
         self.spawn = spawn or (lambda f: threading.Thread(target=f, daemon=True).start())
 
     # --- Telegram ---------------------------------------------------------------------------------
@@ -244,7 +246,9 @@ class Bot:
             self.log(f"scan {addr}: {r.get('error')}")
             return T.scan_error(addr, r.get("error")), None
         res = r["result"]
-        return T.verdict(res), T.report_button(res.get("token") or addr)
+        token = res.get("token") or addr
+        chain = res.get("chain") or T.chain_of(token)
+        return T.verdict(res), T.report_button(token, trade.url(chain, token, self.trade_urls))
 
     # --- цикл опроса ------------------------------------------------------------------------------
 
