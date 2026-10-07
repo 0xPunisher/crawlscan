@@ -1,5 +1,5 @@
 """Тесты Token Burn & Holder Rewards: правила (rewards.py), хранилище, оркестрация с подставной сетью, API."""
-import json, math, os, tempfile, threading, time, unittest, urllib.error, urllib.request
+import json, math, os, sqlite3, tempfile, threading, time, unittest, urllib.error, urllib.request
 from contextlib import ExitStack
 from datetime import datetime
 from http.server import ThreadingHTTPServer
@@ -9,6 +9,7 @@ import fakes  # noqa: F401  (запрещает настоящие RPC адап�
 import rewards as rw
 import rewards_service as rs
 from chains import robinhood as ch
+import rewards_store as rws
 from rewards_store import RewardsStore
 import server
 
@@ -39,6 +40,7 @@ class FakeChain:
 
     def __init__(self, head_ts=None):
         self.transfers = []
+        self.eth = []                                   # нативные ETH-переводы (external)
         self.head_ts = head_ts or DAY_END + 2 * 86400
         self.contracts = {CONTRACT}
         self.calls = {"seed": 0, "launch": 0}
@@ -56,6 +58,16 @@ class FakeChain:
         self.transfers.append(t)
         self.transfers.sort(key=lambda t: (t["block"], t["log_index"]))
         return t
+
+    def add_eth(self, frm, to, wei, block, tx=None):
+        t = {"frm": frm, "to": to, "amount": wei, "block": block, "tx": tx or f"0xeth{len(self.eth):04d}", "log_index": -1}
+        self.eth.append(t)
+        return t
+
+    def eth_sent(self, frm, from_block, to_block, to=None, max_count=1000):
+        fs, ts = set(frm), None if to is None else set(to)
+        return sorted((dict(t) for t in self.eth if from_block <= t["block"] <= to_block and t["frm"] in fs
+                       and (ts is None or t["to"] in ts)), key=lambda t: t["block"])
 
     def head(self):
         return blk(self.head_ts)
@@ -86,6 +98,7 @@ class FakeChain:
         p("block_number", self.head)
         p("block_timestamps", lambda blocks: {b: T0 + b * BLOCK_SECONDS for b in blocks})
         p("get_token_transfers", self.get_token_transfers)
+        p("eth_sent", self.eth_sent)
         p("get_launch", self.get_launch)
         p("excluded_addresses", lambda curve: {CURVE, ZERO_, rw.DEAD})
         p("is_contract_at", lambda addrs, block: {a: a in self.contracts for a in addrs})
@@ -294,6 +307,62 @@ class TestService(unittest.TestCase):
         row = self.store.get_draw(DAY)
         self.assertEqual((row["payout_tx"], row["payout_amount"], row["payout_from"]), (pay["tx"], 25, DEV))
         self.assertEqual(rs.draw_json(row)["payout_status"], "paid")
+
+    def test_eth_payout_detected(self):
+        row = rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY))
+        win, after = row["winner"], blk(rw.draw_time(DAY))
+        self.chain.add_eth(DEV, win, 10 ** 17, blk(DAY_END) + 10)            # до расчёта в 22:05 — не выплата
+        self.chain.add_eth(OUTSIDER, win, 2 * 10 ** 17, after + 5)          # не с DEV_WALLETS
+        self.chain.add_eth(DEV, OUTSIDER, 3 * 10 ** 17, after + 6)          # не победителю
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 0)
+        pay = self.chain.add_eth(DEV, win, 52_300_000_000_000_000, after + 20)   # 0.0523 ETH
+        self.chain.add(DEV, win, 25, after + 30)                             # токен позже — уже не выплата
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 1)
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 0)
+        row = self.store.get_draw(DAY)
+        self.assertEqual((row["payout_tx"], row["payout_amount"], row["payout_currency"], row["payout_log_index"]),
+                         (pay["tx"], 52_300_000_000_000_000, "ETH", -1))
+        j = rs.draw_json(row)
+        self.assertEqual((j["payout_status"], j["payout_currency"], j["payout_eth"], j["payout_tokens"]),
+                         ("paid", "ETH", 0.0523, None))
+        st = rs.status_json(self.store, self.cfg, now=DAY_END + 3600)["last_draw"]
+        self.assertEqual((st["payout_currency"], st["payout_eth"], st["payout_tokens"]), ("ETH", 0.0523, None))
+        h = rs.history_json(self.store, self.cfg)["draws"][0]
+        self.assertEqual((h["payout_currency"], h["payout_eth"]), ("ETH", 0.0523))
+
+    def test_token_payout_still_counts_first(self):
+        row = rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY))
+        win, after = row["winner"], blk(rw.draw_time(DAY))
+        tok = self.chain.add(DEV, win, 25, after + 10)
+        self.chain.add_eth(DEV, win, 10 ** 17, after + 20)
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 1)
+        row = self.store.get_draw(DAY)
+        self.assertEqual((row["payout_tx"], row["payout_currency"]), (tok["tx"], "CRAWLSCAN"))
+        j = rs.draw_json(row)
+        self.assertEqual((j["payout_currency"], j["payout_tokens"], j["payout_eth"]), ("CRAWLSCAN", 25 / 10 ** 18, None))
+
+    def test_old_token_payout_and_migration(self):
+        """База до выплат в ETH: колонки payout_currency нет; выплата токеном отображается как раньше."""
+        path = os.path.join(self.tmp.name, "old.db")
+        db = sqlite3.connect(path)
+        old = rws.SCHEMA.replace(",\n  payout_currency TEXT", "")
+        self.assertNotIn("payout_currency", old)
+        db.executescript(old)
+        db.execute("INSERT INTO rw_draws(day, token, status, list_hash, seed_time, winner, winner_weight, total_weight, "
+                   "participants, decimals, dev_wallets, created_at, payout_amount, payout_tx, payout_log_index, "
+                   "payout_block, payout_from, paid_at) VALUES (?, ?, 'done', 'h', 1, ?, '5', '10', 2, 18, ?, 1, ?, "
+                   "'0xold', 3, 100, ?, 2)", (DAY, TOKEN, A, DEV, str(7 * 10 ** 18), DEV))
+        db.commit(); db.close()
+        st = rws.RewardsStore(path)
+        try:
+            row = st.get_draw(DAY)
+            self.assertIsNone(row["payout_currency"])
+            j = rs.draw_json(row)
+            self.assertEqual((j["payout_status"], j["payout_currency"], j["payout_tokens"], j["payout_eth"]),
+                             ("paid", "CRAWLSCAN", 7.0, None))
+            rws.RewardsStore(path).close()                                  # повторное открытие — без ошибок
+        finally:
+            st.close()
 
     def test_status_decimals_before_first_draw(self):
         rs.check_burns(self.store, self.cfg)

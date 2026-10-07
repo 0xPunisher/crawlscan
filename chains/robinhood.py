@@ -648,14 +648,14 @@ def classify_entries(token, transfers, wallets, chunk=50):
     return out
 
 
-def eth_transfers(to_block, max_count=1000, **flt):
+def eth_transfers(to_block, max_count=1000, from_block=0, **flt):
     """ETH-переводы (alchemy_getAssetTransfers, category external) по фильтру
-    toAddress/fromAddress в блоках [0, to_block]. internal на этой сети не
+    toAddress/fromAddress в блоках [from_block, to_block]. internal на этой сети не
     поддерживается: ETH из контрактов (выводы с бирж через контракт, мосты) не виден.
     Возвращает (список {"from", "to", "block", "amount" (wei), "tx"}, упёрлись_в_max_count)."""
     out, key = [], None
     while True:
-        p = {"category": ["external"], "fromBlock": "0x0", "toBlock": hex(to_block),
+        p = {"category": ["external"], "fromBlock": hex(from_block), "toBlock": hex(to_block),
              "excludeZeroValue": True, "maxCount": hex(min(1000, max_count - len(out)))} | flt
         if key:
             p["pageKey"] = key
@@ -675,6 +675,20 @@ def eth_inflows(wallet, before_block, max_count=1000):
     [{"from", "block", "amount" (wei)}]. Не больше max_count."""
     rows, _ = eth_transfers(before_block - 1, max_count, toAddress=wallet.lower())
     return [{"from": r["from"], "block": r["block"], "amount": r["amount"]} for r in rows]
+
+
+def eth_sent(frm, from_block, to_block, to=None, max_count=1000):
+    """Нативные ETH-переводы (external) с адресов frm (список) в блоках [from_block, to_block], по одному запросу
+    на отправителя; to — оставить только получателей из списка. В форме переводов токена (для выплат наград):
+    [{"frm", "to", "amount" (wei), "tx", "block", "log_index": -1}], по блокам. log_index -1: у нативного перевода
+    лога нет, ключ выплаты — (tx, -1)."""
+    want = None if to is None else {a.lower() for a in to}
+    out = []
+    for a in sorted({x.lower() for x in frm}):
+        rows, _ = eth_transfers(to_block, max_count, from_block=from_block, fromAddress=a)
+        out += [{"frm": r["from"], "to": r["to"], "amount": r["amount"], "tx": r["tx"], "block": r["block"],
+                 "log_index": -1} for r in rows if want is None or r["to"] in want]
+    return sorted(out, key=lambda t: t["block"])
 
 
 def outgoing_count(addr, cap=100):

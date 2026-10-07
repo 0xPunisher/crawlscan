@@ -67,7 +67,7 @@ START = (
     "holding, and wallets linked by the same transaction, distributor or funder.\n\n"
     "In about 15 seconds you get a score from 0 to 100 and a verdict.\n\n"
     "<b>CrawlScan has its own token, and it rewards its holders.</b>\n\n"
-    "Every 24 hours one holder wins 10% of the creator fees, paid in $CrawlScan. Every token you hold is a ticket, "
+    "Every 24 hours one holder wins 10% of the creator fees, paid in ETH. Every token you hold is a ticket, "
     "so the more you hold, the bigger your chance. Every 12 hours the dev burns tokens. "
     "All verifiable live on the website.\n\n"
     f"CA: <code>{OFFICIAL_CA}</code>"
@@ -263,6 +263,13 @@ def tokens(x):
     return f"{x:,.0f}" if x >= 100 else f"{x:,.2f}".rstrip("0").rstrip(".") if x >= 1 else f"{x:.4g}"
 
 
+def eth(x):
+    """Сумма ETH для показа: до 4 знаков после точки без хвостовых нулей (0.0523, 2.5); меньше 0.0001 — "<0.0001"."""
+    if 0 < x < 0.0001:
+        return "<0.0001"
+    return f"{x:.4f}".rstrip("0").rstrip(".")
+
+
 def tx_link(tx, label="tx"):
     return f'<a href="{EXPLORER}/tx/{e(tx)}">{e(label)}</a>'
 
@@ -294,7 +301,10 @@ def rewards(st):
         pct = "—" if chance is None else f"{chance * 100:.2f}%" if chance >= 0.0001 else "<0.01%"
         lines.append(f"<b>Last winner</b> · draw of {e(d.get('day', ''))}")
         lines.append(f"<code>{e(short(d['winner']))}</code> · chance {pct}")
-        if d.get("payout_tx"):
+        if d.get("payout_tx") and d.get("payout_currency") == "ETH":
+            amt = f"{eth(d['payout_eth'])} ETH · " if d.get("payout_eth") is not None else ""
+            lines.append(f"✅ Reward sent: {amt}{tx_link(d['payout_tx'])}")
+        elif d.get("payout_tx"):   # выплаты токеном (до перехода на ETH) — как раньше
             amt = f"{tokens(d.get('payout_tokens'))} $CrawlScan · " if d.get("payout_tokens") is not None else ""
             lines.append(f"✅ Paid: {amt}{tx_link(d['payout_tx'])}")
         else:
