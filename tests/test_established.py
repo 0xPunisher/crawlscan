@@ -278,7 +278,7 @@ class TestLateAndLimited(unittest.TestCase):
         self.assertFalse([g for g in res["gates"] if "could move price" in g or "received by transfer" in g])
         self.assertIsNone(res["rug"])
         self.assertTrue(res["headline"].endswith("market data unavailable, older token: holder signals are limited"))
-        self.assertIn(res["band"], ("CLEAN", "OK", "RISKY", "DANGER"))
+        self.assertIn(res["band"], ("CLEAN", "OK", "RISKY"))           # не ниже RISKY
         self.assertIsNotNone(res["score"])
 
     def test_gt_down_young_token_unchanged(self):
@@ -303,6 +303,16 @@ class TestLateAndLimited(unittest.TestCase):
         self.assertEqual(plain["parts"], lim["parts"])                # части скора те же
         self.assertEqual(lim["headline"], plain["headline"] + d.LIMITED_NOTE)
         self.assertFalse([g for g in lim["gates"] if "could move price" in g or "received by transfer" in g])
+
+    def test_limited_band_not_below_risky(self):
+        s = TestRugProjection.build(self)
+        sig = signals(s)
+        for v in sig.values():
+            v["virgin"] = True                                        # жёсткое правило virgin → DANGER
+        plain = d.score(s.holders, sig, s.ops, s.base, s.reserve)
+        lim = d.score(s.holders, sig, s.ops, s.base, s.reserve, limited=True)
+        self.assertEqual(plain["band"], "DANGER")
+        self.assertEqual(lim["band"], "RISKY")
 
 
 class TestReserveOk(unittest.TestCase):

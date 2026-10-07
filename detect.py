@@ -306,7 +306,7 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     gates — сработавшие стоп-правила: жёсткие (→ DANGER) и мягкие с префиксом "soft:"
     (стая или доказанный оператор из ≥ 3 кошельков → score не выше 59, band не лучше RISKY).
     limited=True — данных рынка нет (GT не ответил), а токен старый (сигналы холдеров ограничены):
-    жёсткие правила по impact и transfer не применяются, к headline добавляется LIMITED_NOTE.
+    жёсткие правила по impact и transfer не применяются, band не ниже RISKY, к headline добавляется LIMITED_NOTE.
     Меньше MIN_HOLDERS холдеров (base["holders_total"]) → score None, band TOO_EARLY_OR_LATE."""
     n = len(holders)
     big = ops[0] if ops else {"share": 0.0, "share_supply": 0.0, "weighted": 0.0, "wallets": []}
@@ -352,6 +352,8 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     if any(g.startswith("soft:") for g in gates):
         total = min(total, SOFT_GATE_SCORE)
     band = "DANGER" if hard else next((b for lim, b in BANDS if total >= lim), "DANGER")
+    if limited and band == "DANGER":
+        band = "RISKY"   # старый токен без данных рынка: сигналы холдеров ограничены, вердикт не ниже RISKY
     return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline}
 
 
