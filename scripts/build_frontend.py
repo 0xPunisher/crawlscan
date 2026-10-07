@@ -1383,6 +1383,91 @@ rep("this.log('verdict',BANDS[e.band]||A,`${e.score} ${e.band} · ${e.detail||''
 # суммы меньше $1K — без хвоста знаков (тонкая ликвидность на Solana)
 rep("':'$'+v;", "':'$'+(v>=10?Math.round(v):v.toFixed(2));")
 
+
+# ---------------------------------------------------------------------------
+# early buyers: первые 20 покупателей после запуска и что с ними сейчас (GET /api/early после вердикта,
+# скан не ждёт). Блок на всю ширину перед «What the crawlers checked»; у TOO ESTABLISHED скрыт и не запрашивается.
+# HTML строкой (earlyHtml) в div с ref, в try/catch: ошибка блока не ломает страницу и пауков.
+# ---------------------------------------------------------------------------
+EARLY_JS = r"""// ---- early buyers (GET /api/early after the verdict) ----
+const EARLY_ST={holding_all:['holding all',G],added:['added',G],sold_part:['sold part',A],sold_all:['sold all','#8a959c'],
+  moved:['moved',A],burned:['burned','#8a959c']};
+const eChip=(t,c,title)=>`<span${title?` title="${escH(title)}"`:''} style="font-family:${MONO_F};font-size:10.5px;padding:2px 7px;border-radius:3px;white-space:nowrap;color:${c};border:1px solid ${rgba(c,0.4)};background:${rgba(c,0.08)}">${escH(t)}</span>`;
+const ePct=v=>{v=(v||0)*100; return v===0?'0%':v<0.01?'<0.01%':v<1?v.toFixed(2)+'%':v.toFixed(1)+'%';};
+const eAfter=b=>{const s=b.dt_s; if(s==null) return '+'+b.block_offset+' blk'; return s<60?`+${s}s`:s<3600?`+${Math.round(s/60)}m`:`+${(s/3600).toFixed(1)}h`;};
+const eShort=a=>a?a.slice(0,a.startsWith('0x')?6:4)+'…'+a.slice(-4):'';
+function earlyHtml(st,ca,W){
+  const head=(right)=>`<div style="display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:12px"><h3 data-grip="1" style="margin:0;font-size:26px;font-weight:500;letter-spacing:-0.025em;color:#eef1f3">Early buyers</h3><span style="font-family:${MONO_F};font-size:12px;color:#5f6b72">${right}</span></div>`;
+  const card=inner=>`<div style="border:1px solid #141b20;border-radius:12px;background:#090c0f;overflow:hidden">${inner}</div>`;
+  if(!st||st.status==='loading') return head('first 20 after launch')+card(`<div style="padding:18px"><div class="cs-skel" data-early-loading="1" style="height:180px;border-radius:8px"></div></div>`);
+  const d=st.data||{};
+  if(st.status!=='ok'||d.error||!d.buyers) return head('first 20 after launch')+card(`<div data-early-empty="1" style="padding:22px 20px;font-family:${MONO_F};font-size:13px;color:#8a959c">${d.reason==='launch history too long'?'launch history is too long to read early buyers':'early buyers temporarily unavailable'}</div>`);
+  const sm=d.summary||{}, n=sm.buyers||0, ex=EXPLORER[chainOf(ca)];
+  const stale=d.stale_at>0?` · as of ${new Date(d.stale_at*1000).toISOString().slice(11,16)} UTC`:'';
+  if(!n) return head('first 20 after launch'+stale)+card(`<div data-early-empty="1" style="padding:22px 20px;font-family:${MONO_F};font-size:13px;color:#8a959c">no buyers yet</div>`);
+  const sum=`<div data-early-summary="1" style="display:flex;flex-wrap:wrap;gap:8px 28px;padding:18px 20px;border-bottom:1px solid #141b20;font-family:${MONO_F}">`
+    +`<span style="font-size:15px;color:#eef1f3"><span style="color:${sm.exited>n/2?RD:'#eef1f3'}">${sm.exited} of ${n}</span> exited</span>`
+    +`<span style="font-size:15px;color:#eef1f3">${sm.holding} holding</span>`
+    +`<span style="font-size:15px;color:#eef1f3">${ePct(sm.now_share_supply)} <span style="color:#8a959c">of supply now</span></span>`
+    +`<span style="font-size:12.5px;color:#5f6b72;align-self:center">bought ${ePct(sm.bought_share_supply)} at launch</span></div>`
+    +(sm.same_destination||[]).map(g=>`<div data-early-same="1" style="padding:12px 20px;border-bottom:1px solid #141b20;font-family:${MONO_F};font-size:12.5px;color:${A}">${g.wallets.length} early buyers sent tokens to the same wallet ${escH(eShort(g.to))}</div>`).join('');
+  const cols='28px minmax(110px,1.2fr) 70px minmax(64px,0.7fr) minmax(64px,0.7fr) minmax(0,1.6fr)';
+  const hd=`<div class="cs-early-row cs-early-head" style="display:grid;grid-template-columns:${cols};gap:14px;padding:10px 20px;font-family:${MONO_F};font-size:11px;color:#5f6b72;border-bottom:1px solid #141b20"><span>#</span><span>wallet</span><span>entry</span><span>bought</span><span>now</span><span>status</span></div>`;
+  const rows=d.buyers.map(b=>{
+    const s=EARLY_ST[b.status]||[b.status,'#8a959c'];
+    const addr=ex?`<a href="${escH(ex.account(b.wallet))}" target="_blank" rel="noopener" style="color:#dfe5e8">${escH(eShort(b.wallet))}</a>`:`<span style="color:#dfe5e8">${escH(eShort(b.wallet))}</span>`;
+    // мелкий перевод (меньше 20% купленного) статуса не меняет — виден долей на чипе
+    const small=b.status!=='moved'&&b.moved_share_supply>0?` · ${ePct(b.moved_share_supply)} moved`:'';
+    const chips=[eChip(s[0]+(b.status==='moved'&&b.moved_to&&b.moved_to[0]?' → '+eShort(b.moved_to[0]):small),s[1],
+      small&&b.moved_to&&b.moved_to.length?'moved to '+b.moved_to.map(eShort).join(', '):'')];
+    if(b.dev) chips.push(eChip('dev',RD));
+    (b.scan_flags||[]).forEach(f=>chips.push(eChip(f,f==='operator'?RD:A)));
+    if(b.partial) chips.push(eChip('partial','#5f6b72','history too long to read every exit'));
+    return `<div class="cs-early-row" data-early-row="${escH(b.wallet)}" style="display:grid;grid-template-columns:${cols};align-items:center;gap:6px 14px;min-height:40px;padding:6px 20px;border-bottom:1px solid #10161a;font-family:${MONO_F};font-size:12.5px">`
+      +`<span style="font-size:11px;color:#4a555c">${b.rank}</span><span class="cs-early-w" style="min-width:0;overflow:hidden;text-overflow:ellipsis">${addr}</span>`
+      +`<span class="cs-early-t" style="color:#8a959c" title="${b.block_offset} blocks after launch">${eAfter(b)}</span>`
+      +`<span class="cs-early-b" style="color:#aab4ba">${ePct(b.bought_share_supply)}</span><span class="cs-early-n" style="color:${b.now_share_supply>0?'#eef1f3':'#5f6b72'}">${ePct(b.now_share_supply)}</span>`
+      +`<span class="cs-early-s" style="display:flex;flex-wrap:wrap;gap:6px;min-width:0">${chips.join('')}</span></div>`;
+  }).join('');
+  return head('first 20 after launch · % of supply'+stale)+card(sum+hd+rows);
+}
+
+"""
+rep("class Component extends DCLogic {", EARLY_JS + "class Component extends DCLogic {")
+rep('        <div class="cs-crit" style="margin-top:56px;',
+    '        <div data-early-box="1" style="display:{{earlyDisplay}};margin-top:56px;flex-direction:column;gap:18px">'
+    '<div ref="{{earlyRef}}" style="display:flex;flex-direction:column;gap:18px"></div></div>\n\n'
+    '        <div class="cs-crit" style="margin-top:56px;')
+rep("chartRef=React.createRef();", "chartRef=React.createRef(); earlyRef=React.createRef();")
+rep("  handleResult(r){this.m.result=r; this.loadChart(); this.bump();}",
+    "  handleResult(r){this.m.result=r; this.loadChart(); this.loadEarly(); this.bump();}\n"
+    "  loadEarly(){   // early buyers — отдельным запросом после вердикта; TOO ESTABLISHED — не запрашиваем\n"
+    "    const m=this.m, raw=(m.result&&m.result.raw)||{};\n"
+    "    if(raw.band==='TOO_ESTABLISHED'){m.early=null; return;}\n"
+    "    m.early={status:'loading'};\n"
+    "    fetch('/api/early?token='+encodeURIComponent(m.ca)).then(r=>r.ok?r.json():null).catch(()=>null)\n"
+    "      .then(d=>{if(this.m!==m) return;\n"
+    "        m.early=d&&d.available===false?(d.reason==='launch history too long'?{status:'ok',data:d}:null):{status:d?'ok':'none',data:d||{}};\n"
+    "        this.bump();});\n"
+    "  }\n"
+    "  paintEarly(){   // ошибка блока не ломает страницу и анимацию пауков\n"
+    "    const el=this.earlyRef.current, m=this.m; if(!el||!m.early) return;\n"
+    "    const key=[m.ca,m.early.status,(m.early.data||{}).updated_at,(m.early.data||{}).stale_at].join('|'); if(el.dataset.k===key) return;\n"
+    "    el.dataset.k=key;\n"
+    "    try{el.innerHTML=earlyHtml(m.early,m.ca,el.clientWidth);}\n"
+    "    catch(err){el.innerHTML=''; console.warn('early buyers render failed',err);}\n"
+    "  }")
+rep("componentDidUpdate(){this.paintChart();", "componentDidUpdate(){this.paintChart(); this.paintEarly();")
+rep("chartRef:this.chartRef,\n", "chartRef:this.chartRef, earlyRef:this.earlyRef,\n"
+    "      earlyDisplay:m.done&&m.result&&!m.error&&m.early?'flex':'none',\n")
+rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}"
+    "\n[data-est=\"1\"] [data-early-box]{display:none!important}"
+    "\n@media (max-width:640px){.cs-early-row{grid-template-columns:22px minmax(0,1fr) auto!important;padding-left:14px!important;padding-right:14px!important}"
+    ".cs-early-head{display:none!important}.cs-early-t{grid-column:3;grid-row:1;text-align:right}"
+    ".cs-early-b,.cs-early-n{grid-row:2;font-size:11.5px}.cs-early-b{grid-column:2}.cs-early-b::before{content:'bought ';color:#5f6b72}"
+    ".cs-early-n{grid-column:3;text-align:right}.cs-early-n::before{content:'now ';color:#5f6b72}"
+    ".cs-early-s{grid-column:2/-1;grid-row:3}}\n")
+
 enc = encode(t)
 TITLE_OLD = '<title>Bundled Page</title>'
 TITLE_NEW = '<title>CRAWLSCAN</title>\n  ' + ICON_LINKS.replace('\n', '\n  ')

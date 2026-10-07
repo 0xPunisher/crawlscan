@@ -95,6 +95,9 @@ HOLDER_TX_CAP = 30         # транзакций токен-аккаунта ч
 HISTORY_TX_CAP = 100       # транзакций кошелька до входа читаем для wallet_distinct_tokens
 HISTORY_CHUNK = 25         # ... кусками, с ранним выходом
 TX_BATCH = 50              # getTransaction в одном HTTP
+EARLY_TX_CHUNK = 60        # early buyers: самых старых транзакций кривой за раз
+EARLY_TX_MAX = 300         # ... не больше стольких на поиск первых покупателей
+EARLY_OUT_CAP = 20         # транзакций токен-аккаунта покупателя (самые новые) на разбор выходов
 TX_CACHE_MAX = 50_000      # транзакций в кэше процесса
 BUY_MATCH = 0.06           # допуск сверки: рынок отдал ≈ кошелёк получил (комиссии, налог)
 TXOPT = {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}
@@ -363,6 +366,9 @@ def _legs(tx, mint):
 # API адаптера
 # ---------------------------------------------------------------------------
 _LAUNCH, _HOLDERS = {}, {}
+_SUPPLY = {}       # token -> (ts, сапплай) из скана (supply_base): early buyers не спрашивает его ещё раз
+SCAN_TTL = 600     # секунд: сколько верим данным скана (= кэш результата скана в server.py)
+_LAUNCH_SIGS = {}  # token -> самые старые успешные подписи кривой (старые → новые), из get_launch: для early buyers
 _PDA_SEEN = set()      # PDA-владельцы и PDA-контрагенты, встреченные по ходу скана (пулы, хранилища)
 _LABEL = {}            # адрес -> подпись для вывода (пул PumpSwap, кривая, ...)
 _OWNER_PROG = {}       # PDA -> программа-владелец
@@ -402,6 +408,7 @@ def get_launch(token):
     if cut or not hist:
         raise RuntimeError("launch not found: bonding curve history too long")
     ok = [s for s in reversed(hist) if not s["err"]]
+    _LAUNCH_SIGS[token] = ok[:EARLY_TX_MAX]
     for s in ok[:3]:
         tx = get_transactions([s["signature"]])[s["signature"]]
         ixs = list(tx["transaction"]["message"]["instructions"]) if tx else []
@@ -481,6 +488,7 @@ def supply_base(token, launch):
     balances — владельцы-кошельки топ-20 (несколько аккаунтов одного владельца суммируются).
     holders_total — нижняя оценка: кошельки с ненулевым балансом в топ-20."""
     supply = token_supply(token)
+    _SUPPLY[token] = (time.time(), supply)
     rows = top_accounts(token)
     excluded = excluded_addresses(launch["curve"])
     bal = defaultdict(int)
@@ -733,3 +741,108 @@ def token_meta(token):
     name, i = _borsh_str(b, 1 + 32 + 32)
     sym, _ = _borsh_str(b, i)
     return {"name": name, "symbol": sym}
+
+
+# ---------------------------------------------------------------------------
+# early buyers: первые покупатели после запуска и что они сделали с токеном
+# ---------------------------------------------------------------------------
+def early_buyers(token, n=20, deadline=None):
+    """Первые n уникальных покупателей с кривой: {"launch": {"block", "ts", "deployer", "curve"}, "buyers": [{"wallet",
+    "block", "ts", "tx", "bought", "account"}], "txs_read"} или None (не pump.fun). Не меняется со временем.
+    Покупатель — не-PDA владелец, чей баланс вырос в транзакции с DEX-программой (дев-бай в create — тоже);
+    bought — сколько получил в первой покупке, account — токен-аккаунт входа. Транзакции кривой — самые старые
+    подписи, которые get_launch уже прочитал (EARLY_TX_MAX); нет в памяти — get_launch ещё раз."""
+    if token not in _LAUNCH or token not in _LAUNCH_SIGS:
+        if get_launch(token) is None:
+            return None
+    launch, sigs = _LAUNCH[token], _LAUNCH_SIGS[token]
+    buyers, seen, pos = [], set(), 0
+    while len(buyers) < n and pos < len(sigs) and not (deadline and time.time() > deadline):
+        part = sigs[pos:pos + EARLY_TX_CHUNK]
+        pos += len(part)
+        txs = get_transactions([x["signature"] for x in part])
+        for x in part:
+            tx = txs.get(x["signature"])
+            if not tx or not is_trade(tx):
+                continue
+            keys, d = tx_keys(tx), token_deltas(tx, token)
+            for b in tx["meta"].get("postTokenBalances") or []:
+                o = b.get("owner")
+                if b["mint"] != token or not o or o in seen or o == launch["curve"] or is_pda(o) or d.get(o, 0) <= 0:
+                    continue
+                seen.add(o)
+                buyers.append({"wallet": o, "block": tx["slot"], "ts": tx.get("blockTime") or x.get("blockTime"),
+                               "tx": x["signature"], "bought": d[o], "account": keys[b["accountIndex"]]})
+                if len(buyers) >= n:
+                    break
+            if len(buyers) >= n:
+                break
+    return {"launch": {"block": launch["block"], "ts": launch["ts"], "deployer": launch["deployer"],
+                       "curve": launch["curve"]}, "buyers": buyers, "txs_read": pos}
+
+
+def early_status(token, buyers, deadline=None, launch=None, out_cap=EARLY_OUT_CAP):
+    """Что покупатели сделали с токеном: {"supply", "wallets": {wallet: {"now", "sold", "moved": {куда: сколько},
+    "burned", "partial"}}}. now — баланс токен-аккаунта входа (закрыт — 0; один getMultipleAccounts).
+    Кто держит меньше купленного — разбор выходов по истории аккаунта (out_cap самых новых транзакций):
+    транзакция с DEX-программой — продажа, иначе перевод получателям (без получателя или на incinerator — сожжено).
+    partial — история длиннее out_cap, не успели до deadline или разобранные выходы не объясняют убыль баланса.
+    launch — из early_buyers (общий контракт сетей; здесь не нужен: аккаунты входа уже известны).
+    Из скана переиспользуются запуск и подписи кривой (_LAUNCH, _LAUNCH_SIGS), транзакции (_TX) и сапплай (_SUPPLY);
+    балансы и истории аккаунтов покупателей читаются заново: скан смотрит только топ-20, а продажи нужны свежие."""
+    hit = _SUPPLY.get(token)
+    supply = hit[1] if hit and time.time() - hit[0] < SCAN_TTL else token_supply(token)
+    accs = [b["account"] for b in buyers]
+    infos = rpc("getMultipleAccounts", [accs, {"encoding": "jsonParsed"}])["value"] if accs else []
+    out = {}
+    for b, info in zip(buyers, infos):
+        amt = (((info or {}).get("data") or {}).get("parsed") or {}).get("info", {}).get("tokenAmount", {}).get("amount")
+        out[b["wallet"]] = {"now": int(amt or 0), "sold": 0, "moved": {}, "burned": 0, "partial": False}
+    need = [b for b in buyers if out[b["wallet"]]["now"] < b["bought"]]
+    if need and deadline and time.time() > deadline:
+        for b in need:
+            out[b["wallet"]]["partial"] = True
+        return {"supply": supply, "wallets": out}
+    pages = rpc_batch([("getSignaturesForAddress", [b["account"], {"limit": SIG_PAGE}]) for b in need], chunk=20)
+    pick = {}
+    for b, page in zip(need, pages):
+        sigs = [x["signature"] for x in page or [] if not x["err"] and x["slot"] >= b["block"] and x["signature"] != b["tx"]]
+        pick[b["wallet"]] = sigs[:out_cap]
+        out[b["wallet"]]["partial"] = page is None or len(page) >= SIG_PAGE or len(sigs) > out_cap
+    if deadline and time.time() > deadline:
+        for b in need:
+            out[b["wallet"]]["partial"] = True
+        return {"supply": supply, "wallets": out}
+    txs = get_transactions([x for v in pick.values() for x in v])
+    for w, sigs in pick.items():
+        o = out[w]
+        for sig in sigs:
+            tx = txs.get(sig)
+            if not tx:
+                o["partial"] = True
+                continue
+            d = token_deltas(tx, token)
+            gone = -d.get(w, 0)
+            if gone <= 0:
+                continue
+            if is_trade(tx):
+                o["sold"] += gone
+                continue
+            legs = [(r, a) for f, r, a in _legs(tx, token) if f == w and r != w]
+            if not legs:   # не крупнейший отдавший в транзакции: получатель — крупнейший получивший
+                rec = sorted((v, r) for r, v in d.items() if v > 0 and r != w)
+                legs = [(rec[-1][1], rec[-1][0])] if rec else []
+            total = sum(a for _, a in legs)
+            if not total:  # получателя нет: сожжено
+                o["burned"] += gone
+            for r, a in legs if total else []:
+                part = gone * a // total
+                if r == BURN:
+                    o["burned"] += part
+                else:
+                    o["moved"][r] = o["moved"].get(r, 0) + part
+    for b in need:   # разобранные выходы не объясняют, куда делось купленное (> 1%) — разобрано не всё
+        o = out[b["wallet"]]
+        if b["bought"] - o["now"] - o["sold"] - o["burned"] - sum(o["moved"].values()) > b["bought"] * 0.01:
+            o["partial"] = True
+    return {"supply": supply, "wallets": out}

@@ -398,3 +398,62 @@ def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, res
     share = sum(p["share"] for p in parts)
     return {"drop": drop, "level_factor": 1.0 - drop, "share": share, "share_supply": share * ratio,
             "parts": parts, "wallets": [w for w, _, _ in holders if w in taken]}
+
+
+# ---------------------------------------------------------------------------
+# early buyers: статус первых покупателей и итог (данные — адаптер: early_buyers / early_status)
+# ---------------------------------------------------------------------------
+EARLY_EXIT_DUST = 0.01  # осталось меньше 1% купленного — вышел полностью
+EARLY_MOVED_MIN = 0.20  # статус moved — только если на другие кошельки ушло столько купленного или больше
+
+
+def early_status(bought, now, sold=0, moved=0, burned=0):
+    """holding_all | added | sold_part | sold_all | moved | burned.
+    Перевод меньше EARLY_MOVED_MIN купленного — мелкий: статус по остальной части (купленное минус переведённое),
+    сам перевод виден только долей (moved_share_supply). Вышел (осталось ≤ EARLY_EXIT_DUST) или вышел частично —
+    по тому, чего больше: продано, переведено, сожжено (поровну — продажа)."""
+    big_move = moved >= bought * EARLY_MOVED_MIN
+    base = bought if big_move else bought - moved
+    if now > base:
+        return "added"
+    if now == base:
+        return "holding_all"
+    if big_move and moved > sold and moved >= burned:
+        return "moved"
+    if burned > sold:
+        return "burned"
+    return "sold_all" if now <= base * EARLY_EXIT_DUST else "sold_part"
+
+
+def early_report(data, status, flags=None):
+    """{"buyers": [...], "summary": {...}} из early_buyers (data) и early_status (status) адаптера.
+    flags — {кошелёк: [флаги скана]} для кошельков, которые скан проверял (топ-20); остальным scan_flags = None.
+    Доли — от сапплая. dt_s — секунды от запуска, block_offset — блоков (Solana: слотов) от запуска.
+    summary.same_destination — адреса, куда перевели токены 2+ покупателя (признак одного владельца)."""
+    launch, supply = data["launch"], status["supply"] or 1
+    rows, dest = [], {}
+    for i, b in enumerate(data["buyers"], 1):
+        w = b["wallet"]
+        st = status["wallets"].get(w) or {"now": 0, "sold": 0, "moved": {}, "burned": 0, "partial": True}
+        moved = sum(st["moved"].values())
+        for to in st["moved"]:
+            dest.setdefault(to, []).append(w)
+        rows.append({
+            "rank": i, "wallet": w, "dev": w == launch.get("deployer"),
+            "dt_s": b["ts"] - launch["ts"] if b.get("ts") is not None and launch.get("ts") is not None else None,
+            "block_offset": b["block"] - launch["block"],
+            "bought_share_supply": b["bought"] / supply, "now_share_supply": st["now"] / supply,
+            "status": early_status(b["bought"], st["now"], st["sold"], moved, st["burned"]),
+            "sold_share_supply": st["sold"] / supply, "moved_share_supply": moved / supply,
+            "burned_share_supply": st["burned"] / supply,
+            "moved_to": sorted(st["moved"], key=lambda a: -st["moved"][a]),
+            "scan_flags": flags.get(w) if flags is not None and w in flags else None,
+            "partial": st["partial"]})
+    held = [r for r, b in zip(rows, data["buyers"]) if status["wallets"].get(r["wallet"], {}).get("now", 0)
+            > b["bought"] * EARLY_EXIT_DUST]
+    return {"buyers": rows, "summary": {
+        "buyers": len(rows), "exited": len(rows) - len(held), "holding": len(held),
+        "now_share_supply": sum(r["now_share_supply"] for r in rows),
+        "bought_share_supply": sum(r["bought_share_supply"] for r in rows),
+        "same_destination": [{"to": to, "wallets": ws} for to, ws in dest.items() if len(ws) >= 2],
+        "partial": any(r["partial"] for r in rows)}}

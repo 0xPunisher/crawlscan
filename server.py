@@ -6,6 +6,8 @@ Read-only: скан идёт в фоне, браузер опрашивает с
   GET  /api/result?job=ID                -> {"done", "result" | "error"}
   GET  /api/chart?token=CA               -> {"token", "chain", "pool", "dex", "timeframe", "candles", "price_usd"[, "stale_at" | "unavailable"]}
                                             свечи GeckoTerminal [[ts, o, h, l, c, v]] от старых к новым; в скан не входит
+  GET  /api/early?token=CA               -> {"token", "chain", "available", "buyers": [...], "summary": {...}[, "stale_at"]}
+                                            первые 20 покупателей и их статус сейчас (early.py); в скан не входит
   GET  /api/recent?limit=12              -> {"items": [{"token", "chain", "ticker", "name", "score", "band", "rug", "ts"}]}
                                             лента «Recently scanned»: последние уникальные токены, новые сверху
   GET  /api/config                       -> {"solana": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
@@ -39,6 +41,7 @@ import hmac, json, os, re, threading, time, uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+import early
 import engine
 import market
 import trade
@@ -123,6 +126,20 @@ def start_scan(token):
         BY_TOKEN[token] = jid
     threading.Thread(target=_run, args=(jid, token), daemon=True).start()
     return jid
+
+
+def scan_flags(token):
+    """{кошелёк: ["operator", "virgin"]} по последнему готовому скану токена (только топ-20, которых скан проверял);
+    скана нет — None. operator — кошелёк в операторе из 2+ кошельков."""
+    with _lock:
+        job = JOBS.get(BY_TOKEN.get(token))
+        res = job and job["done"] and job["result"]
+    if not res or not res.get("holders"):
+        return None
+    multi = {w for o in res.get("operators") or [] if len(o.get("wallets") or []) > 1 for w in o["wallets"]}
+    return {h["wallet"]: [f for f, on in (("operator", h["wallet"] in multi),
+                                          ("virgin", (h.get("signals") or {}).get("virgin"))) if on]
+            for h in res["holders"]}
 
 
 def get_chart(token):
@@ -364,6 +381,12 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/chart":
             try:
                 return self._send(200, get_chart((q.get("token") or [""])[0]))
+            except engine.ScanError as e:
+                return self._send(400, {"error": str(e)})
+        if u.path == "/api/early":
+            try:
+                token = (q.get("token") or [""])[0]
+                return self._send(200, early.get(token, scan_flags(engine.chain_of(token)[1])))
             except engine.ScanError as e:
                 return self._send(400, {"error": str(e)})
         if u.path == "/api/recent":
