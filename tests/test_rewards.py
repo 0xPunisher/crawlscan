@@ -459,8 +459,89 @@ class TestRewardsAPI(unittest.TestCase):
         self.assertEqual(self.req("/api/rewards/2026-01-01/verify")[0], 404)
         self.assertEqual(self.req("/api/rewards/nope")[0], 404)
 
+    def req_full(self, path):
+        try:
+            with urllib.request.urlopen(self.base + path, timeout=10) as resp:
+                return resp.status, json.loads(resp.read()), resp.headers.get("cache-control")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read()), e.headers.get("cache-control")
+
+    def walk(self, kind, limit, first_before=None):
+        """Все страницы по курсору next_before: (элементы подряд, размеры страниц, total)."""
+        items, sizes, before = [], [], first_before
+        for _ in range(100):
+            q = f"/api/rewards/history?kind={kind}&limit={limit}" + (f"&before={before}" if before is not None else "")
+            code, page, _ = self.req_full(q)
+            self.assertEqual((code, page["kind"]), (200, kind))
+            items += page["items"]; sizes.append(len(page["items"]))
+            before = page["next_before"]
+            if before is None:
+                return items, sizes, page["total"]
+        self.fail("pagination does not end")
+
+    def test_history_burns_pages(self):
+        store = server.rewards_store()
+        base = DAY_END + 3600
+        burns = [{"tx": f"0x{i:064x}", "log_index": 0, "frm": DEV, "to": rw.BURN_ADDRESS, "amount": 10 ** 18 * (i + 1),
+                  "block": 5000 + i} for i in range(23)]
+        ts_of = {b["block"]: base + b["block"] * 100 for b in burns}
+        ts_of[5012] = ts_of[5013]          # два сжигания в одну секунду — ровно на границе страниц
+        ts_of[5001] = ts_of[5002]
+        self.assertEqual(store.save_burns(TOKEN, burns, ts_of), 23)
+        items, sizes, total = self.walk("burns", 10)
+        self.assertEqual(total, 24)                                    # + сжигание из setUp
+        self.assertEqual(len(items), 24)
+        self.assertEqual(len({(b["tx"], b["log_index"]) for b in items}), 24)       # без повторов и пропусков
+        times = [b["time"] for b in items]
+        self.assertEqual(times, sorted(times, reverse=True))
+        self.assertEqual(sizes, [11, 11, 2])                           # пара с одним временем не разорвана
+        self.assertEqual(items[0]["tx"], f"0x{22:064x}")
+        self.assertEqual(items[0]["amount_tokens"], 23.0)
+        # курсор строго «раньше»: страница с before = времени сжигания его не включает
+        code, page, cache = self.req_full(f"/api/rewards/history?kind=burns&limit=3&before={ts_of[5010]}")
+        self.assertEqual([b["block"] for b in page["items"]], [5009, 5008, 5007])
+        self.assertEqual((page["next_before"], cache), (ts_of[5007], "no-store"))
+
+    def test_history_draws_pages(self):
+        store = server.rewards_store()
+        row = store.get_draw(DAY)
+        days = [f"2026-09-{d:02d}" for d in range(1, 13)]
+        for d in days:
+            rec = {k: row[k] for k in row if k in ("token", "status", "start_block", "end_block", "list_hash", "seed_time",
+                   "seed_block", "blockhash", "r", "winner", "winner_weight", "total_weight", "participants",
+                   "decimals", "dev_wallets", "created_at")}
+            self.assertTrue(store.save_draw(dict(rec, day=d), {A: 1}))
+        items, sizes, total = self.walk("draws", 5)
+        self.assertEqual(total, 13)
+        self.assertEqual([d["day"] for d in items], [DAY] + days[::-1])
+        self.assertEqual(sizes, [5, 5, 3])
+        self.assertEqual(items[0]["time"], rw.draw_at(DAY))
+        self.assertIn("payout_status", items[0])
+        # before = ровно время розыгрыша 2026-09-10 — он не входит; ISO тоже принимается
+        for b in (rw.draw_at("2026-09-10"), "2026-09-10T22:00:00Z", "2026-09-10T22:00:00"):
+            code, page, _ = self.req_full(f"/api/rewards/history?kind=draws&limit=2&before={b}")
+            self.assertEqual((code, [d["day"] for d in page["items"]]), (200, ["2026-09-09", "2026-09-08"]))
+        code, page, _ = self.req_full(f"/api/rewards/history?kind=draws&before={rw.draw_at('2026-09-01')}")
+        self.assertEqual((page["items"], page["next_before"]), ([], None))
+        self.assertEqual(self.req("/api/rewards/status")[1]["draws_count"], 13)
+
+    def test_history_page_params(self):
+        code, page, _ = self.req_full("/api/rewards/history?kind=draws")
+        self.assertEqual((code, page["limit"], page["before"]), (200, 10, None))
+        self.assertEqual(self.req_full("/api/rewards/history?kind=burns&limit=500")[1]["limit"], 50)
+        self.assertEqual(self.req_full("/api/rewards/history?kind=burns&limit=0")[1]["limit"], 1)
+        for bad in ("kind=all", "kind=burns&limit=x", "kind=burns&before=yesterday"):
+            self.assertEqual(self.req(f"/api/rewards/history?{bad}")[0], 400, bad)
+        code, legacy = self.req("/api/rewards/history?limit=5")                 # без kind — прежний ответ
+        self.assertEqual((code, sorted(legacy)), (200, ["burns", "draws"]))
+        with mock.patch.object(ch, "rpc", side_effect=AssertionError("no network")):
+            self.assertEqual(self.req("/api/rewards/history?kind=burns")[0], 200)
+            self.assertEqual(self.req("/api/rewards/history?kind=draws")[0], 200)
+
     def test_disabled(self):
         with mock.patch.dict(os.environ, {"REWARDS_ENABLED": "false"}):
+            self.assertEqual(self.req("/api/rewards/history?kind=burns")[0], 404)
             self.assertEqual(self.req("/api/rewards/status"), (200, {"enabled": False}))
             self.assertEqual(self.req("/api/rewards/history")[0], 404)
             self.assertIsNone(server.start_rewards_scheduler())

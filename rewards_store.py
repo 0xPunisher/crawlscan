@@ -93,6 +93,18 @@ class RewardsStore:
         with self._lock:
             return [_row(r) for r in self.db.execute("SELECT * FROM rw_draws ORDER BY day DESC LIMIT ?", (int(limit),))]
 
+    def draws_before(self, max_day, limit):
+        """Страница истории розыгрышей: дни <= max_day (None — без границы), новые первыми, limit + 1 строка
+        (лишняя — признак следующей страницы)."""
+        with self._lock:
+            return [_row(r) for r in self.db.execute(
+                "SELECT * FROM rw_draws WHERE (? IS NULL OR day <= ?) ORDER BY day DESC LIMIT ?",
+                (max_day, max_day, int(limit) + 1))]
+
+    def draws_count(self):
+        with self._lock:
+            return self.db.execute("SELECT COUNT(*) FROM rw_draws").fetchone()[0]
+
     def unpaid_draws(self):
         with self._lock:
             return [_row(r) for r in self.db.execute(
@@ -130,6 +142,21 @@ class RewardsStore:
         q = "SELECT * FROM rw_burns WHERE token=? ORDER BY block DESC, log_index DESC" + (" LIMIT ?" if limit else "")
         with self._lock:
             return [_row(r) for r in self.db.execute(q, (token,) + ((int(limit),) if limit else ()))]
+
+    def burns_before(self, token, before, limit):
+        """Страница истории сжиганий: время < before (None — без границы), новые первыми. Сжигания с одним
+        временем страницей не разрываются (курсор — время): страница добирает все строки с временем последней,
+        поэтому может быть длиннее limit. -> (строки, есть ли ещё)."""
+        q = ("SELECT * FROM rw_burns WHERE token=? AND (? IS NULL OR ts < ?) {} "
+             "ORDER BY ts DESC, block DESC, log_index DESC")
+        with self._lock:
+            rows = [_row(r) for r in self.db.execute(q.format("") + " LIMIT ?", (token, before, before, int(limit)))]
+            if len(rows) < limit:
+                return rows, False
+            last = rows[-1]["ts"]
+            tied = [_row(r) for r in self.db.execute(q.format("AND ts=?"), (token, before, before, last))]
+            more = self.db.execute("SELECT 1 FROM rw_burns WHERE token=? AND ts<? LIMIT 1", (token, last)).fetchone()
+        return [r for r in rows if r["ts"] != last] + tied, bool(more)
 
     def burned_total(self, token):
         """(сумма сожжённого разработчиком, число сжиганий)."""
