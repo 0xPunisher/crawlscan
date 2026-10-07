@@ -307,18 +307,20 @@ def get_launch(token):
 
 def token_facts(token, launch):
     """Факты о токене для движка (общий контракт сетей): {"supply", "transfers", "excluded",
-    "market", "reserve", "base"}. base = None: балансы и оборот движок считает из переводов
+    "market", "reserve", "reserve_ok", "base"}. base = None: балансы и оборот движок считает из переводов
     (detect.supply_base) — здесь есть полная история переводов с запуска.
     reserve — токены в ликвидности: баланс кривой (до миграции) + V4 pool manager (после;
     синглтон держит только пулы с этим токеном). Локер не ликвидность — не входит.
     Виртуальная добавка кривой Pons только на стороне котировки (phantomQuote()); токенная
-    сторона цены — tokenReserve() == реальный баланс кривой, поэтому берём реальный баланс."""
+    сторона цены — tokenReserve() == реальный баланс кривой, поэтому берём реальный баланс.
+    reserve_ok = False, если ни кривая, ни pool manager не держат токен (0): резерв не измерен, а не «ликвидности нет»."""
     transfers = get_token_transfers(token, launch["block"])
     supply = token_supply(token)
     pools = {launch["curve"].lower(), V4_POOL_MGR}
     reserve = sum(t["amount"] * ((t["to"] in pools) - (t["frm"] in pools)) for t in transfers)
     return {"supply": supply, "transfers": transfers, "excluded": excluded_addresses(launch["curve"]),
-            "market": market_addresses(launch["curve"]), "reserve": max(0, reserve), "base": None}
+            "market": market_addresses(launch["curve"]), "reserve": max(0, reserve), "reserve_ok": reserve > 0,
+            "base": None}
 
 
 def get_token_transfers(token, from_block, to_block=None, frm=None, to=None):

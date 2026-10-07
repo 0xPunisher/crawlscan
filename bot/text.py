@@ -2,6 +2,7 @@
 Распознавание адреса — та же логика, что у сайта (engine.chain_of): 0x + 40 hex → Robinhood,
 base58 32 байта (32–44 символа) → Solana."""
 import html, re
+from datetime import datetime, timezone
 
 WEBSITE = "https://crawlscan.fun"
 OFFICIAL_CA = "0x19dCb63C4d2F29A6f077F094a4f858fC790145e1"
@@ -12,6 +13,12 @@ B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 CHAIN_NAME = {"robinhood": "Robinhood Chain", "solana": "Solana"}
 BAND_ICON = {"CLEAN": "🟢", "OK": "🟡", "RISKY": "🟠", "DANGER": "🔴"}
 TOO_EARLY = "TOO_EARLY_OR_LATE"
+TOO_ESTABLISHED = "TOO_ESTABLISHED"
+ESTABLISHED_HEADLINE = "This token is too established for CrawlScan."
+ESTABLISHED_TEXT = ("CrawlScan is built for fresh memecoins. On large, older tokens the top holders are mostly "
+                    "exchanges and big liquidity pools: tokens reach exchange wallets by transfer, not by buying, "
+                    "and liquidity is spread across many pools, so holder patterns don't mean what they mean "
+                    "on a fresh launch.")
 
 
 def _b58_len(s):
@@ -74,7 +81,8 @@ START_BUTTONS = {"inline_keyboard": [
 HELP = (
     "<b>How to read a verdict</b>\n\n"
     "<b>Score 0–100</b>: 100 = clean. The lower it is, the more the top holders look like a few people.\n"
-    "<b>Verdict</b>: 🟢 CLEAN · 🟡 OK · 🟠 RISKY · 🔴 DANGER. ⏳ TOO EARLY OR LATE: too few holders to judge.\n"
+    "<b>Verdict</b>: 🟢 CLEAN · 🟡 OK · 🟠 RISKY · 🔴 DANGER. ⏳ TOO EARLY OR LATE: too few holders to judge. "
+    "🏛 TOO ESTABLISHED: a large, older token, not scanned.\n"
     "<b>Operators</b>: real people behind the top holders. Wallets linked by shared buys or transfers "
     "count as one operator.\n"
     "<b>Dump impact</b>: how far the price could drop if the biggest operator sold everything.\n"
@@ -83,7 +91,8 @@ HELP = (
     "<b>Transfer supply</b>: share of the float received by transfer instead of bought.\n"
     "<b>Snipers</b>: wallets that bought right after launch and still hold.\n"
     "<b>Why</b>: rules that forced the verdict down.\n\n"
-    "Send a token address to scan it. In groups: /scan &lt;address&gt;."
+    "Send a token address to scan it. In groups: /scan &lt;address&gt;.\n"
+    "/rewards: next holder draw, last winner and token burns."
 )
 
 ASK_ADDRESS = "Send me a token address from Robinhood Chain or Solana"
@@ -107,8 +116,12 @@ def wait(seconds):
     return f"⏳ please wait {seconds} s"
 
 
-def report_button(addr):
-    return {"inline_keyboard": [[{"text": "Full report", "url": f"{WEBSITE}/?ca={addr}"}]]}
+def report_button(addr, trade_url=None):
+    """[Full report] и, если есть ссылка, [Trade on Axiom] в одном ряду."""
+    row = [{"text": "Full report", "url": f"{WEBSITE}/?ca={addr}"}]
+    if trade_url:
+        row.append({"text": "Trade on Axiom", "url": trade_url})
+    return {"inline_keyboard": [row]}
 
 
 def rejected(addr, error):
@@ -165,6 +178,10 @@ def verdict(res):
     lines = [title(res), ""]
     holders = len(res.get("holders") or [])
     ops = res.get("operators") or []
+    if res.get("band") == TOO_ESTABLISHED:     # полный скан не запускался: без скора
+        lines.append(f"🏛 <b>{e(res.get('headline') or ESTABLISHED_HEADLINE)}</b>")
+        lines.append(e(res.get("reason") or ESTABLISHED_TEXT))
+        return "\n".join(lines)
     if res.get("band") == TOO_EARLY:
         lines.append("⏳ <b>Too early or too late</b>")
         lines.append(f"Only {res.get('holders_total', 0)} holders, too few to judge.")
@@ -177,7 +194,10 @@ def verdict(res):
     if ops and "impact" in m:
         n = len(ops[0].get("wallets") or [])
         who = f"Biggest operator ({n} wallets)" if n > 1 else "Biggest operator"
-        lines.append(f"{who} could move price {impact_phrase(m['impact'])} if sold")
+        if m["impact"] is None:                   # резерв не измерен надёжно: падение не считаем
+            lines.append(f"{who} holds {_pct(m.get('operator') or 0, 1)}% of float · liquidity not measured")
+        else:
+            lines.append(f"{who} could move price {impact_phrase(m['impact'])} if sold")
     if res.get("rug"):
         lines += [""] + rug_lines(res["rug"])
 
@@ -196,4 +216,92 @@ def verdict(res):
     if gates:
         lines += ["", "<b>Why:</b>"]
         lines += [f"• {e(g[len('soft:'):].strip() if g.startswith('soft:') else g)}" for g in gates]
+    return "\n".join(lines)
+
+
+# ---------- /rewards ----------
+EXPLORER = "https://robinhoodchain.blockscout.com"
+REWARDS_BUTTON = {"inline_keyboard": [[{"text": "Rewards on website", "url": WEBSITE}]]}
+REWARDS_OFF = "🎁 Holder rewards are not running right now. Check the website for news."
+
+
+def _parse_iso(s):
+    try:
+        return datetime.fromisoformat(s).timestamp() if s else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _utc(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def until(ts, now):
+    """Время до события: "in 5h 12m", "in 7m", "in <1m"; прошло — "now"."""
+    s = int(ts - now)
+    if s <= 0:
+        return "now"
+    if s < 60:
+        return "in <1m"
+    h, m = s // 3600, s // 60 % 60
+    return f"in {h}h {m}m" if h else f"in {m}m"
+
+
+def tokens(x):
+    """Сумма токенов для показа: 1,500,001 · 12.5 · 0.0042."""
+    if x is None:
+        return "—"
+    return f"{x:,.0f}" if x >= 100 else f"{x:,.2f}".rstrip("0").rstrip(".") if x >= 1 else f"{x:.4g}"
+
+
+def tx_link(tx, label="tx"):
+    return f'<a href="{EXPLORER}/tx/{e(tx)}">{e(label)}</a>'
+
+
+def _when(label, iso, now):
+    ts = _parse_iso(iso)
+    if ts is None:
+        return None
+    return f"{label}: <b>{datetime.fromtimestamp(ts, timezone.utc).strftime('%H:%M')} UTC</b> · {until(ts, now)}"
+
+
+def rewards(st):
+    """Статус /api/rewards/status → HTML-текст /rewards. Выключено — REWARDS_OFF."""
+    if not isinstance(st, dict) or not st.get("enabled"):
+        return REWARDS_OFF
+    now = _parse_iso(st.get("now")) or datetime.now(timezone.utc).timestamp()
+    lines = ["🎁 <b>$CrawlScan holder rewards</b>", ""]
+    lines += [x for x in (_when("🎲 Next draw", st.get("next_draw"), now),
+                          _when("🔥 Next burn", st.get("next_burn"), now)) if x]
+
+    d = st.get("last_draw")
+    lines.append("")
+    if not d:
+        lines.append("No draws yet. The first winner is picked at the next draw.")
+    elif not d.get("winner"):
+        lines.append(f"<b>Draw of {e(d.get('day', ''))}</b>: no eligible holders, the prize carries over.")
+    else:
+        chance = d.get("chance")
+        pct = "—" if chance is None else f"{chance * 100:.2f}%" if chance >= 0.0001 else "<0.01%"
+        lines.append(f"<b>Last winner</b> · draw of {e(d.get('day', ''))}")
+        lines.append(f"<code>{e(short(d['winner']))}</code> · chance {pct}")
+        if d.get("payout_tx"):
+            amt = f"{tokens(d.get('payout_tokens'))} $CrawlScan · " if d.get("payout_tokens") is not None else ""
+            lines.append(f"✅ Paid: {amt}{tx_link(d['payout_tx'])}")
+        else:
+            lines.append("⏳ Payout pending")
+
+    tb, dev = st.get("total_burned"), st.get("burned_by_dev") or {}
+    lines.append("")
+    if tb and tb.get("amount"):
+        pct = f" ({tb['amount'] / tb['minted'] * 100:.2f}% of supply)" if tb.get("minted") else ""
+        lines.append(f"🔥 <b>Burned</b>: {tokens(tb.get('amount_tokens'))} $CrawlScan{pct}")
+    elif dev.get("amount"):
+        lines.append(f"🔥 <b>Burned</b>: {tokens(dev.get('amount_tokens'))} $CrawlScan")
+    else:
+        lines.append("🔥 <b>Burned</b>: nothing yet")
+    lb = st.get("last_burn")
+    if lb:
+        when = f" · {_utc(lb['time'])}" if lb.get("time") else ""
+        lines.append(f"Last burn: {tokens(lb.get('amount_tokens'))} $CrawlScan{when} · {tx_link(lb['tx'])}")
     return "\n".join(lines)

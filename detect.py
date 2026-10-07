@@ -38,6 +38,7 @@ WEIGHTS = {                # веса частей скора, сумма 100
 # (в README не заданы), калибруются на реальных токенах.
 SCALE = {
     "operator":      (0.10, 0.60),  # dump_impact: 35 баллов при ≤ 10% падения цены, 0 при ≥ 60%
+    "operator_share": (0.05, 0.25), # резерв не измерен (reserve_ok=False): по взвешенной доле оборота, как в v1
     "virgin":        (0.10, 0.80),
     "transfer":      (0.01, 0.10),
     "sniper":        (0.01, 0.15),
@@ -52,6 +53,15 @@ SOFT_GATE_SCORE = 59       # мягкое стоп-правило: стая ил
 SOFT_GATE_WALLETS = 3      #   → band не лучше RISKY (score = min(score, 59))
 BANDS = ((80, "CLEAN"), (60, "OK"), (40, "RISKY"))  # иначе DANGER
 TOO_EARLY = "TOO_EARLY_OR_LATE"
+
+# --- Too established: старый и большой токен — полный скан не запускаем (README «Too established») ---
+TOO_ESTABLISHED = "TOO_ESTABLISHED"
+ESTABLISHED = {"min_age_days": 30.0, "min_liquidity_usd": 750_000.0, "min_mcap_usd": 10_000_000.0}
+ESTABLISHED_HEADLINE = "This token is too established for CrawlScan."
+ESTABLISHED_TEXT = ("CrawlScan is built for fresh memecoins. On large, older tokens the top holders are mostly "
+                    "exchanges and big liquidity pools: tokens reach exchange wallets by transfer, not by buying, "
+                    "and liquidity is spread across many pools, so holder patterns don't mean what they mean "
+                    "on a fresh launch.")
 
 # --- Probably rug (README «Probably rug») ---
 RUG_MIN_DROP = 0.40        # проекция показывается, если продажа подозрительного запаса уронит цену на ≥ 40%
@@ -257,20 +267,32 @@ def dump_impact(q, reserve):
     return 1.0 - (reserve / (reserve + q)) ** 2
 
 
-def _part(name, x):
-    good, bad = SCALE[name]
+def _part(name, x, scale=None):
+    good, bad = SCALE[scale or name]
     k = 1.0 if x <= good else 0.0 if x >= bad else (bad - x) / (bad - good)
     return round(WEIGHTS[name] * k, 1)
 
 
+def too_established(market, limits=ESTABLISHED):
+    """Старый и большой токен по данным GeckoTerminal: возраст ≥ min_age_days И ликвидность всех пулов
+    ≥ min_liquidity_usd И капитализация ≥ min_mcap_usd. Нет любого из чисел — False (обычный скан)."""
+    age, liq, mcap = (market or {}).get("age_days"), (market or {}).get("liquidity_usd"), (market or {}).get("mcap_usd")
+    if age is None or liq is None or mcap is None:
+        return False
+    return age >= limits["min_age_days"] and liq >= limits["min_liquidity_usd"] and mcap >= limits["min_mcap_usd"]
+
+
 def _impact_phrase(impact, ops):
-    """Фраза о цене для headline: < 1% → "<1%"; без операторов из 2+ кошельков и < 1% — не показываем."""
+    """Фраза о цене для headline: < 1% → "<1%"; без операторов из 2+ кошельков и < 1% — не показываем;
+    резерв не измерен (None) — "liquidity not measured"."""
+    if impact is None:
+        return ", liquidity not measured"
     if impact < 0.01:
         return ", could move price <1% if sold" if any(len(o["wallets"]) > 1 for o in ops) else ""
     return f", could move price −{impact * 100:.0f}% if sold"
 
 
-def score(holders, signals, ops, base, reserve, liquidity_usd=None):
+def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True):
     """Скор 0–100 (100 = чисто): {"score", "band", "parts", "gates", "metrics", "headline"}.
     reserve — резерв токенов ликвидности (сырые единицы): баланс пула после миграции или кривой до.
     Часть "operator" и её стоп-правило — от dump_impact крупнейшего оператора (q = взвешенная доля
@@ -278,12 +300,14 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None):
     Остальные метрики — доли оборота. parts — баллы по пяти частям README.
     liquidity_usd — ликвидность из шапки токена; < LIQ_MIN_USD → мягкое правило (band не лучше RISKY),
     None (неизвестна) — правило не применяется.
+    reserve_ok=False — резерв не удалось определить надёжно: impact = None, стоп-правило по impact не
+    применяется, часть "operator" — по взвешенной доле оборота (SCALE["operator_share"]).
     gates — сработавшие стоп-правила: жёсткие (→ DANGER) и мягкие с префиксом "soft:"
     (стая или доказанный оператор из ≥ 3 кошельков → score не выше 59, band не лучше RISKY).
     Меньше MIN_HOLDERS холдеров (base["holders_total"]) → score None, band TOO_EARLY_OR_LATE."""
     n = len(holders)
     big = ops[0] if ops else {"share": 0.0, "share_supply": 0.0, "weighted": 0.0, "wallets": []}
-    impact = dump_impact(big["weighted"] * base["circulating"], reserve)
+    impact = dump_impact(big["weighted"] * base["circulating"], reserve) if reserve_ok else None
     headline = (f"{n} wallets → {len(ops)} operators, biggest holds "
                 f"{big['share'] * 100:.1f}% of float ({big['share_supply'] * 100:.1f}% of supply)"
                 + _impact_phrase(impact, ops))
@@ -301,9 +325,12 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None):
         "sniper": sum(share[a] for a in non_dev if signals[a]["sniper"]),
         "concentration": sum(share.values()),
     }
-    parts = {k: _part(k, m["impact"] if k == "operator" else m[k]) for k in WEIGHTS}
+    parts = {k: _part(k, m[k]) for k in WEIGHTS if k != "operator"}
+    parts["operator"] = (_part("operator", impact) if impact is not None
+                         else _part("operator", m["operator"], "operator_share"))
+    parts = {k: parts[k] for k in WEIGHTS}
     gates = []
-    if m["impact"] >= GATE_IMPACT:
+    if impact is not None and impact >= GATE_IMPACT:
         gates.append(f"biggest operator could move price −{m['impact'] * 100:.0f}% if sold "
                      f"(≥ {GATE_IMPACT * 100:.0f}%; {m['operator'] * 100:.1f}% of float)")
     if len(non_dev) >= GATE_VIRGIN_MIN and m["virgin"] >= GATE_VIRGIN:
@@ -325,7 +352,7 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None):
     return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline}
 
 
-def rug_projection(holders, signals, ops, base, reserve, band, snipers=True):
+def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, reserve_ok=True):
     """Проекция «probably rug»: куда упадёт цена, если весь подозрительный запас продадут в ликвидность.
     Только при band DANGER (скор и вердикт не меняет); иначе, без запаса или при падении
     < RUG_MIN_DROP — None.
@@ -337,8 +364,9 @@ def rug_projection(holders, signals, ops, base, reserve, band, snipers=True):
     Кошелёк относится к первой подходящей причине в порядке RUG_ORDER, поэтому доли parts
     складываются в share. drop = dump_impact(q, reserve), q — все токены запаса без весов.
     {"drop", "level_factor" (= 1 − drop), "share", "share_supply", "parts": [{"kind", "wallets",
-    "share", "share_supply"}], "wallets"}; доли — от оборота, share_supply — от сапплая."""
-    if band != "DANGER":
+    "share", "share_supply"}], "wallets"}; доли — от оборота, share_supply — от сапплая.
+    reserve_ok=False (резерв не измерен надёжно) — None: падение без ликвидности не считаем."""
+    if band != "DANGER" or not reserve_ok:
         return None
     linked = {w for o in ops if len(o["wallets"]) > 1 for w in o["wallets"]}
     test = {

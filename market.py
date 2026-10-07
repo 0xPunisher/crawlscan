@@ -1,6 +1,7 @@
 """GeckoTerminal: шапка токена (цена, капа, ликвидность, объём) и свечи для чарта. Read-only, ошибки не фатальны.
 На HTTP 429 повторяем с нарастающей паузой. Шапка — один запрос /tokens/{token}:
 бесплатный тариф GT быстро отвечает 429, а в этом ответе уже есть всё для шапки.
+Тот же ответ (с include=top_pools) даёт возраст пулов и FDV для проверки «too established» до скана.
 Чарт (fetch_chart) в скан не входит: его отдаёт отдельный /api/chart."""
 import json, time, urllib.request, urllib.error
 from datetime import datetime
@@ -37,20 +38,27 @@ def _gt(path, budget=GT_BUDGET):
         time.sleep(min(0.5, max(0.0, end - time.time() - 0.2)))
 
 
-def fetch_market(token, network="robinhood"):
-    """{"name", "ticker", "price_usd", "mcap_usd", "liquidity_usd", "vol24h_usd"} или {} при ошибке.
-    mcap — market_cap_usd, если GT его знает, иначе fdv. network — сеть GT: "robinhood" | "solana"
-    (адреса Solana регистрозависимы, их не приводим к нижнему регистру)."""
+def fetch_market(token, network="robinhood", now=None):
+    """{"name", "ticker", "price_usd", "mcap_usd", "fdv_usd", "liquidity_usd", "vol24h_usd", "age_days"}
+    или {} при ошибке. Один запрос /tokens/{token}?include=top_pools.
+    mcap — market_cap_usd, если GT его знает, иначе fdv; liquidity — сумма пулов (total_reserve_in_usd);
+    age_days — от создания самого раннего из топ-пулов (None, если GT не дал дат).
+    network — сеть GT: "robinhood" | "solana" (адреса Solana регистрозависимы, их не приводим к нижнему регистру)."""
     tok = token.lower() if network == "robinhood" else token
     try:
-        a = _gt(f"/{network}/tokens/{tok}").get("data", {}).get("attributes", {})
+        d = _gt(f"/{network}/tokens/{tok}?include=top_pools")
     except Exception:
         return {}
+    a = (d.get("data") or {}).get("attributes") or {}
     f = lambda v: float(v) if v not in (None, "") else None
+    born = [_ts((p.get("attributes") or {}).get("pool_created_at")) for p in d.get("included") or []
+            if p.get("type") == "pool"]
+    born = [b for b in born if b]
     return {"name": a.get("name"), "ticker": a.get("symbol"), "price_usd": f(a.get("price_usd")),
-            "mcap_usd": f(a.get("market_cap_usd")) or f(a.get("fdv_usd")),
+            "mcap_usd": f(a.get("market_cap_usd")) or f(a.get("fdv_usd")), "fdv_usd": f(a.get("fdv_usd")),
             "liquidity_usd": f(a.get("total_reserve_in_usd")),
-            "vol24h_usd": f((a.get("volume_usd") or {}).get("h24"))}
+            "vol24h_usd": f((a.get("volume_usd") or {}).get("h24")),
+            "age_days": round(((now or time.time()) - min(born)) / 86400, 1) if born else None}
 
 
 def _ts(iso):

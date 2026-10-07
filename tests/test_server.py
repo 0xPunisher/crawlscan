@@ -1,5 +1,5 @@
 """Тесты HTTP-сервера: настоящий ThreadingHTTPServer на свободном порту, движок на подставном адаптере."""
-import json, os, threading, time, unittest, urllib.error, urllib.request
+import json, os, tempfile, threading, time, unittest, urllib.error, urllib.request
 from unittest import mock
 from http.server import ThreadingHTTPServer
 
@@ -26,9 +26,19 @@ class TestServer(unittest.TestCase):
             server.JOBS.clear(); server.BY_TOKEN.clear()
         self.fakes = fakes.patched()
         self.fakes.__enter__()
+        # лента пишет в DRAW_DB_PATH: в тестах — временный файл, не ./data/draw.db
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"DRAW_DB_PATH": os.path.join(self.tmp.name, "t.db")})
+        self.env.__enter__()
 
     def tearDown(self):
+        with server._stores_lock:
+            for st in server._recent_stores.values():
+                st.close()
+            server._recent_stores.clear()
+        self.env.__exit__(None, None, None)
         self.fakes.__exit__(None, None, None)
+        self.tmp.cleanup()
 
     def request(self, path, body=None, raw=None):
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
@@ -59,7 +69,19 @@ class TestServer(unittest.TestCase):
         for value, on in (("true", True), ("false", False)):
             with mock.patch.dict(os.environ, {"SOLANA_ENABLED": value}):
                 code, d, _ = self.request("/api/config")
-            self.assertEqual((code, d), (200, {"solana": on}))
+            self.assertEqual((code, d["solana"]), (200, on))
+
+    def test_config_trade_templates(self):
+        import trade
+        with mock.patch.dict(os.environ, {"TRADE_URL_ROBINHOOD": "", "TRADE_URL_SOLANA": ""}):
+            _, d, _ = self.request("/api/config")
+        self.assertEqual(d["trade"], trade.DEFAULTS)
+        env = {"TRADE_URL_ROBINHOOD": "https://x.example/{address}?c=rh", "TRADE_URL_SOLANA": "javascript:alert(1)//{address}"}
+        with mock.patch.dict(os.environ, env):
+            _, d, _ = self.request("/api/config")
+        self.assertEqual(d["trade"], {"robinhood": "https://x.example/{address}?c=rh", "solana": trade.DEFAULTS["solana"]})
+        self.assertEqual(trade.url("robinhood", "0xab", d["trade"]), "https://x.example/0xab?c=rh")
+        self.assertIsNone(trade.url("base", "0xab"))
 
     def test_solana_coming_soon(self):
         sol_ca = "fjKUqPWK9m331Y5TZZNFismtqoP2MGWAMHEkB62pump"

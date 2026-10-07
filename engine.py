@@ -14,7 +14,10 @@ import market
 
 BUDGET = 25.0          # секунд на весь скан (README)
 DETECT_RESERVE = 1.0   # секунд оставляем на detect и события после чтения кошельков
-MARKET_WAIT = 3.0      # шапку GeckoTerminal ждём не дольше стольких секунд от старта скана
+MARKET_WAIT = 3.0      # шапку GeckoTerminal ждём до первого RPC не дольше стольких секунд от старта скана
+RESERVE_MIN_SEEN = 0.25  # резерв в $ < 25% токенной стороны ликвидности GT (liquidity / 2) — пулы не найдены
+ESTABLISHED_ENV = {"min_age_days": "ESTABLISHED_MIN_AGE_DAYS", "min_liquidity_usd": "ESTABLISHED_MIN_LIQUIDITY_USD",
+                   "min_mcap_usd": "ESTABLISHED_MIN_MCAP_USD"}
 WORKERS = 12           # потоков чтения истории кошельков; лимитер RPS в адаптере общий
 SPIDERS = 6            # пауков; кошельки раздаются по кругу
 HIST_CAP = d.SHORT_HISTORY_MAX + 1  # монеты до входа считаем до 4: важно 0 / 1..3 / больше
@@ -48,6 +51,48 @@ def chain_of(token):
             raise ScanError("Solana support is coming soon")
         return "solana", token
     raise ScanError("not a token address")
+
+
+def established_limits():
+    """Пороги «too established» из env (ESTABLISHED_*), неверное или пустое значение — дефолт detect.ESTABLISHED."""
+    out = {}
+    for k, name in ESTABLISHED_ENV.items():
+        try:
+            v = float(os.environ.get(name) or "nan")
+            out[k] = v if v == v and v >= 0 else d.ESTABLISHED[k]
+        except ValueError:
+            out[k] = d.ESTABLISHED[k]
+    return out
+
+
+def reserve_seen(reserve, supply, gt):
+    """Резерв согласуется с ликвидностью GT: R в $ (R / supply × FDV) не меньше RESERVE_MIN_SEEN токенной
+    стороны (liquidity / 2). Меньше — пулы найдены не все (другой DEX, вне топ-20): резерв ненадёжен.
+    Нет чисел GT — проверить нечем, True."""
+    fdv, liq = gt.get("fdv_usd"), gt.get("liquidity_usd")
+    if not reserve or not supply or not fdv or not liq:
+        return True
+    return reserve / supply * fdv >= liq / 2 * RESERVE_MIN_SEEN
+
+
+def _header(gt, meta=None, age_h=None):
+    meta = meta or {}
+    return {"name": gt.get("name") or meta.get("name"), "ticker": gt.get("ticker") or meta.get("symbol"),
+            "price_usd": gt.get("price_usd"), "mcap_usd": gt.get("mcap_usd"),
+            "liquidity_usd": gt.get("liquidity_usd"), "vol24h_usd": gt.get("vol24h_usd"), "age_h": age_h}
+
+
+def established_result(token, chain, gt, limits, ev, t0):
+    """Результат без полного скана: токен старый и большой (detect.too_established). Без скора."""
+    ev("done", d.ESTABLISHED_TEXT, score=None, band=d.TOO_ESTABLISHED, headline=d.ESTABLISHED_HEADLINE, rug=None)
+    age = gt.get("age_days")
+    return {"token": token, "chain": chain, "header": _header(gt, age_h=None if age is None else round(age * 24, 1)),
+            "score": None, "band": d.TOO_ESTABLISHED, "headline": d.ESTABLISHED_HEADLINE,
+            "reason": d.ESTABLISHED_TEXT, "parts": {}, "gates": [], "metrics": {}, "rug": None,
+            "holders": [], "holders_total": None, "operators": [], "links": [], "packs": [], "unread": [],
+            "established": {"liquidity_usd": gt.get("liquidity_usd"), "mcap_usd": gt.get("mcap_usd"),
+                            "age_days": age, "limits": limits},
+            "elapsed_s": round(time.time() - t0, 1), "rpc_requests": 0}
 
 
 def validate(token):
@@ -90,8 +135,9 @@ def _reason(sc, base):
     k = max(loss, key=loss.get)
     if loss[k] < 5:
         return "no clear signs of a single operator"
-    return {"operator": f"biggest operator could move price −{m['impact'] * 100:.0f}% if sold "
-                        f"({m['operator'] * 100:.1f}% of float)",
+    return {"operator": (f"biggest operator could move price −{m['impact'] * 100:.0f}% if sold "
+                         f"({m['operator'] * 100:.1f}% of float)" if m["impact"] is not None else
+                         f"biggest operator holds {m['operator'] * 100:.1f}% of float (liquidity not measured)"),
             "virgin": f"{m['virgin'] * 100:.0f}% virgin wallets in top",
             "transfer": f"{m['transfer'] * 100:.1f}% of float received by transfer",
             "sniper": f"snipers hold {m['sniper'] * 100:.1f}% of float",
@@ -117,10 +163,17 @@ def scan(token, emit=lambda e: None):
         seq[0] += 1
         emit(e)
 
+    # GeckoTerminal — до первого RPC: шапка и проверка «too established». Не ответил за MARKET_WAIT —
+    # обычный скан без шапки (поздний ответ не используется), GT недоступен — тоже обычный скан.
     mkt_box = {}
     mkt_thread = threading.Thread(target=lambda: mkt_box.update(market.fetch_market(token, GT_NETWORK[chain])),
                                   daemon=True)
     mkt_thread.start()
+    mkt_thread.join(timeout=max(0.0, t0 + MARKET_WAIT - time.time()))
+    gt = dict(mkt_box)   # снимок: поздний ответ GT не меняет результат
+    limits = established_limits()
+    if d.too_established(gt, limits):
+        return established_result(token, chain, gt, limits, ev, t0)
 
     ev("stage", "launch")
     launch = a.get_launch(token)
@@ -201,22 +254,19 @@ def scan(token, emit=lambda e: None):
                wallet=o["wallets"][0], wallets=o["wallets"], level=o["level"],
                share=o["share"], share_supply=o["share_supply"])
 
-    # ликвидность из шапки нужна скору; не пришла за MARKET_WAIT — скор без правила ликвидности
-    mkt_thread.join(timeout=max(0.0, t0 + MARKET_WAIT - time.time()))
-    gt = dict(mkt_box)   # снимок: поздний ответ GT не меняет уже посчитанный результат
-    sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"))
+    # резерв надёжен: адаптер нашёл пул (на кривой — всегда) и он согласуется с ликвидностью GT
+    reserve_ok = facts.get("reserve_ok", True) and reserve_seen(facts["reserve"], supply, gt)
+    sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"), reserve_ok=reserve_ok)
     reason = _reason(sc, base)
     # probably rug: только вычисления на уже собранных данных, без запросов в сеть
-    rug = d.rug_projection(holders, sig, ops, base, facts["reserve"], sc["band"], snipers=a.RUG_SNIPERS)
+    rug = d.rug_projection(holders, sig, ops, base, facts["reserve"], sc["band"], snipers=a.RUG_SNIPERS,
+                           reserve_ok=reserve_ok)
     if rug:
         rug["level_usd"] = gt["price_usd"] * rug["level_factor"] if gt.get("price_usd") else None
     meta = {}
     if not gt.get("name"):
         meta = a.token_meta(token)
-    header = {"name": gt.get("name") or meta.get("name"), "ticker": gt.get("ticker") or meta.get("symbol"),
-              "price_usd": gt.get("price_usd"), "mcap_usd": gt.get("mcap_usd"),
-              "liquidity_usd": gt.get("liquidity_usd"), "vol24h_usd": gt.get("vol24h_usd"),
-              "age_h": round((time.time() - ts[launch["block"]]) / 3600, 1)}
+    header = _header(gt, meta, round((time.time() - ts[launch["block"]]) / 3600, 1))
     elapsed = round(time.time() - t0, 1)
     ev("done", reason, score=sc["score"], band=sc["band"], headline=sc["headline"], rug=rug)
 
@@ -229,6 +279,7 @@ def scan(token, emit=lambda e: None):
         "links": links, "packs": packs, "operators": ops,
         "score": sc["score"], "band": sc["band"], "parts": sc["parts"], "gates": sc["gates"],
         "metrics": sc["metrics"], "headline": sc["headline"], "reason": reason, "reserve": facts["reserve"],
+        "reserve_ok": reserve_ok,
         "rug": rug,
         "unread": unread, "use_funding": USE_FUNDING,
         "elapsed_s": elapsed, "rpc_requests": a.REQUESTS[0] - r0,

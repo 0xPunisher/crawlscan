@@ -23,7 +23,8 @@
     между «crawlers at work» и «how it works», строка CA с copy в герое;
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
     переносы в логах, отступы 16 px;
-  - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора;
+  - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора; TOO ESTABLISHED (TOO_ESTABLISHED) — без скора,
+    таблицы холдеров и критериев: шапка, чарт, карточка вердикта с пояснением, Trade on Axiom;
   - цвета частей скора и критериев: больше баллов = чище = зелёный, мало = красный;
   - две сети: сеть по адресу (0x + 40 hex — Robinhood, base58 32–44 — Solana, регистр Solana
     не меняется), переключатель «Robinhood | Solana» над полем (плейсхолдер и sample сети),
@@ -48,6 +49,12 @@
     есть rug — красная пунктирная стрелка от now до уровня с подписью «probably rug −X%» и причины
     (parts) под чартом. Меньше 5 свечей — линия now и «not enough trades to chart yet»; нет данных
     GeckoTerminal — текстовая карточка.
+
+  - лента «recently scanned» в герое под полем поиска: GET /api/recent?limit=12 при загрузке, раз в 30 с
+    (только при открытой вкладке) и при возврате на лендинг; строка — тикер, сеть, адрес, скор, вердикт,
+    probably rug, «2m ago»; клик запускает скан токена, клик по адресу копирует его. Пусто — секции нет.
+  - «Trade on Axiom» под вердиктом: шаблоны ссылок по сети из /api/config (env TRADE_URL_*), новая вкладка;
+    адрес токена в шапке результата — копируется кликом (иконка copy, галочка «copied»), без ссылки на эксплорер.
 
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
 и index.html не перезаписывает.
@@ -93,7 +100,7 @@ rep('<meta name="viewport" content="width=device-width, initial-scale=1">\n<scri
 
 # полоса TOO EARLY
 rep("const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD};",
-    "const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD,'TOO EARLY':'#8a959c'};")
+    "const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD,'TOO EARLY':'#8a959c','TOO ESTABLISHED':'#8a959c'};")
 
 # нормализация API -> формат дизайна (перед классом)
 rep("class Component extends DCLogic {", r'''// ---- live API (rh-crawler server.py) -> design format ----
@@ -130,7 +137,7 @@ function normalizeEvent(e){
       break;
     }
     case 'done':
-      o.band=e.band==='TOO_EARLY_OR_LATE'?'TOO EARLY':e.band; break;
+      o.band=e.band==='TOO_EARLY_OR_LATE'?'TOO EARLY':e.band==='TOO_ESTABLISHED'?'TOO ESTABLISHED':e.band; break;
     case 'error': o.detail=e.detail||'error'; break;
   }
   return o;
@@ -387,9 +394,9 @@ rep('          <span>read-only · no wallet connect · Robinhood Chain</span>\n'
     f'          <span style="display:inline-flex;align-items:center;gap:8px"><span style="color:#00c805">${TOKEN_TICKER}</span>'
     f'<span>CA:</span><span title="{TOKEN_CA}" style="color:#aab4ba">{TOKEN_CA_SHORT}</span>{copy_button("Hero", "copy token contract address")}</span>\n')
 
-# логика copy в компоненте: CA в исходном регистре, галочка на 1.5 с
-rep("  blank(ca){return {", f"""  copyCa(key){{
-    const ca={json.dumps(TOKEN_CA)};
+# логика copy в компоненте: CA в исходном регистре, галочка на 1.5 с; один ключ caCopied на всю страницу
+rep("  blank(ca){return {", f"""  copyCa(key,text){{   // text — любой адрес (шапка скана, лента); без него — CA проекта
+    const ca=text||{json.dumps(TOKEN_CA)};
     const fallback=()=>{{const t=document.createElement('textarea'); t.value=ca; t.style.position='fixed'; t.style.opacity='0'; document.body.appendChild(t); t.select(); try{{document.execCommand('copy');}}catch(e){{}} t.remove();}};
     try{{ if(navigator.clipboard&&window.isSecureContext) navigator.clipboard.writeText(ca).catch(fallback); else fallback(); }}catch(e){{fallback();}}
     this.setState({{caCopied:key}}); clearTimeout(this._caT); this._caT=setTimeout(()=>this.setState({{caCopied:''}}),1500);
@@ -527,14 +534,17 @@ rep('<sc-if value="{{inputError}}" hint-placeholder-val="{{false}}"><span style=
     '<sc-if value="{{inputNotice}}" hint-placeholder-val="{{false}}"><span data-notice="1" style="display:inline-flex;align-items:center;gap:8px;color:#9fd9ff">'
     '<span style="width:6px;height:6px;border-radius:50%;background:#9fd9ff;box-shadow:0 0 6px #9fd9ff"></span>{{inputNotice}}</span></sc-if>')
 
-# бейдж сети у тикера и ссылка на токен
+# бейдж сети у тикера; адрес токена — копируется кликом (ссылки на эксплорер у токена нет, у кошельков — есть)
 TICKER = "<span data-grip=\"1\" style=\"font-family:'JetBrains Mono',monospace;font-size:14px;color:#9fd9ff\">${{hTicker}}</span>"
 rep(TICKER, TICKER + f'<span data-chain="1" style="align-self:center;{MONO};font-size:10.5px;padding:2px 8px;border-radius:999px;color:#c9d1d6;'
     'border:1px solid #2c353b;background:#0b1013">{{chainLabel}}</span>')
 CA_STYLE = f"{MONO};font-size:12px;color:#5f6b72;word-break:break-all"
 rep("<span style=\"font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72\">{{ca}}</span>",
-    f'<sc-if value="{{{{caLink}}}}" hint-placeholder-val="{{{{false}}}}"><a href="{{{{caUrl}}}}" target="_blank" rel="noopener" style="{CA_STYLE}" style-hover="color:#9fd9ff">{{{{ca}}}} ↗</a></sc-if>'
-    f'<sc-if value="{{{{caPlain}}}}" hint-placeholder-val="{{{{true}}}}"><span style="{CA_STYLE}">{{{{ca}}}}</span></sc-if>')
+    f'<button sc-camel-on-click="{{{{copyScanCa}}}}" data-copy-ca="1" title="copy full address" aria-label="copy token address" '
+    f'style="display:inline-flex;align-items:center;gap:8px;padding:0;border:0;background:transparent;cursor:pointer;text-align:left;{CA_STYLE}" '
+    f'style-hover="color:#9fd9ff"><span style="min-width:0">{{{{ca}}}}</span>'
+    f'<sc-if value="{{{{caScanIdle}}}}" hint-placeholder-val="{{{{true}}}}">{ICON_COPY}</sc-if>'
+    f'<sc-if value="{{{{caScanDone}}}}" hint-placeholder-val="{{{{false}}}}"><span style="display:inline-flex;align-items:center;gap:4px;color:#00c805;white-space:nowrap">{ICON_CHECK}copied</span></sc-if></button>')
 
 # адрес кошелька в таблице: ссылка solscan для Solana, иначе текст
 ADDR = "font-family:'JetBrains Mono',monospace;font-size:13px;color:{{r.addrColor}}"
@@ -594,14 +604,15 @@ rep("  blank(ca){return {", """  soon(ca){   // Solana выключена: ле�
     if(was!=='landing'){window.scrollTo(0,0); this.startLanding();}
   }
   netVals(){
-    const net=this.state.net, ch=chainOf(this.m.ca)||'robinhood', ex=EXPLORER[ch];
+    const net=this.state.net, ch=chainOf(this.m.ca)||'robinhood';
     const st=on=>on?{c:'#eef1f3',b:'rgba(0,200,5,0.55)',g:'rgba(0,200,5,0.1)'}:{c:'#5f6b72',b:'#1c252b',g:'transparent'};
     const rh=st(net==='robinhood'), so=st(net==='solana');
     const pick=n=>()=>this.setState({net:n,inputError:'',inputNotice:''});
     return {placeholder:PLACEHOLDER[net], inputNotice:this.state.inputNotice,
       rhColor:rh.c, rhBorder:rh.b, rhBg:rh.g, solColor:so.c, solBorder:so.b, solBg:so.g,
       solSoon:this.state.solanaOn===false, pickRh:pick('robinhood'), pickSol:pick('solana'),
-      chainLabel:CHAIN_NAME[ch], caUrl:ex?ex.token(this.m.ca):'', caLink:!!ex, caPlain:!ex};
+      chainLabel:CHAIN_NAME[ch], copyScanCa:()=>this.copyCa('scan',this.m.ca),
+      caScanDone:this.state.caCopied==='scan', caScanIdle:this.state.caCopied!=='scan'};
   }
   blank(ca){return {""")
 rep("      onInput:e=>this.setState({input:e.target.value,inputError:''}),",
@@ -1183,6 +1194,138 @@ CHART_CSS = """
 @media (max-width:640px){.cs-rug-row{grid-template-columns:minmax(0,1fr) auto!important}.cs-rug-row>:nth-child(2){grid-column:1/-1;grid-row:2}}
 """
 rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}" + CHART_CSS)
+
+# ---------------------------------------------------------------------------
+# лента «recently scanned» в герое, сразу под полем поиска (внутри data-nocrawl: пауки лендинга
+# её не закрывают). GET /api/recent?limit=12 при загрузке, раз в 30 с, при возврате на вкладку и
+# на лендинг; вкладка скрыта — запросов нет. Пусто или ошибка — секции нет.
+# Строка: тикер, сеть, адрес, скор и вердикт цветом полосы, «probably rug», «2m ago»; клик — скан (?ca=),
+# клик по адресу — копирует полный адрес (скан не открывает).
+# ---------------------------------------------------------------------------
+rep("  blank(ca){return {", r"""  loadRecent(){   // лента «recently scanned»: только при открытой вкладке
+    if(document.hidden) return;
+    fetch('/api/recent?limit=12').then(r=>r.ok?r.json():null)
+      .then(d=>{if(d&&Array.isArray(d.items)) this.setState({recent:d.items});}).catch(()=>{});
+  }
+  recentVals(){
+    const items=this.state.recent||[], now=Date.now()/1000;
+    const ago=ts=>{const s=Math.max(0,Math.floor(now-ts)); return s<60?'just now':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago';};
+    const rows=items.map(x=>{
+      const early=x.band==='TOO_EARLY_OR_LATE', est=x.band==='TOO_ESTABLISHED', band=early?'TOO EARLY':est?'TOO ESTABLISHED':x.band,
+        col=BANDS[band]||'#8a959c', sol=x.chain==='solana';
+      return {ticker:x.ticker?'$'+x.ticker:(x.name||x.token.slice(0,6)+'…'+x.token.slice(-4)),
+        chain:sol?'Solana':'Robinhood', chainColor:sol?'#9945FF':'#00c805',
+        addr:x.token.slice(0,6)+'…'+x.token.slice(-4), full:x.token,
+        score:est?'':x.score!=null&&!early?String(x.score):'—', band:early?'too early':est?'too established':band, color:col,
+        rug:!!x.rug, ago:ago(x.ts), href:'/?ca='+encodeURIComponent(x.token),
+        go:e=>{e.preventDefault(); this.startScan(x.token);},
+        copy:e=>{e.preventDefault(); e.stopPropagation(); this.copyCa('r:'+x.token,x.token);},
+        copied:this.state.caCopied==='r:'+x.token, idle:this.state.caCopied!=='r:'+x.token};
+    });
+    return {recentOn:rows.length>0, recentRows:rows};
+  }
+  blank(ca){return {""")
+rep("  state={view:'landing',", "  state={recent:[],view:'landing',")
+rep("    this.loadDraw();\n    this.loadRewards();\n",
+    "    this.loadDraw();\n    this.loadRewards();\n"
+    "    this.loadRecent(); this._recentT=setInterval(()=>this.loadRecent(),30000);\n"
+    "    this._vis=()=>{if(!document.hidden) this.loadRecent();}; document.addEventListener('visibilitychange',this._vis);\n")
+rep("clearInterval(this._drawT); clearInterval(this._rwT);",
+    "clearInterval(this._drawT); clearInterval(this._rwT); clearInterval(this._recentT); document.removeEventListener('visibilitychange',this._vis);")
+rep("    this.setState({view:'landing'});\n    window.scrollTo(0,0);\n    this.startLanding();",
+    "    this.setState({view:'landing'});\n    window.scrollTo(0,0);\n    this.startLanding();\n    this.loadRecent();")
+rep("      ...this.rwVals(),", "      ...this.rwVals(),\n      ...this.recentVals(),")
+PILL = f"{MONO};font-size:10.5px;padding:2px 8px;border-radius:999px;white-space:nowrap"
+RECENT_BLOCK = f'''          <sc-if value="{{{{recentOn}}}}" hint-placeholder-val="{{{{false}}}}"><div data-recent="1" style="margin-top:22px;border:1px solid #141b20;border-radius:12px;background:#090c0f;padding:6px 12px;box-sizing:border-box;min-width:0">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 4px 8px;{MONO};font-size:12px"><span style="display:inline-flex;align-items:center;gap:8px;color:#00c805"><span style="width:6px;height:6px;border-radius:50%;background:#00c805;box-shadow:0 0 6px #00c805"></span>recently scanned</span><span style="color:#5f6b72">click to open</span></div>
+            <sc-for list="{{{{recentRows}}}}" as="r" hint-placeholder-count="4"><a href="{{{{r.href}}}}" sc-camel-on-click="{{{{r.go}}}}" title="{{{{r.full}}}}" class="cs-recent-row" style="display:grid;align-items:center;padding:10px 4px;border-top:1px solid #12181c;{MONO};font-size:13px;color:#dfe5e8;text-decoration:none" style-hover="background:#0d1317">
+              <span class="cs-rc-t" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#eef1f3">{{{{r.ticker}}}}</span>
+              <span class="cs-rc-c" style="{PILL};color:{{{{r.chainColor}}}};border:1px solid {{{{r.chainColor}}}};justify-self:start">{{{{r.chain}}}}</span>
+              <button class="cs-rc-a" sc-camel-on-click="{{{{r.copy}}}}" title="copy full address" aria-label="copy token address" style="justify-self:start;display:inline-flex;align-items:center;gap:6px;padding:0;border:0;background:transparent;cursor:pointer;{MONO};color:#5f6b72;font-size:12px;white-space:nowrap" style-hover="color:#9fd9ff"><sc-if value="{{{{r.idle}}}}" hint-placeholder-val="{{{{true}}}}">{{{{r.addr}}}}{ICON_COPY.replace('width="14" height="14"', 'width="12" height="12"')}</sc-if><sc-if value="{{{{r.copied}}}}" hint-placeholder-val="{{{{false}}}}"><span style="display:inline-flex;align-items:center;gap:4px;color:#00c805">{ICON_CHECK.replace('width="14" height="14"', 'width="12" height="12"')}copied</span></sc-if></button>
+              <span class="cs-rc-s" style="color:{{{{r.color}}}};text-align:right;font-variant-numeric:tabular-nums">{{{{r.score}}}}</span>
+              <span class="cs-rc-v" style="color:{{{{r.color}}}};font-size:11.5px;letter-spacing:0.04em;white-space:nowrap">{{{{r.band}}}}</span>
+              <span class="cs-rc-r" style="justify-self:start"><sc-if value="{{{{r.rug}}}}" hint-placeholder-val="{{{{false}}}}"><span style="{PILL};color:#ff4d4d;background:rgba(255,77,77,0.1);border:1px solid rgba(255,77,77,0.45)">▼ <span class="cs-rc-pw">probably </span>rug</span></sc-if></span>
+              <span class="cs-rc-g" style="color:#5f6b72;font-size:12px;text-align:right;white-space:nowrap">{{{{r.ago}}}}</span>
+            </a></sc-for>
+          </div></sc-if>
+'''
+rep('try a sample →</a>\n        </div>\n', 'try a sample →</a>\n        </div>\n' + RECENT_BLOCK)
+RECENT_CSS = """
+.cs-recent-row{grid-template-columns:minmax(0,1fr) 92px 110px 34px 116px 116px 62px;grid-template-areas:"t c a s v r g";column-gap:12px}
+.cs-rc-t{grid-area:t}.cs-rc-c{grid-area:c}.cs-rc-a{grid-area:a}.cs-rc-s{grid-area:s}.cs-rc-v{grid-area:v}.cs-rc-r{grid-area:r}.cs-rc-g{grid-area:g}
+@media (max-width:640px){.cs-recent-row{grid-template-columns:auto auto minmax(0,1fr) auto!important;grid-template-areas:"t t s v" "c a r g"!important;row-gap:6px}.cs-rc-r{justify-self:end!important}.cs-rc-pw{display:none}}
+"""
+rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}" + RECENT_CSS)
+
+# ---------------------------------------------------------------------------
+# «Trade on Axiom» под вердиктом: шаблон ссылки по сети из /api/config (trade, env TRADE_URL_*),
+# {address} — адрес токена из результата. Только когда есть результат; новая вкладка, rel="noopener".
+# ---------------------------------------------------------------------------
+rep(".then(d=>this.setState({solanaOn:!!d.solana}))", ".then(d=>this.setState({solanaOn:!!d.solana,trade:d.trade||null}))")
+rep("  blank(ca){return {", """  tradeVals(){
+    const raw=this.m&&this.m.result&&this.m.result.raw, t=this.state.trade, tpl=raw&&t&&t[raw.chain];
+    if(this.state.view!=='scan'||!raw||!raw.token||!tpl||this.m.error) return {tradeOn:false,tradeUrl:'#'};
+    return {tradeOn:true,tradeUrl:tpl.split('{address}').join(encodeURIComponent(raw.token))};
+  }
+  blank(ca){return {""")
+rep("      ...this.recentVals(),", "      ...this.recentVals(),\n      ...this.tradeVals(),")
+TRADE_BTN = (f'<sc-if value="{{{{tradeOn}}}}" hint-placeholder-val="{{{{false}}}}"><a href="{{{{tradeUrl}}}}" target="_blank" rel="noopener" data-trade="1" '
+             f'style="display:flex;align-items:center;justify-content:center;gap:8px;height:44px;border:1px solid rgba(0,200,5,0.55);border-radius:8px;'
+             f'background:rgba(0,200,5,0.08);color:#eef1f3;{MONO};font-size:13px;font-weight:600;text-decoration:none" '
+             f'style-hover="background:rgba(0,200,5,0.16);border-color:#00c805">Trade on Axiom ↗</a></sc-if>\n')
+REASON = '{{reason}}</span>\n              <div style="display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid #141b20">'
+rep(REASON, REASON.replace('</span>\n', '</span>\n              ' + TRADE_BTN, 1))
+
+# ---------------------------------------------------------------------------
+# «too established» (band TOO_ESTABLISHED): полный скан не запускался. На странице результата — шапка,
+# чарт, карточка вердикта (TOO ESTABLISHED, без скора, заголовок и пояснение, Trade on Axiom, new crawl без copy link)
+# и рядом карточка token stats (возраст, капа, ликвидность, объём 24ч из GT; на телефоне — под вердиктом);
+# таблица холдеров, части скора, факты и «What the crawlers checked» скрыты (data-est="1" на main).
+# В ленте — пометка «too established» вместо скора.
+# ---------------------------------------------------------------------------
+rep('<main data-screen-label="Scan" style="position:relative;z-index:1;padding-bottom:120px">',
+    '<main data-screen-label="Scan" data-est="{{estFlag}}" style="position:relative;z-index:1;padding-bottom:120px">')
+rep('''<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));border-bottom:1px solid #12181c;font-family:'JetBrains Mono',monospace">''',
+    '''<div class="cs-facts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));border-bottom:1px solid #12181c;font-family:'JetBrains Mono',monospace">''')
+rep('<div style="display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid #141b20">',
+    '<div class="cs-parts" style="display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid #141b20">')
+rep('<div style="margin-top:56px;display:flex;flex-direction:column;gap:18px">',
+    '<div class="cs-crit" style="margin-top:56px;display:flex;flex-direction:column;gap:18px">')
+rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}"
+    "\n[data-est=\"1\"] .cs-facts,[data-est=\"1\"] .cs-scan-table,[data-est=\"1\"] .cs-parts,[data-est=\"1\"] .cs-crit,"
+    "[data-est=\"1\"] .cs-score,[data-est=\"1\"] .cs-copylink{display:none!important}"
+    "\n[data-est=\"1\"] aside,.cs-est-stats{flex:1 1 0!important;max-width:none!important;align-self:stretch;position:static!important}"
+    "\n[data-est=\"1\"] aside>div{flex:1}"
+    "\n@media (max-width:640px){[data-est=\"1\"] aside,.cs-est-stats{flex:1 1 100%!important}}\n")
+rep("  blank(ca){return {", """  estVals(){   // too established: полный скан не запускался; карточка token stats — числа GT (нет числа — нет строки)
+    const dn=this.state.view==='scan'&&this.m&&this.m.done, on=!!dn&&dn.band==='TOO ESTABLISHED';
+    const raw=on&&this.m.result&&this.m.result.raw||{}, est=raw.established||{}, h=raw.header||{};
+    const num=v=>typeof v==='number'&&isFinite(v), age=est.age_days, mcap=num(est.mcap_usd)?est.mcap_usd:h.mcap_usd;
+    const liq=num(est.liquidity_usd)?est.liquidity_usd:h.liquidity_usd;
+    const stats=[['age',num(age)?Math.floor(age).toLocaleString('en-US')+(Math.floor(age)===1?' day':' days'):null],
+      ['market cap',num(mcap)?fmtUsd(mcap):null],['liquidity · all pools',num(liq)?fmtUsd(liq):null],
+      ['24h volume',num(h.vol24h_usd)?fmtUsd(h.vol24h_usd):null]].filter(x=>x[1]).map(([label,value])=>({label,value}));
+    return {estFlag:on?'1':'0', estStatsOn:on&&!!this.m.result&&stats.length>0, estStats:stats};
+  }
+  blank(ca){return {""")
+rep("      ...this.tradeVals(),", "      ...this.tradeVals(),\n      ...this.estVals(),")
+# карточка token stats справа от вердикта (только TOO ESTABLISHED), стиль — как у карточки вердикта
+STATS_CARD = (f'          <sc-if value="{{{{estStatsOn}}}}" hint-placeholder-val="{{{{false}}}}"><div class="cs-est-stats" style="min-width:0;display:flex;flex-direction:column">'
+              '<div data-est-stats="1" style="flex:1;border:1px solid #141b20;border-radius:14px;background:#090c0f;padding:26px 26px 24px;'
+              'display:flex;flex-direction:column;gap:18px;box-sizing:border-box">\n'
+              f'            <div style="display:flex;justify-content:space-between;align-items:center;{MONO};font-size:11px;color:#5f6b72"><span>token stats</span><span>GeckoTerminal</span></div>\n'
+              f'            <sc-for list="{{{{estStats}}}}" as="x" hint-placeholder-count="4"><div style="display:flex;justify-content:space-between;align-items:baseline;gap:16px;padding:14px 0;border-top:1px solid #141b20">'
+              f'<span style="{MONO};font-size:12px;color:#8a959c">{{{{x.label}}}}</span>'
+              f'<span style="{MONO};font-size:22px;color:#eef1f3;font-variant-numeric:tabular-nums;white-space:nowrap">{{{{x.value}}}}</span></div></sc-for>\n'
+              '          </div></div></sc-if>\n')
+rep('          </aside>\n', '          </aside>\n' + STATS_CARD)
+# copy link — класс, чтобы скрыть в TOO ESTABLISHED (в обычных сканах остаётся)
+rep('<button data-grip="1" sc-camel-on-click="{{copyLink}}"', '<button class="cs-copylink" data-grip="1" sc-camel-on-click="{{copyLink}}"')
+# число скора скрыто (его нет); в логе вердикта без «null» (и для TOO EARLY)
+rep('<div data-grip="1" style="display:flex;align-items:baseline;gap:8px">',
+    '<div class="cs-score" data-grip="1" style="display:flex;align-items:baseline;gap:8px">')
+rep("this.log('verdict',BANDS[e.band]||A,`${e.score} ${e.band} · ${e.detail||''}`,BANDS[e.band]||A);",
+    "this.log('verdict',BANDS[e.band]||A,`${e.score!=null?e.score+' ':''}${e.band} · ${e.detail||''}`,BANDS[e.band]||A);")
 
 # суммы меньше $1K — без хвоста знаков (тонкая ликвидность на Solana)
 rep("':'$'+v;", "':'$'+(v>=10?Math.round(v):v.toFixed(2));")
