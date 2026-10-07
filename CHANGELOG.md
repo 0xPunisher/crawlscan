@@ -5,6 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Full burn and winner history on the site: "All burns" and "All winners" lists with Show more, per-day Verify, and direct links `#burns` / `#winners`.
+- `GET /api/rewards/history?kind=burns|draws` with pages of up to 50 and a time cursor (`before`).
+
 ### Planned
 
 - Early buyers crawl: see how much supply was bundled at launch, even after bundlers exit.

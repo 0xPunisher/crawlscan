@@ -30,6 +30,8 @@ Token Burn & Holder Rewards, Robinhood (только при REWARDS_ENABLED=true
   GET  /api/rewards/status               -> токен, следующий розыгрыш и плановое сжигание, последнее сжигание,
                                             всего сожжено, последний победитель (вес, шанс, выплата), участники
   GET  /api/rewards/history?limit=30     -> розыгрыши и сжигания, новые первыми (limit до 365)
+  GET  /api/rewards/history?kind=burns|draws&limit=10&before=T -> страница полной истории: {"kind", "total",
+                                            "items", "next_before"}; limit 1–50, before — unix-время или ISO 8601
   GET  /api/rewards/<YYYY-MM-DD>/participants -> полный список участников с весами
   GET  /api/rewards/<YYYY-MM-DD>/verify  -> входные данные и пересчёт победителя
 
@@ -51,6 +53,7 @@ Alerts, подписки для бота (только при ALERTS_ENABLED=tru
 Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
 """
 import hashlib, hmac, json, os, re, threading, time, uuid
+from datetime import datetime, timezone
 from email.utils import formatdate, parsedate_to_datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -247,6 +250,30 @@ def rewards_store():
         if path not in _rw_stores:
             _rw_stores[path] = RewardsStore(path or None)
         return _rw_stores[path]
+
+
+def history_args(q):
+    """kind, limit, before из запроса страницы /api/rewards/history?kind=burns|draws&limit=10&before=...
+    before — unix-время (секунды) или ISO 8601; ошибка — ValueError с текстом для 400."""
+    kind = q["kind"][0]
+    if kind not in ("burns", "draws"):
+        raise ValueError("kind must be burns or draws")
+    try:
+        limit = int((q.get("limit") or ["10"])[0])
+    except ValueError:
+        raise ValueError("limit must be an integer") from None
+    raw = (q.get("before") or [""])[0].strip()
+    before = None
+    if raw:
+        try:
+            if raw.replace(".", "", 1).isdigit():
+                before = int(float(raw))
+            else:   # ISO без пояса — UTC
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                before = int((dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp())
+        except (ValueError, OverflowError):
+            raise ValueError("before must be unix time or ISO 8601") from None
+    return kind, limit, before
 
 
 _recent_stores = {}
@@ -599,6 +626,11 @@ class H(BaseHTTPRequestHandler):
         store = rewards_store()
         if store is None:
             return self._send(404, {"error": "rewards are disabled"})
+        if path == "/api/rewards/history" and q.get("kind"):
+            try:
+                return self._send(200, rs.history_page(store, cfg, *history_args(q)))
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
         if path == "/api/rewards/history":
             try:
                 limit = min(365, max(1, int((q.get("limit") or ["30"])[0])))

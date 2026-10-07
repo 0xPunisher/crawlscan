@@ -41,6 +41,8 @@
     enabled: true. Две карточки: Burn (таймер до next_burn, последнее сжигание, всего сожжено и % сапплая,
     кошелёк разработчика «burns from» и адрес сжиганий с copy) и Holder Rewards (кошелёк «rewards paid from», таймер до next_draw, блок доверия с Verify по
     /api/rewards/<day>/*, последний победитель с copy, шанс, выплата или payout pending).
+    «All burns (N)» / «All winners (N)» раскрывают полную историю (/api/rewards/history?kind=..., по 10,
+    «Show more»); #burns / #winners в адресе — список раскрыт и прокручен к нему.
     Таймер в нуле — «Waiting for burn transaction…» / «Picking the winner…»; новое сжигание — вспышка
     «Tokens burned: N», новый розыгрыш — появление победителя. Большие таймеры — цифры в зелёных плитках
     (моноширинные, фиксированной ширины), двоеточия без плиток. Ссылки — Blockscout Robinhood Chain.
@@ -1021,13 +1023,76 @@ winner_line = lambda cls: (
     f'<a href="{{{{rwWinnerUrl}}}}" title="{{{{rwWinnerFull}}}}" target="_blank" rel="noopener" data-rw-winner="1" style="color:#eef1f3" style-hover="color:#9fd9ff">{{{{rwWinner}}}} ↗</a>'
     + rw_copy("Winner", "rwWinIdle", "rwWinDone", "copy winner address") + '</div>')
 dev_rows = lambda key, label, attr: sif("rwHasDevs", f'<span style="{LABEL}">{label}</span><sc-for list="{{{{{key}}}}}" as="w" hint-placeholder-count="1"><div {attr}="1" style="display:flex;align-items:center;gap:10px;min-width:0"><a href="{{{{w.url}}}}" title="{{{{w.full}}}}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#dfe5e8;overflow-wrap:anywhere;min-width:0" style-hover="color:#9fd9ff"><span class="cs-rw-full">{{{{w.full}}}}</span><span class="cs-rw-short">{{{{w.short}}}}</span> ↗</a><button sc-camel-on-click="{{{{w.copy}}}}" title="copy developer wallet" aria-label="copy developer wallet" style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px solid #1c252b;border-radius:7px;background:#0b1013;color:#8a959c;cursor:pointer;flex-shrink:0" style-hover="color:#ffffff;border-color:#2c353b"><sc-if value="{{{{w.idle}}}}" hint-placeholder-val="{{{{true}}}}">{ICON_COPY}</sc-if><sc-if value="{{{{w.done}}}}" hint-placeholder-val="{{{{false}}}}">{ICON_CHECK}</sc-if></button></div></sc-for><span style="height:6px"></span>')
+# полная история (GET /api/rewards/history?kind=burns|draws, по 10, «Show more» — курсор next_before):
+# «All burns (N)» / «All winners (N)» раскрывают список под карточками на всю ширину (≤ 900 px — под своей карточкой);
+# #burns и #winners в адресе — список сразу раскрыт и прокручен к нему. Телефон (≤ 640 px) — строки карточками.
+HBTN = (f'{MONO};font-size:13px;color:#dfe5e8;background:#0b1013;border:1px solid #1c252b;padding:9px 14px;'
+        'border-radius:8px;cursor:pointer;align-self:flex-start')
+hist_btn = lambda on, opened, target, label: (
+    f'<button sc-camel-on-click="{{{{{on}}}}}" aria-expanded="{{{{{opened}}}}}" aria-controls="{target}" data-rw-hist-btn="{target}" '
+    f'style="{HBTN};margin-top:6px" style-hover="color:#ffffff;border-color:#2c353b">{label}</button>')
+BURN_COLS = "grid-template-columns:200px minmax(0,1fr) minmax(0,1fr);gap:16px"
+WIN_COLS = "grid-template-columns:170px minmax(0,1.3fr) 76px minmax(0,1.5fr) 150px;gap:16px"
+ROW = "align-items:center;padding:12px;border-bottom:1px solid #12181c;font-size:13px;min-width:0"
+
+
+def hist_panel(pid, key, order, title, cols, head, row, empty):
+    more = "more" + key[0].upper() + key[1:]
+    return (f'          <div id="{pid}" data-rw-hist="{pid}" style="order:{order};grid-column:1/-1;display:{{{{{key}Disp}}}};'
+            f'flex-direction:column;border:1px solid #141b20;border-radius:14px;background:#090c0f;padding:8px 14px;'
+            f'box-sizing:border-box;min-width:0;scroll-margin-top:88px">\n'
+            f'            <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px 12px;padding:12px 12px 8px;{MONO};font-size:13px">'
+            f'<span style="color:#00c805;white-space:nowrap">{title}</span><span style="color:#5f6b72">{{{{{key}N}}}} total · newest first · UTC</span></div>\n'
+            f'            <div class="cs-hist-head" style="display:grid;{cols};padding:10px 12px;border-bottom:1px solid #141b20;{LABEL}">{head}</div>\n'
+            f'            <div class="cs-hist-list" style="display:flex;flex-direction:column;min-width:0">'
+            f'<sc-for list="{{{{{key}Rows}}}}" as="h" hint-placeholder-count="3">{row}</sc-for></div>\n'
+            f'            {sif(key + "Empty", f"<div style=\"padding:16px 12px;{MONO};font-size:13px;color:#5f6b72\">{empty}</div>")}\n'
+            f'            {sif(key + "Loading", f"<div class=\"cs-rw-pulse\" style=\"padding:16px 12px;{MONO};font-size:13px;color:#8a959c\">Loading…</div>")}\n'
+            f'            {sif(key + "Err", f"<button sc-camel-on-click=\"{{{{{more}}}}}\" style=\"{HBTN};margin:12px;color:#ff6b6b\">could not load · retry</button>")}\n'
+            f'            {sif(key + "More", f"<button sc-camel-on-click=\"{{{{{more}}}}}\" data-rw-more=\"{pid}\" style=\"{HBTN};margin:12px\" style-hover=\"color:#ffffff;border-color:#2c353b\">Show more</button>")}\n'
+            f'          </div>\n')
+
+
+BURNS_PANEL = hist_panel(
+    "burns", "rwBurns", 3, "all burns", BURN_COLS, "<span>time</span><span>amount</span><span>transaction</span>",
+    f'<div class="cs-hist-row cs-burn-row" data-rw-burn-row="1" style="display:grid;{BURN_COLS};{ROW};{MONO}">'
+    '<span class="cs-h-time" style="color:#8a959c">{{h.time}}</span>'
+    '<span class="cs-h-amt" style="color:#eef1f3;overflow-wrap:anywhere;min-width:0">{{h.amt}} tokens</span>'
+    '<a class="cs-h-tx" href="{{h.txUrl}}" target="_blank" rel="noopener" style="color:#9fd9ff;min-width:0" style-hover="color:#ffffff">{{h.txShort}} ↗</a></div>',
+    "no burns yet")
+WIN_COPY = ('<button sc-camel-on-click="{{h.copy}}" title="copy winner address" aria-label="copy winner address" '
+            'style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:1px solid #1c252b;'
+            'border-radius:7px;background:#0b1013;color:#8a959c;cursor:pointer;flex-shrink:0" style-hover="color:#ffffff;border-color:#2c353b">'
+            + sif("h.idle", ICON_COPY, "true") + sif("h.done", ICON_CHECK) + '</button>')
+WIN_VERIFY = (f'<button sc-camel-on-click="{{{{h.verify}}}}" data-rw-hist-verify="1" title="recompute this draw in your browser" '
+              f'style="{MONO};font-size:13px;color:#9fd9ff;background:none;border:0;padding:0;cursor:pointer;text-decoration:underline;'
+              f'text-underline-offset:3px" style-hover="color:#ffffff">Verify</button>'
+              + sif("h.vShow", '<span title="{{h.vDetail}}" data-rw-hist-verdict="1" style="color:{{h.vColor}}">{{h.vText}}</span>'))
+WINNERS_PANEL = hist_panel(
+    "winners", "rwDraws", 4, "all winners", WIN_COLS,
+    "<span>draw</span><span>winner</span><span>chance</span><span>payout</span><span>verify</span>",
+    f'<div class="cs-hist-row cs-win-row" data-rw-win-row="1" style="display:grid;{WIN_COLS};{ROW};{MONO}">'
+    '<span class="cs-h-date" style="color:#8a959c">{{h.date}}</span>'
+    '<span class="cs-h-win" style="display:flex;align-items:center;gap:8px;min-width:0">'
+    + sif("h.won", '<a href="{{h.winUrl}}" title="{{h.winFull}}" target="_blank" rel="noopener" style="color:#dfe5e8" '
+          'style-hover="color:#9fd9ff">{{h.winShort}} ↗</a>' + WIN_COPY, "true")
+    + sif("h.noWin", '<span style="color:#5f6b72">no eligible holders</span>') + '</span>'
+    '<span class="cs-h-chance" style="color:#dfe5e8">{{h.chance}}</span>'
+    '<span class="cs-h-pay" style="min-width:0;overflow-wrap:anywhere">'
+    + sif("h.paid", '<span style="color:#00c805">{{h.prize}}</span> · <a href="{{h.txUrl}}" target="_blank" rel="noopener" '
+          'style="color:#9fd9ff" style-hover="color:#ffffff">{{h.txShort}} ↗</a>', "true")
+    + sif("h.pending", '<span style="color:#8a959c">payout pending</span>')
+    + sif("h.carry", '<span style="color:#5f6b72">carries over</span>') + '</span>'
+    '<span class="cs-h-verify" style="display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;min-width:0">'
+    + sif("h.won", WIN_VERIFY, "true") + '</span></div>',
+    "no draws yet")
 REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{{{false}}}}"><section id="rewards" class="cs-wrap" style="max-width:1280px;margin:0 auto;padding:40px 32px 120px;box-sizing:border-box">
         <div style="display:flex;align-items:baseline;justify-content:space-between;gap:24px;border-top:1px solid #12181c;padding-top:22px;margin-bottom:44px">
           <h2 data-grip="1" style="margin:0;font-size:34px;font-weight:500;letter-spacing:-0.03em;color:#eef1f3">token burn &amp; holder rewards</h2>
           <span style="{MONO};font-size:12px;color:#5f6b72">{{{{numRewards}}}}</span>
         </div>
         <div class="cs-rw-grid" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;align-items:stretch">
-          <div data-grip="1" data-rw-burn="1" style="{CARD}">
+          <div data-grip="1" data-rw-burn="1" style="order:1;{CARD}">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">burn</span><span style="color:#5f6b72">every 12 hours</span></div>
             <div style="display:flex;flex-direction:column;gap:6px;min-height:76px">
               <span style="{LABEL}">next burn</span>
@@ -1048,9 +1113,10 @@ REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{
                 <a href="{{{{rwBurnAddrUrl}}}}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#dfe5e8;overflow-wrap:anywhere;min-width:0" style-hover="color:#9fd9ff">{{{{rwBurnAddr}}}} ↗</a>
                 {rw_copy("Burn", "rwBurnIdle", "rwBurnDone", "copy burn address")}
               </div>
+              {sif("rwBurnsBtn", hist_btn("toggleRwBurns", "rwBurnsOpen", "burns", "All burns ({{rwBurnsN}}) {{rwBurnsArrow}}"))}
             </div>
           </div>
-          <div data-grip="1" data-rw-draw="1" style="{CARD}">
+{BURNS_PANEL}          <div data-grip="1" data-rw-draw="1" style="order:2;{CARD}">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">holder rewards</span><span style="color:#5f6b72">every 24 hours</span></div>
             <div style="display:flex;flex-direction:column;gap:6px;min-height:76px">
               <span style="{LABEL}">next draw</span>
@@ -1075,9 +1141,10 @@ REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{
               {sif("rwWonNew", f'<span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwChance}}}} · {{{{rwDayLabel}}}}</span>')}
               {sif("rwPaid", f'<span data-rw-payout="1" style="{MONO};font-size:13px;color:#00c805;overflow-wrap:anywhere">Paid: {{{{rwPrize}}}} · <a href="{{{{rwTxUrl}}}}" target="_blank" rel="noopener" style="color:#9fd9ff" style-hover="color:#ffffff">{{{{rwTxShort}}}} ↗</a></span>')}
               {sif("rwPending", f'<span data-rw-payout="1" style="{MONO};font-size:13px;color:#8a959c">payout pending</span>')}
+              {sif("rwDrawsBtn", hist_btn("toggleRwDraws", "rwDrawsOpen", "winners", "All winners ({{rwDrawsN}}) {{rwDrawsArrow}}"))}
             </div>
           </div>
-        </div>
+{WINNERS_PANEL}        </div>
       </section></sc-if>
 
 '''
@@ -1314,6 +1381,90 @@ rep("clearInterval(this._drawT); clearInterval(this._rwT);",
 rep("    this.setState({view:'landing'});\n    window.scrollTo(0,0);\n    this.startLanding();",
     "    this.setState({view:'landing'});\n    window.scrollTo(0,0);\n    this.startLanding();\n    this.loadRecent();")
 rep("      ...this.rwVals(),", "      ...this.rwVals(),\n      ...this.recentVals(),")
+
+# полная история сжиганий и розыгрышей (кнопки «All burns (N)» / «All winners (N)», якоря #burns / #winners)
+RW_HIST_JS = r"""  rwH(kind){   // состояние списка: страницы по 10, курсор next_before
+    const all=this._rh||(this._rh={});
+    return all[kind]||(all[kind]={open:false,items:[],next:null,total:null,loading:false,loaded:false,err:false});
+  }
+  rwHistSet(){this.setState({rwHistV:(this.state.rwHistV||0)+1});}
+  rwHistToggle(kind){
+    const h=this.rwH(kind); h.open=!h.open;
+    try{history.replaceState(null,'',h.open?'#'+RW_HIST_ID[kind]:location.pathname+location.search);}catch(e){}
+    if(h.open&&!h.loaded) this.rwHistLoad(kind); else this.rwHistSet();
+  }
+  rwHistLoad(kind,scroll){
+    const h=this.rwH(kind); if(h.loading) return;
+    h.loading=true; h.err=false; this.rwHistSet();
+    const before=h.loaded&&h.next!=null?'&before='+h.next:'';
+    fetch(`/api/rewards/history?kind=${kind}&limit=10${before}`).then(r=>r.ok?r.text():Promise.reject(new Error('http '+r.status)))
+      .then(txt=>{const p=parseRw(txt); h.items=h.items.concat(p.items); h.next=p.next_before; h.total=p.total; h.loaded=true;})
+      .catch(()=>{h.err=true;})
+      .finally(()=>{h.loading=false; this.rwHistSet(); if(scroll) this.rwHistScroll(kind);});
+  }
+  rwHistScroll(kind){
+    setTimeout(()=>{const el=document.getElementById(RW_HIST_ID[kind]); if(el) el.scrollIntoView({block:'start'});},60);
+  }
+  rwHashOpen(){   // #burns / #winners: список раскрыт и прокручен к нему
+    const kind={burns:'burns',winners:'draws'}[location.hash.slice(1)];
+    if(!kind||!this.state.rw) return;
+    const h=this.rwH(kind); h.open=true;
+    if(!h.loaded) this.rwHistLoad(kind,true); else {this.rwHistSet(); this.rwHistScroll(kind);}
+  }
+  rwHistVerify(day){   // Verify строки истории: тот же пересчёт, что у последнего розыгрыша
+    const all=this._rhv||(this._rhv={}), set=v=>{all[day]=v; this.rwHistSet();};
+    if(!(window.crypto&&crypto.subtle)){set({s:'err',text:'needs https'}); return;}
+    set({s:'busy',text:'checking…'});
+    verifyDraw(day,'/api/rewards').then(v=>set({s:v.ok?'ok':'bad',text:v.ok?'✓ verified':'✗ mismatch',
+        detail:v.ok?`${v.n} participants · list_hash ${v.lh.slice(0,12)}…`:'mismatch: '+v.bad.join(', ')}))
+      .catch(e=>set({s:'err',text:'✗ error',detail:e.message}));
+  }
+  rwHistVals(){
+    const st=this.state.rw; if(!st) return {};
+    const dec=st.decimals, cp=this.state.rwCopied, B=this.rwH('burns'), D=this.rwH('draws'), hv=this._rhv||{};
+    const nB=B.total??(st.burned_by_dev?st.burned_by_dev.count:0), nD=D.total??(st.draws_count||0);
+    const prize=d=>d.payout_currency==='ETH'?fmtEth(d.payout_amount)+' ETH':fmtUnits(d.payout_amount,d.decimals??dec)+' $CrawlScan';
+    const vals=(k,H,n,rows)=>({[k+'N']:Number(n).toLocaleString('en-US'), [k+'Btn']:n>0, [k+'Open']:H.open?'true':'false',
+      [k+'Arrow']:H.open?'↑':'↓', [k+'Disp']:H.open?'flex':'none', [k+'Rows']:rows,
+      [k+'Loading']:H.loading, [k+'Err']:H.err&&!H.loading, [k+'Empty']:H.loaded&&!H.items.length&&!H.err&&!H.loading,
+      [k+'More']:H.loaded&&H.next!=null&&!H.loading&&!H.err});
+    const burns=B.items.map(b=>({time:fmtUtcTs(b.time*1000), amt:fmtUnits(b.amount,dec), txUrl:RH_TX(b.tx), txShort:rwShort(b.tx)}));
+    const draws=D.items.map(d=>{
+      const won=!!d.winner, paid=!!d.payout_tx, v=hv[d.day], key='hw:'+d.day;
+      return {day:d.day, date:fmtUtcTs(d.time*1000), won, noWin:!won, winShort:won?rwShort(d.winner):'', winFull:d.winner||'',
+        winUrl:won?RH_ADDR(d.winner):'#', copy:()=>this.copyText(key,d.winner||''), idle:cp!==key, done:cp===key,
+        chance:won?fmtChance(d.winner_weight,d.total_weight):'—', paid:won&&paid, pending:won&&!paid, carry:!won,
+        prize:paid?prize(d):'', txUrl:paid?RH_TX(d.payout_tx):'#', txShort:paid?rwShort(d.payout_tx):'',
+        verify:()=>this.rwHistVerify(d.day), vShow:!!v, vText:v?v.text:'', vDetail:v&&v.detail?v.detail:'',
+        vColor:{ok:G,bad:RD,err:RD}[v&&v.s]||'#8a959c'};
+    });
+    return {...vals('rwBurns',B,nB,burns), ...vals('rwDraws',D,nD,draws),
+      toggleRwBurns:()=>this.rwHistToggle('burns'), toggleRwDraws:()=>this.rwHistToggle('draws'),
+      moreRwBurns:()=>this.rwHistLoad('burns'), moreRwDraws:()=>this.rwHistLoad('draws')};
+  }
+  secVals(){"""
+rep("  secVals(){", RW_HIST_JS)
+rep("const burnedFor=", "const RW_HIST_ID={burns:'burns',draws:'winners'};\nconst burnedFor=")
+rep("      ...this.rwVals(),\n", "      ...this.rwVals(),\n      ...this.rwHistVals(),\n")
+# первая загрузка статуса — открыть список по якорю; дальше — по смене якоря
+rep("    this.setState(s); this.rwTick(st);\n",
+    "    this.setState(s); this.rwTick(st);\n"
+    "    if(!prev){setTimeout(()=>this.rwHashOpen(),0);\n"
+    "      if(!this._rwHash){this._rwHash=()=>this.rwHashOpen(); window.addEventListener('hashchange',this._rwHash);}}\n")
+rep("document.removeEventListener('visibilitychange',this._vis);",
+    "document.removeEventListener('visibilitychange',this._vis); window.removeEventListener('hashchange',this._rwHash);")
+rep("@media (max-width:900px){.cs-rw-grid{grid-template-columns:minmax(0,1fr)!important}}\n",
+    "@media (max-width:900px){.cs-rw-grid{grid-template-columns:minmax(0,1fr)!important}.cs-rw-grid>*{order:0!important}}\n"
+    "@media (max-width:640px){\n"
+    "  .cs-hist-head{display:none!important}\n"
+    "  .cs-hist-list{gap:10px;padding:4px 0 8px}\n"
+    "  .cs-hist-row{border:1px solid #1c252b!important;border-radius:10px;background:#0b1013;padding:12px 14px!important;gap:8px 12px!important}\n"
+    "  .cs-burn-row{grid-template-columns:minmax(0,1fr) auto!important;grid-template-areas:'amt tx' 'time time'}\n"
+    "  .cs-h-amt{grid-area:amt}.cs-h-tx{grid-area:tx}.cs-h-time{grid-area:time;font-size:12px}\n"
+    "  .cs-win-row{grid-template-columns:minmax(0,1fr) auto!important;grid-template-areas:'date verify' 'win chance' 'pay pay'}\n"
+    "  .cs-h-date{grid-area:date;font-size:12px}.cs-h-verify{grid-area:verify;justify-content:flex-end}\n"
+    "  .cs-h-win{grid-area:win}.cs-h-chance{grid-area:chance;text-align:right}.cs-h-pay{grid-area:pay}\n"
+    "}\n")
 PILL = f"{MONO};font-size:10.5px;padding:2px 8px;border-radius:999px;white-space:nowrap"
 RECENT_BLOCK = f'''          <sc-if value="{{{{recentOn}}}}" hint-placeholder-val="{{{{false}}}}"><div data-recent="1" style="margin-top:22px;border:1px solid #141b20;border-radius:12px;background:#090c0f;padding:6px 12px;box-sizing:border-box;min-width:0">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 4px 8px;{MONO};font-size:12px"><span style="display:inline-flex;align-items:center;gap:8px;color:#00c805"><span style="width:6px;height:6px;border-radius:50%;background:#00c805;box-shadow:0 0 6px #00c805"></span>recently scanned</span><span style="color:#5f6b72">click to open</span></div>

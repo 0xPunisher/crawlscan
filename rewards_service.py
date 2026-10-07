@@ -293,13 +293,40 @@ def status_json(store, cfg, now=None):
                 "total_supply": int(supply["total_supply"]), "minted": int(supply["minted"]),
                 "dead_balance": int(supply["dead_balance"]), "updated_at": supply["updated_at"],
                 "method": "minted - totalSupply() + balanceOf(0x...dead)"},
-            "last_draw": last, "participants_last": latest["participants"] if latest else 0}
+            "last_draw": last, "participants_last": latest["participants"] if latest else 0,
+            "draws_count": store.draws_count()}
 
 
 def history_json(store, cfg, limit=30):
     dec = store.meta("decimals:" + cfg["token"])
     return {"draws": [draw_json(r) for r in store.draws(limit)],
             "burns": [burn_json(r, dec) for r in store.burns(cfg["token"], limit)]}
+
+
+PAGE_MAX = 50
+
+
+def history_page(store, cfg, kind, limit=10, before=None):
+    """Страница полной истории для сайта: kind "burns" | "draws", новые первыми, limit 1–50, курсор before — unix-время
+    (строго раньше): у сжигания — время блока, у розыгрыша — время розыгрыша (22:00 UTC дня). next_before — курсор
+    следующей страницы или None. Только база, без запросов к сети."""
+    limit = min(PAGE_MAX, max(1, int(limit)))
+    if kind == "burns":
+        dec = store.meta("decimals:" + cfg["token"])
+        rows, more = store.burns_before(cfg["token"], before, limit)
+        items = [burn_json(r, dec) for r in rows]
+        total = store.burned_total(cfg["token"])[1]
+        nxt = rows[-1]["ts"] if more else None
+    else:
+        # draw_at(day) < before  <=>  day <= дата (before - 22:00 - 1 с)
+        max_day = None if before is None else datetime.fromtimestamp(
+            before - rw.DRAW_HOUR * 3600 - 1, timezone.utc).date().isoformat()
+        rows = store.draws_before(max_day, limit)
+        more, rows = len(rows) > limit, rows[:limit]
+        items = [dict(draw_json(r), time=rw.draw_at(r["day"])) for r in rows]
+        total = store.draws_count()
+        nxt = items[-1]["time"] if more else None
+    return {"kind": kind, "limit": limit, "before": before, "total": total, "items": items, "next_before": nxt}
 
 
 def participants_json(store, day):
