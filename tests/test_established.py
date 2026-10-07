@@ -454,6 +454,24 @@ class TestDexScreenerFallback(unittest.TestCase):
         self.assertEqual(a, b)
         self.assertEqual(len(net.calls), n)                            # повтор — из кэша, ни GT, ни DexScreener
 
+    def test_pool_for_widget(self):
+        """pool — самый ликвидный пул GT / пара DexScreener; в результате скана — market_pool."""
+        d = gt_response()
+        d["included"] = [{"type": "pool", "attributes": {"address": "small", "reserve_in_usd": "10"}},
+                         {"type": "pool", "attributes": {"address": "big", "reserve_in_usd": "5000"}},
+                         {"type": "token", "attributes": {"address": "nope", "reserve_in_usd": "1e9"}}]
+        self.assertEqual(market._gt_market(d)["pool"], "big")
+        self.assertIsNone(market._gt_market(gt_response())["pool"])                # GT не дал адресов
+        old, young = ds_response(), ds_response(age_days=0.5, liq=40_000.0, mcap=200_000.0)
+        with mock.patch.object(market, "_ds", return_value=old):
+            self.assertEqual(market._ds_market(fakes.TOKEN, "robinhood")["pool"], old[0]["pairAddress"])  # 60% ликвидности
+        res, _ = self.scan(Net(gt=429, ds=old), age_days=550)
+        self.assertEqual((res["band"], res["market_pool"]), ("TOO_ESTABLISHED", old[0]["pairAddress"]))
+        market.clear_cache()
+        res, _ = self.scan(Net(gt=429, ds=young), age_days=0.5)
+        self.assertNotEqual(res["band"], "TOO_ESTABLISHED")
+        self.assertEqual(res["market_pool"], young[0]["pairAddress"])
+
     def test_parse_dexscreener(self):
         sol = ts.SOL_TOKEN
         with mock.patch.object(market, "_ds", return_value=ds_response(token=sol, chain="solana")) as ds:

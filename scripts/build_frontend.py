@@ -1064,6 +1064,8 @@ rep("@media (max-width:640px){\n",
 # Свечи — GET /api/chart?token= отдельным запросом после вердикта (handleResult), пока грузится — skeleton.
 # SVG собирается строкой (chartHtml) в div с ref и перерисовывается при смене ширины.
 # stale_at (GT не ответил, отдан последний удачный чарт) — подпись «chart as of HH:MM UTC» в шапке блока.
+# Виджет GeckoTerminal (iframe) вместо SVG: TOO ESTABLISHED — всегда, обычный скан — когда свечей нет; без стрелки
+# rug, причины остаются. Нет ни пула, ни пары — карточка «chart temporarily unavailable».
 # rug из результата: красная пунктирная стрелка от now до now × level_factor, подпись и причины (parts).
 # ---------------------------------------------------------------------------
 CHART_JS = r"""// ---- price chart + probably rug (GET /api/chart after the verdict) ----
@@ -1096,6 +1098,19 @@ const SRC_LABEL={gt:'GeckoTerminal',dexscreener:'DexScreener'};
 const srcLabel=s=>SRC_LABEL[s]||'GeckoTerminal';
 function chartFail(){   // чарт не отрисовался (ошибка в рендере): карточка вместо блока, страница живёт дальше
   return `<div data-chart-empty="1" style="padding:26px 20px 24px;font-family:${MONO_F};font-size:13px;color:#8a959c">chart temporarily unavailable</div>`;
+}
+// виджет GeckoTerminal (грузится в браузере пользователя, лимиты GT нашего сервера его не касаются):
+// у TOO ESTABLISHED — всегда, у обычного скана — когда /api/chart не дал свечей. Адрес пула — из /api/chart
+// или market_pool результата (у DexScreener адрес пары = адрес пула GT). Сеть GT = сеть токена.
+function widgetUrl(ca,pool){
+  return pool?`https://www.geckoterminal.com/${chainOf(ca)}/pools/${encodeURIComponent(pool)}?embed=1&info=0&swaps=0&grayscale=0&light_chart=0`:null;
+}
+function chartWidget(url,rug,W){
+  const H=W<640?230:300;
+  return `<div style="display:flex;justify-content:space-between;gap:12px;padding:14px 20px 0;font-family:${MONO_F};font-size:11px;color:#5f6b72"><span>price</span><span data-chart-src="1">GeckoTerminal</span></div>`
+    +`<div style="padding:8px 12px 10px"><iframe data-chart-widget="1" src="${escH(url)}" title="price chart" loading="lazy" frameborder="0" `
+    +`sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox" referrerpolicy="strict-origin-when-cross-origin" `
+    +`style="display:block;width:100%;height:${H}px;border:0;border-radius:8px;background:#090c0f"></iframe></div>`+rugReasons(rug);
 }
 function chartHtml(st,rug,hdrPrice,W,src){
   const mob=W<640, H=mob?230:300, sw=W-24;
@@ -1190,10 +1205,16 @@ rep("  handleResult(r){this.m.result=r; this.bump();}",
     "  paintChart(){   // ошибка в чарте не ломает рендер страницы и анимацию пауков\n"
     "    const el=this.chartRef.current, m=this.m; if(!el||!m.chart||!el.clientWidth) return;\n"
     "    const raw=(m.result&&m.result.raw)||{}, rug=raw.rug||null, W=el.clientWidth, src=raw.market_source||'';\n"
-    "    const key=[m.ca,m.chart.status,W,rug?rug.drop:0,src].join('|'); if(el.dataset.k===key) return;\n"
-    "    el.dataset.k=key;\n"
-    "    try{el.innerHTML=chartHtml(m.chart,rug,(raw.header||{}).price_usd,W,src);}\n"
-    "    catch(err){el.innerHTML=chartFail(); console.warn('chart render failed',err);}\n"
+    "    try{\n"
+    "      // виджет: TOO ESTABLISHED — всегда; иначе — /api/chart ответил без свечей (сбой GT или пусто)\n"
+    "      const est=raw.band==='TOO_ESTABLISHED', d=m.chart.data||{};\n"
+    "      const noCandles=m.chart.status!=='loading'&&!(Array.isArray(d.candles)&&d.candles.length);\n"
+    "      const url=(est||noCandles)?widgetUrl(m.ca,d.pool||raw.market_pool):null;\n"
+    "      // ключ виджета без точной ширины: иначе iframe перезагружается при каждом resize\n"
+    "      const key=url?[m.ca,'w',url,W<640,rug?rug.drop:0].join('|'):[m.ca,m.chart.status,W,rug?rug.drop:0,src].join('|');\n"
+    "      if(el.dataset.k===key) return; el.dataset.k=key;\n"
+    "      el.innerHTML=url?chartWidget(url,rug,W):(est||noCandles)&&m.chart.status!=='loading'&&(d.unavailable||m.chart.status!=='ok'||est)?chartFail()+rugReasons(rug):chartHtml(m.chart,rug,(raw.header||{}).price_usd,W,src);\n"
+    "    }catch(err){el.dataset.k=''; el.innerHTML=chartFail(); console.warn('chart render failed',err);}\n"
     "  }")
 rep("  componentDidUpdate(){const el=this.logRef.current;",
     "  componentDidUpdate(){this.paintChart(); const el=this.logRef.current;")

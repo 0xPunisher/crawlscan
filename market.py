@@ -133,11 +133,13 @@ def _gt(path, budget=GT_BUDGET):
 
 
 def fetch_market(token, network="robinhood", now=None, budget=GT_BUDGET):
-    """{"name", "ticker", "price_usd", "mcap_usd", "fdv_usd", "liquidity_usd", "vol24h_usd", "age_days", "source"}
+    """{"name", "ticker", "price_usd", "mcap_usd", "fdv_usd", "liquidity_usd", "vol24h_usd", "age_days", "pool",
+    "source"}
     или {} при ошибке. Сначала GT (один запрос /tokens/{token}?include=top_pools, до GT_FIRST секунд),
     не ответил (429, ошибка, таймаут) — DexScreener (_ds_market); нет и его — GT ещё раз на остаток бюджета.
     mcap — market cap, иначе fdv; liquidity — сумма пулов; age_days — от самого раннего пула (None без дат).
-    source — "gt" | "dexscreener". Удачный итог кэшируется по токену на GT_CACHE_TTL (общий для обоих источников).
+    pool — адрес самого ликвидного пула (GT) / пары (DexScreener; у Solana и Robinhood это тот же адрес пула,
+    что у GT) — для виджета чарта на фронте. source — "gt" | "dexscreener". Удачный итог кэшируется по токену на GT_CACHE_TTL (общий для обоих источников).
     network — сеть GT: "robinhood" | "solana" (адреса Solana регистрозависимы, их не приводим к нижнему регистру).
     budget — секунд на все попытки (движок ждёт ответ в фоне дольше, чем шапку)."""
     tok = token.lower() if network == "robinhood" else token
@@ -176,11 +178,15 @@ def _gt_market(d, now=None):
     born = [_ts((p.get("attributes") or {}).get("pool_created_at")) for p in d.get("included") or []
             if p.get("type") == "pool"]
     born = [b for b in born if b]
+    pools = [(f((p.get("attributes") or {}).get("reserve_in_usd")) or 0.0, (p.get("attributes") or {}).get("address"))
+             for p in d.get("included") or [] if p.get("type") == "pool"]
+    pools = [p for p in pools if p[1]]
     return {"name": a.get("name"), "ticker": a.get("symbol"), "price_usd": f(a.get("price_usd")),
             "mcap_usd": f(a.get("market_cap_usd")) or f(a.get("fdv_usd")), "fdv_usd": f(a.get("fdv_usd")),
             "liquidity_usd": f(a.get("total_reserve_in_usd")),
             "vol24h_usd": f((a.get("volume_usd") or {}).get("h24")),
-            "age_days": round(((now or time.time()) - min(born)) / 86400, 1) if born else None, "source": "gt"}
+            "age_days": round(((now or time.time()) - min(born)) / 86400, 1) if born else None,
+            "pool": max(pools)[1] if pools else None, "source": "gt"}
 
 
 def _ds(url, budget):
@@ -228,7 +234,7 @@ def _ds_market(tok, network, now=None, budget=DS_BUDGET):
             "liquidity_usd": sum(liq(p) for p in pairs) or None,
             "vol24h_usd": sum(v for v in vols if v) if any(v is not None for v in vols) else None,
             "age_days": round(((now or time.time()) - min(born)) / 86400, 1) if born else None,
-            "source": "dexscreener"}
+            "pool": max(pairs, key=liq).get("pairAddress"), "source": "dexscreener"}
 
 
 def _ts(iso):
