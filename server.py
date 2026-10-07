@@ -15,6 +15,7 @@ Read-only: скан идёт в фоне, браузер опрашивает с
   GET  /                                 -> index.html
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
   GET  /health
+  HEAD — на любой GET-путь: те же код и заголовки, без тела
 
 Розыгрыш среди холдеров (только при DRAW_ENABLED=true, иначе 404; status отвечает всегда):
   GET  /api/draw/status                  -> включено ли, токен, следующий розыгрыш, снимки и веса за сегодня
@@ -277,7 +278,8 @@ class H(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(b)))
         self.send_header("cache-control", cache)
         self.end_headers()
-        self.wfile.write(b)
+        if self.command != "HEAD":
+            self.wfile.write(b)
 
     def _send_page(self, path):
         """index.html с Cache-Control: no-cache, ETag и Last-Modified: после деплоя браузер сразу видит новую
@@ -314,7 +316,8 @@ class H(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/html; charset=utf-8")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _job(self, q):
         jid = (q.get("job") or [""])[0]
@@ -406,6 +409,10 @@ class H(BaseHTTPRequestHandler):
             return self._send(400, {"error": str(e)})
         except (ValueError, AttributeError):
             return self._send(400, {"error": "bad json"})
+
+    def do_HEAD(self):
+        """HEAD = GET без тела: те же код и заголовки (content-length — как у GET), тело не пишется (_send, _send_page)."""
+        return self.do_GET()
 
     def do_GET(self):
         u = urlparse(self.path)

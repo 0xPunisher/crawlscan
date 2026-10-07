@@ -210,6 +210,34 @@ class TestPageCache(unittest.TestCase):
         self.assertEqual((code, body), (200, b"<html>v2 with early buyers</html>"))
         self.assertNotEqual(h["etag"], old)
 
+    def head(self, path="/", **headers):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            c.request("HEAD", path, headers=headers)
+            r = c.getresponse()
+            return r.status, r.read(), {k.lower(): v for k, v in r.getheaders()}
+        finally:
+            c.close()
+
+    def test_head(self):
+        code, body, h = self.get("/")
+        for path in ("/", "/index.html", "/?ca=0x" + "ab" * 20):
+            hc, hb, hh = self.head(path)
+            self.assertEqual((hc, hb), (200, b""), path)                         # без тела
+            for k in ("cache-control", "etag", "last-modified", "content-type", "content-length"):
+                self.assertEqual(hh[k], h[k], (path, k))                          # заголовки — как у GET
+        self.assertEqual(self.head(**{"If-None-Match": h["etag"]})[:2], (304, b""))
+        hc, hb, hh = self.head("/health")
+        self.assertEqual((hc, hb, hh["cache-control"], hh["content-length"]), (200, b"", "no-store", "12"))
+        self.assertEqual(self.head("/nope")[:2], (404, b""))
+        with mock.patch.object(server, "ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+            gc, gb, gh = self.get("/favicon.svg")
+            hc, hb, hh = self.head("/favicon.svg")
+        self.assertEqual((hc, hb, hh["cache-control"], hh["content-length"]),
+                         (200, b"", "public, max-age=86400", str(len(gb))))
+        self.assertEqual(self.get("/")[:2], (code, body))                         # соединение и GET после HEAD — как были
+
     def test_missing_page(self):
         os.remove(self.page)
         self.assertEqual(self.get()[:2], (200, b"<h1>rh-crawler</h1>"))
