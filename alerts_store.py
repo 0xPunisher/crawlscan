@@ -93,3 +93,22 @@ class AlertsStore:
         """Действующие подписки чата, старые первыми."""
         with self._lock:
             return self._watches(chat_id, int(now if now is not None else time.time()))
+
+    def watchers(self, token, now=None):
+        """chat_id действующих подписчиков токена; истёкшие подписки удаляются."""
+        now = int(now if now is not None else time.time())
+        with self._lock, self.db:
+            self.db.execute("DELETE FROM alert_watches WHERE expires_at <= ?", (now,))
+            return [r["chat_id"] for r in self.db.execute(
+                "SELECT chat_id FROM alert_watches WHERE token = ? ORDER BY rowid", (token,)).fetchall()]
+
+    def is_watching(self, chat_id, token, now=None):
+        now = int(now if now is not None else time.time())
+        with self._lock:
+            return self.db.execute("SELECT 1 FROM alert_watches WHERE chat_id = ? AND token = ? AND expires_at > ?",
+                                   (chat_id, token, now)).fetchone() is not None
+
+    def unwatch_chat(self, chat_id):
+        """Удалить все подписки чата (заблокировал бота). → сколько удалено."""
+        with self._lock, self.db:
+            return self.db.execute("DELETE FROM alert_watches WHERE chat_id = ?", (chat_id,)).rowcount

@@ -14,7 +14,7 @@ A, B, C, D = ("0x" + c * 40 for c in "abcd")
 
 
 def res(band="OK", score=70, rug=None, ops=None, holders=None, token=T, chain="robinhood"):
-    return {"token": token, "chain": chain, "band": band, "score": score, "rug": rug,
+    return {"token": token, "chain": chain, "band": band, "score": score, "rug": rug, "header": {"ticker": "AAA"},
             "operators": ops if ops is not None else [{"wallets": [A, B], "share_supply": 0.10}],
             "holders": holders if holders is not None else [{"wallet": A, "share_supply": 0.06},
                                                             {"wallet": B, "share_supply": 0.04},
@@ -33,7 +33,7 @@ class TestSnapshot(unittest.TestCase):
 
     def test_fields(self):
         s = alerts.snapshot(res(band="DANGER", score=12, rug={"drop": 0.7234567891}), 0.123456789, ts=5)
-        self.assertEqual(s, {"token": T, "chain": "robinhood", "ts": 5, "band": "DANGER", "score": 12,
+        self.assertEqual(s, {"token": T, "chain": "robinhood", "ticker": "AAA", "ts": 5, "band": "DANGER", "score": 12,
                              "rug": True, "rug_drop": 0.723457,
                              "operator": {"wallets": [A, B], "share_supply": 0.1},
                              "top": {A: 0.06, B: 0.04, C: 0.02}, "early_share": 0.123457})

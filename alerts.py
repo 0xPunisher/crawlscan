@@ -3,9 +3,10 @@
 Шаг A1: снимок результата скана по токену (snapshot) и сравнение двух снимков (diff) → список важных
 изменений с коротким текстом на английском. Хранение снимков — alerts_store.py, запись — server.record_snapshot.
 Шаг A2: подписки чатов на токены (alerts_store, API /api/alerts/* в server.py, команды бота), без отправки.
+Шаг A3: текст уведомления (message); очередь и отправка — alerts_notify.py.
 Всё за выключателем ALERTS_ENABLED (по умолчанию выключено).
 """
-import os, time
+import html, os, time
 
 BAND_RANK = {"DANGER": 0, "RISKY": 1, "OK": 2, "CLEAN": 3}   # вердикты со скором; остальные не сравниваются
 VERDICT_MIN_MOVE = 8         # смена полосы без DANGER (CLEAN↔OK, OK↔RISKY) — только если скор сдвинулся на ≥ 8
@@ -16,6 +17,9 @@ EARLY_MIN_SHARE = 0.005      # ... если была ≥ 0.5% сапплая
 ROUND = 6                    # знаков у долей в снимке
 WATCH_LIMIT = 3              # токенов в подписке на один чат
 WATCH_DAYS = 7               # подписка живёт столько дней (повторный watch продлевает)
+WEBSITE = "https://crawlscan.fun"
+CHAIN_NAME = {"robinhood": "Robinhood Chain", "solana": "Solana"}
+BAND_ICON = {"CLEAN": "🟢", "OK": "🟡", "RISKY": "🟠", "DANGER": "🔴"}
 
 
 def enabled():
@@ -35,8 +39,10 @@ def snapshot(result, early_share=None, ts=None):
         return None
     score, rug, ops = result.get("score"), result.get("rug"), result.get("operators") or []
     big = ops[0] if ops else None
+    h = result.get("header") or {}
     return {
         "token": result["token"], "chain": result.get("chain") or "robinhood",
+        "ticker": h.get("ticker") or h.get("name") or None,
         "ts": int(ts if ts is not None else time.time()),
         "band": result["band"], "score": int(score) if isinstance(score, (int, float)) else None,
         "rug": bool(rug), "rug_drop": _r(rug.get("drop")) if rug else None,
@@ -92,3 +98,29 @@ def diff(old, new):
             out.append({"kind": "early_dropped", "fell": fell, "from": oe, "to": ne,
                         "text": f"Early buyers' share fell {fell * 100:.0f}% ({_pct(oe)} → {_pct(ne)} of supply)"})
     return out
+
+
+def _short(addr):
+    return f"{addr[:6]}…{addr[-4:]}" if len(addr) > 12 else addr
+
+
+def message(snap, changes, trade_url=None):
+    """Уведомление подписчику (HTML parse mode) → (текст, кнопки). snap — текущий снимок, changes — diff."""
+    e = lambda x: html.escape(str(x), quote=False)
+    token = snap["token"]
+    name = f"${e(snap['ticker'])}" if snap.get("ticker") else e(_short(token))
+    lines = [f"🔔 <b>{name}</b> · {CHAIN_NAME.get(snap.get('chain'), e(snap.get('chain') or ''))}", ""]
+    lines += [f"• {e(c['text'])}" for c in changes]
+    band = snap.get("band") or ""
+    lines.append("")
+    if snap.get("score") is not None:
+        lines.append(f"Now: {BAND_ICON.get(band, '⚪️')} <b>{e(band)}</b> · score {snap['score']}/100")
+    else:
+        lines.append(f"Now: <b>{e(band.replace('_', ' '))}</b>")
+    if snap.get("rug"):
+        drop = snap.get("rug_drop")
+        lines.append("⚠️ probably rug" + (f" −{drop * 100:.0f}%" if drop else ""))
+    row = [{"text": "Full report", "url": f"{WEBSITE}/?ca={token}"}]
+    if trade_url:
+        row.append({"text": "Trade on Axiom", "url": trade_url})
+    return "\n".join(lines), {"inline_keyboard": [row, [{"text": "🔕 Unwatch", "callback_data": f"unwatch:{token}"}]]}

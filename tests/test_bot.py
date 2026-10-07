@@ -636,6 +636,22 @@ class TestAlerts(unittest.TestCase):
                                               "message": {"chat": {"id": -100, "type": "supergroup"}}}})
         self.assertNotIn(-100, api.watches)
 
+    def test_unwatch_callback_from_notification(self):
+        """[Unwatch] под уведомлением сайта (callback_data из alerts.message)."""
+        import alerts
+        bot, tg, api = self.make()
+        bot.handle_update(private(f"/watch {RH}"))
+        _, markup = alerts.message({"token": RH.lower(), "chain": "robinhood", "band": "OK", "score": 70}, [])
+        data = markup["inline_keyboard"][1][0]["callback_data"]
+        bot.handle_update({"callback_query": {"id": "u", "data": data,
+                                              "message": {"chat": {"id": 1, "type": "private"}}}})
+        self.assertEqual(tg.of("answerCallbackQuery")[-1], {"callback_query_id": "u"})
+        self.assertEqual(self.last(tg), "🔕 Stopped watching 0x19dc…45e1.")
+        self.assertEqual(api.watches[1], {})
+        bot.handle_update({"callback_query": {"id": "v", "data": "unwatch:garbage",
+                                              "message": {"chat": {"id": 1, "type": "private"}}}})
+        self.assertEqual(self.last(tg), "🔕 Stopped watching 0x19dc…45e1.")   # мусор — без ответа
+
     def test_limit(self):
         bot, tg, _ = self.make()
         for a in (RH, RH_B, RH_C):

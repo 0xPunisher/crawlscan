@@ -9,7 +9,8 @@ ALERTS_API_SECRET — секрет API подписок сайта (нет — �
 
 Личка: адрес токена (или /scan <адрес>) → скан; /start, /help, /rewards. Группы: только /scan <адрес>
 и /rewards (и /scan@имябота, /rewards@имябота). Алерты (только личка, если на сайте /api/config → alerts и задан
-ALERTS_API_SECRET): /watch <адрес>, /watchlist, /unwatch <адрес>, кнопка [Watch] под вердиктом; иначе — «coming soon». /rewards — статус наград и сжиганий с сайта (/api/rewards/status). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
+ALERTS_API_SECRET): /watch <адрес>, /watchlist, /unwatch <адрес>, кнопка [Watch] под вердиктом, [Unwatch] под
+уведомлением (уведомления шлёт сайт); иначе — «coming soon». /rewards — статус наград и сжиганий с сайта (/api/rewards/status). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
 Лимиты: 1 скан на пользователя в USER_COOLDOWN секунд, не больше WORKERS сканов одновременно (остальные — в очереди).
 """
 import math, os, queue, sys, threading, time, traceback
@@ -162,10 +163,12 @@ class Bot:
         chat_id, data = chat.get("id"), cq.get("data") or ""
         if chat_id is None:
             return
-        if data.startswith("watch:") and chat.get("type") == "private":
-            found = T.find_address(data[len("watch:"):])
+        cmd, _, addr = data.partition(":")
+        if cmd in ("watch", "unwatch") and addr and chat.get("type") == "private":
+            # [Watch] под вердиктом, [Unwatch] под уведомлением сайта (alerts_notify)
+            found = T.find_address(addr)
             if found:
-                self.alerts_command(chat_id, "watch", found[1])
+                self.alerts_command(chat_id, cmd, found[1])
         elif data == "scan":
             self.send(chat_id, T.ASK_ADDRESS)
         elif data == "help":

@@ -42,7 +42,8 @@ Alerts, подписки для бота (только при ALERTS_ENABLED=tru
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
 Лента /api/recent кэшируется 20 секунд; запись — после завершения скана, сбой базы скан не ломает.
-При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан.
+При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан;
+изменился важный показатель — уведомление подписчикам в Telegram (alerts_notify.py, свой поток, TG_BOT_TOKEN).
 Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
 """
 import hashlib, hmac, json, os, re, threading, time, uuid
@@ -51,6 +52,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import alerts
+import alerts_notify
 import detect
 import early
 import engine
@@ -270,15 +272,40 @@ def alerts_store():
         return _alerts_stores[path]
 
 
+_notifier = {"obj": None, "warned": False}
+
+
+def notifier():
+    """Отправщик уведомлений (свой фоновый поток, alerts_notify) или None без TG_BOT_TOKEN — тогда одно
+    предупреждение в лог. Токен нигде не печатается."""
+    token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    with _stores_lock:
+        if not token:
+            if not _notifier["warned"]:
+                _notifier["warned"] = True
+                print("alerts: TG_BOT_TOKEN is not set, notifications are not sent", flush=True)
+            return None
+        if _notifier["obj"] is None:
+            _notifier["obj"] = alerts_notify.Notifier(alerts_store, alerts_notify.telegram(token)).start()
+        return _notifier["obj"]
+
+
 def record_snapshot(result):
     """Снимок завершённого скана для alerts (только при ALERTS_ENABLED). Вызывается после done, как лента:
-    клиент уже получил вердикт; сбой базы только логируется."""
+    клиент уже получил вердикт; сбой базы только логируется. diff со старым снимком не пуст — событие в очередь
+    уведомлений (подписчиков ищет и шлёт фоновый поток; здесь — без сети и ожидания)."""
     if not alerts.enabled():
         return
     try:
         snap = alerts.snapshot(result, early.known_share(result.get("chain"), result.get("token")))
-        if snap:
-            alerts_store().record(snap)
+        if not snap:
+            return
+        prev, cur = alerts_store().record(snap)
+        changes = alerts.diff(prev, cur)
+        if changes:
+            n = notifier()
+            if n:
+                n.push(prev, cur, changes)
     except Exception as e:
         print(f"alerts: snapshot not saved: {type(e).__name__}: {e}", flush=True)
 

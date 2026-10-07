@@ -6,11 +6,12 @@ API = "https://api.telegram.org"
 
 
 class TelegramError(Exception):
-    """Ответ Bot API с ok=false или сбой сети. code — HTTP-код (409 — второй экземпляр бота), 0 — сеть."""
+    """Ответ Bot API с ok=false или сбой сети. code — HTTP-код (409 — второй экземпляр бота), 0 — сеть.
+    retry_after — секунды из parameters ответа 429."""
 
-    def __init__(self, code, description):
+    def __init__(self, code, description, retry_after=None):
         super().__init__(f"{code}: {description}")
-        self.code, self.description = code, description
+        self.code, self.description, self.retry_after = code, description, retry_after
 
 
 class Telegram:
@@ -59,5 +60,6 @@ class Telegram:
         except (OSError, ValueError) as e:   # URLError, таймаут, обрыв, не JSON
             raise TelegramError(0, self.redact(e)) from None
         if not data.get("ok"):
-            raise TelegramError(data.get("error_code", 0), self.redact(data.get("description", "unknown error")))
+            raise TelegramError(data.get("error_code", 0), self.redact(data.get("description", "unknown error")),
+                                (data.get("parameters") or {}).get("retry_after"))
         return data.get("result")
