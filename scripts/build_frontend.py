@@ -1278,7 +1278,8 @@ rep(REASON, REASON.replace('</span>\n', '</span>\n              ' + TRADE_BTN, 1
 
 # ---------------------------------------------------------------------------
 # «too established» (band TOO_ESTABLISHED): полный скан не запускался. На странице результата — шапка,
-# чарт, карточка вердикта (TOO ESTABLISHED, без скора, заголовок и пояснение) и Trade on Axiom;
+# чарт, карточка вердикта (TOO ESTABLISHED, без скора, заголовок и пояснение, Trade on Axiom, new crawl без copy link)
+# и рядом карточка token stats (возраст, капа, ликвидность, объём 24ч из GT; на телефоне — под вердиктом);
 # таблица холдеров, части скора, факты и «What the crawlers checked» скрыты (data-est="1" на main).
 # В ленте — пометка «too established» вместо скора.
 # ---------------------------------------------------------------------------
@@ -1292,14 +1293,34 @@ rep('<div style="margin-top:56px;display:flex;flex-direction:column;gap:18px">',
     '<div class="cs-crit" style="margin-top:56px;display:flex;flex-direction:column;gap:18px">')
 rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}"
     "\n[data-est=\"1\"] .cs-facts,[data-est=\"1\"] .cs-scan-table,[data-est=\"1\"] .cs-parts,[data-est=\"1\"] .cs-crit,"
-    "[data-est=\"1\"] .cs-score{display:none!important}"
-    "\n[data-est=\"1\"] aside{max-width:720px!important}\n")
-rep("  blank(ca){return {", """  estVals(){   // too established: полный скан не запускался
-    const dn=this.state.view==='scan'&&this.m&&this.m.done;
-    return {estFlag:dn&&dn.band==='TOO ESTABLISHED'?'1':'0'};
+    "[data-est=\"1\"] .cs-score,[data-est=\"1\"] .cs-copylink{display:none!important}"
+    "\n[data-est=\"1\"] aside,.cs-est-stats{flex:1 1 0!important;max-width:none!important;align-self:stretch;position:static!important}"
+    "\n[data-est=\"1\"] aside>div{flex:1}"
+    "\n@media (max-width:640px){[data-est=\"1\"] aside,.cs-est-stats{flex:1 1 100%!important}}\n")
+rep("  blank(ca){return {", """  estVals(){   // too established: полный скан не запускался; карточка token stats — числа GT (нет числа — нет строки)
+    const dn=this.state.view==='scan'&&this.m&&this.m.done, on=!!dn&&dn.band==='TOO ESTABLISHED';
+    const raw=on&&this.m.result&&this.m.result.raw||{}, est=raw.established||{}, h=raw.header||{};
+    const num=v=>typeof v==='number'&&isFinite(v), age=est.age_days, mcap=num(est.mcap_usd)?est.mcap_usd:h.mcap_usd;
+    const liq=num(est.liquidity_usd)?est.liquidity_usd:h.liquidity_usd;
+    const stats=[['age',num(age)?Math.floor(age).toLocaleString('en-US')+(Math.floor(age)===1?' day':' days'):null],
+      ['market cap',num(mcap)?fmtUsd(mcap):null],['liquidity · all pools',num(liq)?fmtUsd(liq):null],
+      ['24h volume',num(h.vol24h_usd)?fmtUsd(h.vol24h_usd):null]].filter(x=>x[1]).map(([label,value])=>({label,value}));
+    return {estFlag:on?'1':'0', estStatsOn:on&&!!this.m.result&&stats.length>0, estStats:stats};
   }
   blank(ca){return {""")
 rep("      ...this.tradeVals(),", "      ...this.tradeVals(),\n      ...this.estVals(),")
+# карточка token stats справа от вердикта (только TOO ESTABLISHED), стиль — как у карточки вердикта
+STATS_CARD = (f'          <sc-if value="{{{{estStatsOn}}}}" hint-placeholder-val="{{{{false}}}}"><div class="cs-est-stats" style="min-width:0;display:flex;flex-direction:column">'
+              '<div data-est-stats="1" style="flex:1;border:1px solid #141b20;border-radius:14px;background:#090c0f;padding:26px 26px 24px;'
+              'display:flex;flex-direction:column;gap:18px;box-sizing:border-box">\n'
+              f'            <div style="display:flex;justify-content:space-between;align-items:center;{MONO};font-size:11px;color:#5f6b72"><span>token stats</span><span>GeckoTerminal</span></div>\n'
+              f'            <sc-for list="{{{{estStats}}}}" as="x" hint-placeholder-count="4"><div style="display:flex;justify-content:space-between;align-items:baseline;gap:16px;padding:14px 0;border-top:1px solid #141b20">'
+              f'<span style="{MONO};font-size:12px;color:#8a959c">{{{{x.label}}}}</span>'
+              f'<span style="{MONO};font-size:22px;color:#eef1f3;font-variant-numeric:tabular-nums;white-space:nowrap">{{{{x.value}}}}</span></div></sc-for>\n'
+              '          </div></div></sc-if>\n')
+rep('          </aside>\n', '          </aside>\n' + STATS_CARD)
+# copy link — класс, чтобы скрыть в TOO ESTABLISHED (в обычных сканах остаётся)
+rep('<button data-grip="1" sc-camel-on-click="{{copyLink}}"', '<button class="cs-copylink" data-grip="1" sc-camel-on-click="{{copyLink}}"')
 # число скора скрыто (его нет); в логе вердикта без «null» (и для TOO EARLY)
 rep('<div data-grip="1" style="display:flex;align-items:baseline;gap:8px">',
     '<div class="cs-score" data-grip="1" style="display:flex;align-items:baseline;gap:8px">')
