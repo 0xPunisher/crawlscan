@@ -116,12 +116,12 @@ def wait(seconds):
     return f"⏳ please wait {seconds} s"
 
 
-def report_button(addr, trade_url=None):
-    """[Full report] и, если есть ссылка, [Trade on Axiom] в одном ряду."""
+def report_button(addr, trade_url=None, watch=False):
+    """[Full report] и, если есть ссылка, [Trade on Axiom] в одном ряду; watch — второй ряд [Watch]."""
     row = [{"text": "Full report", "url": f"{WEBSITE}/?ca={addr}"}]
     if trade_url:
         row.append({"text": "Trade on Axiom", "url": trade_url})
-    return {"inline_keyboard": [row]}
+    return {"inline_keyboard": [row] + ([watch_button(addr)] if watch else [])}
 
 
 def rejected(addr, error):
@@ -305,3 +305,62 @@ def rewards(st):
         when = f" · {_utc(lb['time'])}" if lb.get("time") else ""
         lines.append(f"Last burn: {tokens(lb.get('amount_tokens'))} $CrawlScan{when} · {tx_link(lb['tx'])}")
     return "\n".join(lines)
+
+
+# ---------- alerts: /watch, /watchlist, /unwatch ----------
+ALERTS_SOON = "🔔 Alerts are coming soon."
+WATCH_USAGE = "Usage: /watch &lt;token address&gt;"
+UNWATCH_USAGE = "Usage: /unwatch &lt;token address&gt;"
+WATCH_WHAT = ("I'll message you when something important changes: the verdict, a probably rug warning, "
+              "the biggest operator selling, or early buyers exiting. Alerts arrive within about 15 minutes.")
+
+
+def watch_button(addr):
+    """Ряд [Watch] под вердиктом (только личка, алерты включены). callback_data ≤ 64 байт: адрес ≤ 44 символов."""
+    return [{"text": "🔔 Watch", "callback_data": f"watch:{addr}"}]
+
+
+def expires_in(ts, now):
+    """Сколько осталось подписке: "6d 23h", "5h", "<1h"."""
+    s = int(ts - now)
+    d, h = s // 86400, s // 3600 % 24
+    if d:
+        return f"{d}d {h}h" if h else f"{d}d"
+    return f"{h}h" if h else "<1h"
+
+
+def _watch_line(w, now):
+    return (f"• <code>{e(w['token'])}</code>\n  {CHAIN_NAME.get(w.get('chain'), e(w.get('chain', '')))} · "
+            f"expires in {expires_in(w['expires_at'], now)}")
+
+
+def watching(r):
+    """Ответ /api/alerts/watch (200) → HTML."""
+    head = (f"🔔 Still watching {e(short(r['token']))}, extended to {r['days']} days." if r.get("renewed")
+            else f"🔔 Watching {e(short(r['token']))} for {r['days']} days.")
+    return (f"{head}\n\n{WATCH_WHAT}\n\n"
+            f"Watching {len(r.get('items') or [])}/{r['limit']} tokens · /watchlist · /unwatch &lt;address&gt;")
+
+
+def watch_limit(r, now):
+    """409: уже limit токенов."""
+    return "\n".join([f"You're already watching {r['limit']} tokens, the maximum. /unwatch one first:", ""]
+                     + [_watch_line(w, now) for w in r.get("items") or []])
+
+
+def watch_established(addr):
+    return f"🏛 {e(short(addr))} is too established for CrawlScan, so it can't be watched."
+
+
+def unwatched(r):
+    if r.get("removed"):
+        return f"🔕 Stopped watching {e(short(r['token']))}."
+    return f"You weren't watching {e(short(r['token']))}. /watchlist shows what you watch."
+
+
+def watchlist(r, now):
+    items = r.get("items") or []
+    if not items:
+        return "You're not watching any tokens. Send /watch &lt;address&gt; or tap Watch under a verdict."
+    return "\n".join([f"🔔 <b>Watching {len(items)}/{r['limit']} tokens</b>", ""]
+                     + [_watch_line(w, now) for w in items] + ["", "/unwatch &lt;address&gt; to stop."])

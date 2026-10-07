@@ -10,7 +10,7 @@ Read-only: скан идёт в фоне, браузер опрашивает с
                                             первые 20 покупателей и их статус сейчас (early.py); в скан не входит
   GET  /api/recent?limit=12              -> {"items": [{"token", "chain", "ticker", "name", "score", "band", "rug", "ts"}]}
                                             лента «Recently scanned»: последние уникальные токены, новые сверху
-  GET  /api/config                       -> {"solana": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
+  GET  /api/config                       -> {"solana": bool, "alerts": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
                                             шаблоны ссылки Trade on Axiom ({address}), env TRADE_URL_* (trade.py)
   GET  /                                 -> index.html
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
@@ -33,6 +33,12 @@ Token Burn & Holder Rewards, Robinhood (только при REWARDS_ENABLED=true
   GET  /api/rewards/<YYYY-MM-DD>/participants -> полный список участников с весами
   GET  /api/rewards/<YYYY-MM-DD>/verify  -> входные данные и пересчёт победителя
 
+Alerts, подписки для бота (только при ALERTS_ENABLED=true, иначе 404; X-Alerts-Secret == ALERTS_API_SECRET, иначе 403):
+  POST /api/alerts/watch {"chat_id", "token"}   -> подписка на WATCH_DAYS дней; 409 — уже WATCH_LIMIT токенов,
+                                                   422 — токен too established, 400 — плохой адрес
+  POST /api/alerts/unwatch {"chat_id", "token"} -> {"ok", "removed"}
+  GET  /api/alerts/list?chat_id=N               -> {"items": [{"token", "chain", "created_at", "expires_at"}], ...}
+
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
 Лента /api/recent кэшируется 20 секунд; запись — после завершения скана, сбой базы скан не ломает.
@@ -45,6 +51,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import alerts
+import detect
 import early
 import engine
 import market
@@ -276,6 +283,89 @@ def record_snapshot(result):
         print(f"alerts: snapshot not saved: {type(e).__name__}: {e}", flush=True)
 
 
+def record_early(body):
+    """/api/early посчитал блок → доля ранних покупателей в последний снимок токена (только при ALERTS_ENABLED).
+    Вызывается после ответа клиенту; без сети; сбой только логируется. Устаревший ответ (stale_at) и ошибки не пишутся."""
+    if not alerts.enabled():
+        return
+    try:
+        if body.get("available") and not body.get("error") and not body.get("stale_at") and body.get("summary"):
+            alerts_store().set_early(body["token"], body["summary"]["now_share_supply"])
+    except Exception as e:
+        print(f"alerts: early share not saved: {type(e).__name__}: {e}", flush=True)
+
+
+WATCH_MARKET_BUDGET = 3.0  # секунд на проверку «too established» при подписке на токен, который ещё не сканировали
+TOO_ESTABLISHED_WATCH = "This token is too established for CrawlScan, so it can't be watched."
+WATCH_LIMIT_TEXT = f"You can watch up to {alerts.WATCH_LIMIT} tokens. Unwatch one first."
+
+
+def too_established(chain, token):
+    """Можно ли подписать: последний снимок, вердикт too established в кэше или рынок (GT / DexScreener, кэш 15 мин;
+    в блокчейн не ходим). Рынок не ответил — подписываем (плановая перепроверка отпишет)."""
+    try:
+        _, cur = alerts_store().get(token)
+    except Exception:
+        cur = None
+    if cur and cur.get("band") == detect.TOO_ESTABLISHED:
+        return True
+    network, limits = engine.GT_NETWORK[chain], engine.established_limits()
+    cached = market.established_get(token, network)
+    if cached is not None:
+        return detect.too_established(cached, limits)
+    try:
+        gt = market.fetch_market(token, network, budget=WATCH_MARKET_BUDGET)
+    except Exception:
+        return False
+    if detect.too_established(gt, limits):
+        market.established_put(token, network, gt)
+        return True
+    return False
+
+
+def alerts_secret_ok(header):
+    """X-Alerts-Secret == ALERTS_API_SECRET за постоянное время; секрет не задан — всегда нет. Нигде не логируется."""
+    secret = os.environ.get("ALERTS_API_SECRET", "")
+    return bool(secret) and hmac.compare_digest((header or "").encode(), secret.encode())
+
+
+def _chat_id(v):
+    if isinstance(v, bool):
+        raise ValueError
+    if isinstance(v, str):
+        v = int(v)
+    if not isinstance(v, int):
+        raise ValueError
+    return v
+
+
+def alerts_api(method, path, body, q):
+    """/api/alerts/* → (код, тело). Выключатель и секрет проверяет вызывающий."""
+    try:
+        chat_id = _chat_id((q.get("chat_id") or [None])[0] if method == "GET" else body.get("chat_id"))
+    except (ValueError, TypeError, AttributeError):
+        return 400, {"error": "need chat_id"}
+    store, now = alerts_store(), int(time.time())
+    meta = {"limit": alerts.WATCH_LIMIT, "days": alerts.WATCH_DAYS}
+    if method == "GET" and path == "/api/alerts/list":
+        return 200, {"chat_id": chat_id, "items": store.watches(chat_id, now)} | meta
+    if method != "POST" or path not in ("/api/alerts/watch", "/api/alerts/unwatch"):
+        return 404, {"error": "not found"}
+    try:
+        chain, token = engine.chain_of(body.get("token"))
+    except engine.ScanError as e:
+        return 400, {"error": str(e)}
+    if path == "/api/alerts/unwatch":
+        removed = store.unwatch(chat_id, token)
+        return 200, {"ok": True, "token": token, "removed": removed, "items": store.watches(chat_id, now)} | meta
+    if too_established(chain, token):
+        return 422, {"error": "too established", "message": TOO_ESTABLISHED_WATCH, "token": token}
+    status, w, items = store.watch(chat_id, token, chain, now)
+    if status == "limit":
+        return 409, {"error": "watch limit", "message": WATCH_LIMIT_TEXT, "items": items} | meta
+    return 200, {"ok": True, "renewed": status == "renewed", **w, "items": items} | meta
+
+
 def get_recent(limit):
     """Ответ /api/recent с кэшем RECENT_TTL. Сбой базы — пустая лента, не ошибка."""
     now = time.time()
@@ -424,7 +514,30 @@ class H(BaseHTTPRequestHandler):
         body = rs.participants_json(store, day) if what == "participants" else rs.verify_json(store, day)
         return self._send(200, body) if body else self._send(404, {"error": "no draw for this day"})
 
+    def _alerts(self, method, path, q):
+        if not alerts.enabled():
+            return self._send(404, {"error": "alerts are disabled"})
+        if not alerts_secret_ok(self.headers.get("X-Alerts-Secret")):
+            return self._send(403, {"error": "forbidden"})
+        body = {}
+        if method == "POST":
+            try:
+                n = int(self.headers.get("content-length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError
+            except ValueError:
+                return self._send(400, {"error": "bad json"})
+        try:
+            return self._send(*alerts_api(method, path, body, q))
+        except Exception as e:   # сбой базы и т.п.: бот покажет «недоступно»
+            print(f"alerts: {path} failed: {type(e).__name__}: {e}", flush=True)
+            return self._send(500, {"error": "alerts temporarily unavailable"})
+
     def do_POST(self):
+        u = urlparse(self.path)
+        if u.path.startswith("/api/alerts/"):
+            return self._alerts("POST", u.path, parse_qs(u.query))
         m = DRAW_PATH.match(urlparse(self.path).path)
         if m and m.group(2) == "payout":
             return self._draw_payout(m.group(1))
@@ -452,8 +565,11 @@ class H(BaseHTTPRequestHandler):
             return self._draw_get(u.path, q)
         if u.path.startswith("/api/rewards/"):
             return self._rewards_get(u.path, q)
-        if u.path == "/api/config":  # фронт: какие сети включены (Solana — флаг SOLANA_ENABLED), шаблоны Trade on Axiom
-            return self._send(200, {"solana": engine.solana_enabled(), "trade": trade.templates()})
+        if u.path.startswith("/api/alerts/"):
+            return self._alerts("GET", u.path, q)
+        if u.path == "/api/config":  # фронт и бот: какие сети включены (SOLANA_ENABLED), алерты (ALERTS_ENABLED), Trade on Axiom
+            return self._send(200, {"solana": engine.solana_enabled(), "alerts": alerts.enabled(),
+                                    "trade": trade.templates()})
         if u.path == "/api/chart":
             try:
                 return self._send(200, get_chart((q.get("token") or [""])[0]))
@@ -462,9 +578,11 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/early":
             try:
                 token = (q.get("token") or [""])[0]
-                return self._send(200, early.get(token, scan_flags(engine.chain_of(token)[1])))
+                body = early.get(token, scan_flags(engine.chain_of(token)[1]))
             except engine.ScanError as e:
                 return self._send(400, {"error": str(e)})
+            self._send(200, body)
+            return record_early(body)
         if u.path == "/api/recent":
             try:
                 limit = min(50, max(1, int((q.get("limit") or [str(RECENT_DEFAULT)])[0])))

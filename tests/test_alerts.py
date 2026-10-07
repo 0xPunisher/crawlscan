@@ -63,6 +63,23 @@ class TestDiff(unittest.TestCase):
         self.assertEqual(ch[0]["text"], "Verdict improved: RISKY → CLEAN (score 45 → 85)")
         self.assertEqual(alerts.diff(snap(band="OK", score=61), snap(band="OK", score=79)), [])   # скор без смены полосы
 
+    def test_border_noise_is_silent(self):
+        self.assertEqual(alerts.diff(snap(band="CLEAN", score=80), snap(band="OK", score=78)), [])
+        self.assertEqual(alerts.diff(snap(band="OK", score=78), snap(band="CLEAN", score=81)), [])
+        self.assertEqual(alerts.diff(snap(band="OK", score=62), snap(band="RISKY", score=55)), [])      # 7 баллов
+        self.assertEqual(kinds(alerts.diff(snap(band="OK", score=62), snap(band="RISKY", score=54))),
+                         ["verdict_worse"])                                                           # 8 баллов
+        self.assertEqual(kinds(alerts.diff(snap(band="CLEAN", score=85), snap(band="OK", score=77))),
+                         ["verdict_worse"])
+
+    def test_danger_always(self):
+        ch = alerts.diff(snap(band="OK", score=61), snap(band="DANGER", score=59))   # жёсткое правило, скор почти тот же
+        self.assertEqual(ch[0]["text"], "Verdict worsened: OK → DANGER (score 61 → 59)")
+        ch = alerts.diff(snap(band="DANGER", score=38), snap(band="RISKY", score=41))
+        self.assertEqual(ch[0]["text"], "Verdict improved: DANGER → RISKY (score 38 → 41)")
+        ch = alerts.diff(snap(band="OK", score=None), snap(band="RISKY", score=None))   # скора нет — сообщаем
+        self.assertEqual(kinds(ch), ["verdict_worse"])
+
     def test_unranked_bands_not_compared(self):
         for a, b in (("TOO_EARLY_OR_LATE", "DANGER"), ("OK", "TOO_ESTABLISHED"), ("TOO_ESTABLISHED", "CLEAN")):
             self.assertNotIn("verdict_worse", kinds(alerts.diff(snap(band=a, score=None), snap(band=b, score=None))))
@@ -121,6 +138,8 @@ class TestDiff(unittest.TestCase):
 
 class TestStore(unittest.TestCase):
 
+    NOW = 1_800_000_000
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = AlertsStore(os.path.join(self.tmp.name, "a.db"))
@@ -140,6 +159,39 @@ class TestStore(unittest.TestCase):
         self.store.record(other)
         self.assertEqual(self.store.get("0x" + "22" * 20), (None, other))
         self.assertEqual(self.store.get(T), (s2, s3))
+
+    def test_set_early(self):
+        self.assertFalse(self.store.set_early(T, 0.1))                 # снимка нет — ничего не создаём
+        self.assertEqual(self.store.get(T), (None, None))
+        s1 = alerts.snapshot(res(), ts=1)
+        self.store.record(s1)
+        self.assertTrue(self.store.set_early(T, 0.123456789))
+        prev, cur = self.store.get(T)
+        self.assertEqual((prev, cur), (None, s1 | {"early_share": 0.123457}))
+
+    def test_watch_limit_and_renew(self):
+        tok = ["0x" + c * 40 for c in "123456"]
+        for i, t in enumerate(tok[:3]):
+            st, w, items = self.store.watch(1, t, "robinhood", now=self.NOW + i)
+            self.assertEqual((st, w["expires_at"], len(items)), ("ok", self.NOW + i + 7 * 86400, i + 1))
+        st, w, items = self.store.watch(1, tok[3], "robinhood", now=self.NOW + 10)
+        self.assertEqual((st, w, [x["token"] for x in items]), ("limit", None, tok[:3]))
+        st, w, items = self.store.watch(1, tok[0], "robinhood", now=self.NOW + 100)   # уже есть — продление
+        self.assertEqual((st, w["created_at"], w["expires_at"], len(items)),
+                         ("renewed", self.NOW, self.NOW + 100 + 7 * 86400, 3))
+        self.assertEqual(self.store.watch(2, tok[3], "robinhood", now=self.NOW)[0], "ok")   # другой чат — свой лимит
+        self.assertTrue(self.store.unwatch(1, tok[1]))
+        self.assertFalse(self.store.unwatch(1, tok[1]))
+        self.assertEqual(self.store.watch(1, tok[3], "robinhood", now=self.NOW + 200)[0], "ok")
+
+    def test_watch_expires_after_7_days(self):
+        t = "0x" + "77" * 20
+        self.store.watch(1, t, "robinhood", now=self.NOW)
+        self.assertEqual(len(self.store.watches(1, now=self.NOW + 7 * 86400 - 1)), 1)
+        self.assertEqual(self.store.watches(1, now=self.NOW + 7 * 86400), [])
+        for i, c in enumerate("abc"):     # истёкшая не занимает место в лимите
+            self.assertEqual(self.store.watch(1, "0x" + c * 40, "robinhood", now=self.NOW + 7 * 86400 + i)[0], "ok")
+        self.assertEqual(len(self.store.watches(1, now=self.NOW + 7 * 86400 + 5)), 3)
 
 
 class TestServerSnapshots(unittest.TestCase):
@@ -237,6 +289,42 @@ class TestServerSnapshots(unittest.TestCase):
         self.put_early(time.time() - early.STALE_TTL - 1)
         self.assertIsNone(early.known_share("robinhood", fakes.TOKEN))
 
+    def early_body(self, **kw):
+        return {"token": fakes.TOKEN, "chain": "robinhood", "available": True,
+                "summary": {"now_share_supply": 0.0812}} | kw
+
+    def test_early_written_into_last_snapshot(self):
+        self.scan(fakes.TOKEN)
+        with mock.patch.object(early, "get", return_value=self.early_body()):
+            e = self.get(f"/api/early?token={fakes.TOKEN}")
+        self.assertEqual(e["summary"]["now_share_supply"], 0.0812)
+        time.sleep(0.05)
+        prev, cur = server.alerts_store().get(fakes.TOKEN)
+        self.assertEqual((prev, cur["early_share"]), (None, 0.0812))
+
+    def test_early_stale_or_error_not_written(self):
+        self.scan(fakes.TOKEN)
+        for body in (self.early_body(stale_at=1), self.early_body(error="busy", summary=None),
+                     {"token": fakes.TOKEN, "chain": "robinhood", "available": False, "reason": "too established"}):
+            with mock.patch.object(early, "get", return_value=body):
+                self.get(f"/api/early?token={fakes.TOKEN}")
+        time.sleep(0.05)
+        self.assertIsNone(server.alerts_store().get(fakes.TOKEN)[1]["early_share"])
+
+    def test_early_db_failure_does_not_break_early(self):
+        with mock.patch.object(early, "get", return_value=self.early_body()), \
+                mock.patch.object(server, "alerts_store", side_effect=OSError("disk full")):
+            e = self.get(f"/api/early?token={fakes.TOKEN}")
+        self.assertEqual(e["summary"]["now_share_supply"], 0.0812)
+
+    def test_early_disabled_writes_nothing(self):
+        with mock.patch.dict(os.environ, {"ALERTS_ENABLED": "false"}), \
+                mock.patch.object(early, "get", return_value=self.early_body()), \
+                mock.patch.object(server, "AlertsStore", side_effect=AssertionError("store opened")):
+            e = self.get(f"/api/early?token={fakes.TOKEN}")
+        self.assertTrue(e["available"])
+        self.assertEqual(server._alerts_stores, {})
+
     def test_disabled_writes_nothing(self):
         with mock.patch.dict(os.environ, {"ALERTS_ENABLED": "false"}), \
                 mock.patch.object(server, "AlertsStore", side_effect=AssertionError("store opened")) as st, \
@@ -260,6 +348,167 @@ class TestServerSnapshots(unittest.TestCase):
         with mock.patch.object(AlertsStore, "record", side_effect=RuntimeError("locked")):
             d = self.scan(fakes.TOKEN)
         self.assertIn("result", d)
+
+
+
+SECRET = "s3cret-for-tests"
+RH2, RH3, RH4 = ("0x" + c * 40 for c in "234")
+
+
+class TestWatchAPI(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.H)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"DRAW_DB_PATH": os.path.join(self.tmp.name, "w.db"),
+                                                "ALERTS_ENABLED": "true", "ALERTS_API_SECRET": SECRET})
+        self.env.__enter__()
+        self.fakes = fakes.patched()     # market.fetch_market → {} (рынок не ответил), сети нет
+        self.fakes.__enter__()
+
+    def tearDown(self):
+        self.fakes.__exit__(None, None, None)
+        with server._stores_lock:
+            for st in server._alerts_stores.values():
+                st.close()
+            server._alerts_stores.clear()
+        self.env.__exit__(None, None, None)
+        self.tmp.cleanup()
+
+    def req(self, path, body=None, secret=SECRET):
+        headers = {"content-type": "application/json"}
+        if secret is not None:
+            headers["X-Alerts-Secret"] = secret
+        r = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
+                                   method="POST" if body is not None else "GET", headers=headers)
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def watch(self, token, chat=42, **kw):
+        return self.req("/api/alerts/watch", {"chat_id": chat, "token": token}, **kw)
+
+    def test_secret_required(self):
+        self.assertFalse(server.alerts_secret_ok("ключ"))          # не-ASCII — просто «нет», без исключения
+        self.assertFalse(server.alerts_secret_ok(None))
+        self.assertTrue(server.alerts_secret_ok(SECRET))
+        for secret in (None, "", "wrong", SECRET + "x"):
+            self.assertEqual(self.watch(RH2, secret=secret)[0], 403, secret)
+            self.assertEqual(self.req("/api/alerts/list?chat_id=42", secret=secret)[0], 403, secret)
+            self.assertEqual(self.req("/api/alerts/unwatch", {"chat_id": 42, "token": RH2}, secret=secret)[0], 403)
+        self.assertEqual(self.req("/api/alerts/list?chat_id=42")[1]["items"], [])     # ничего не записалось
+        with mock.patch.dict(os.environ, {"ALERTS_API_SECRET": ""}):                 # секрет не задан — всегда 403
+            self.assertEqual(self.watch(RH2, secret="")[0], 403)
+
+    def test_secret_not_logged(self):
+        import io, contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.watch(RH2); self.watch(RH2, secret="wrong")
+            with mock.patch.object(server, "alerts_store", side_effect=OSError("disk full")):
+                self.watch(RH2)
+        self.assertNotIn(SECRET, out.getvalue())
+
+    def test_disabled_404(self):
+        with mock.patch.dict(os.environ, {"ALERTS_ENABLED": "false"}):
+            self.assertEqual(self.watch(RH2)[0], 404)
+            self.assertEqual(self.req("/api/alerts/list?chat_id=42")[0], 404)
+            self.assertEqual(self.req("/api/alerts/unwatch", {"chat_id": 42, "token": RH2})[0], 404)
+            self.assertEqual(self.req("/api/config", secret=None)[1]["alerts"], False)
+        self.assertEqual(self.req("/api/config", secret=None)[1]["alerts"], True)
+
+    def test_watch_list_unwatch(self):
+        code, d = self.watch(RH2.upper().replace("0X", "0x"))
+        self.assertEqual((code, d["ok"], d["renewed"], d["token"], d["chain"], d["days"], d["limit"]),
+                         (200, True, False, RH2, "robinhood", 7, 3))
+        self.assertAlmostEqual(d["expires_at"] - d["created_at"], 7 * 86400)
+        self.assertAlmostEqual(d["created_at"], time.time(), delta=5)
+        code, d = self.req("/api/alerts/list?chat_id=42")
+        self.assertEqual((code, [w["token"] for w in d["items"]]), (200, [RH2]))
+        self.assertEqual(self.req("/api/alerts/list?chat_id=43")[1]["items"], [])
+        code, d = self.req("/api/alerts/unwatch", {"chat_id": 42, "token": RH2})
+        self.assertEqual((code, d["removed"], d["items"]), (200, True, []))
+        self.assertFalse(self.req("/api/alerts/unwatch", {"chat_id": 42, "token": RH2})[1]["removed"])
+
+    def test_limit_3(self):
+        for t in (RH2, RH3, T):
+            self.assertEqual(self.watch(t)[0], 200)
+        code, d = self.watch(RH4)
+        self.assertEqual((code, d["error"], d["limit"]), (409, "watch limit", 3))
+        self.assertEqual(d["message"], "You can watch up to 3 tokens. Unwatch one first.")
+        self.assertEqual([w["token"] for w in d["items"]], [RH2, RH3, T])
+        code, d = self.watch(RH2)                      # уже подписан — продление, не превышение
+        self.assertEqual((code, d["renewed"]), (200, True))
+        self.assertEqual(self.watch(RH4, chat=99)[0], 200)
+
+    def test_expires_after_7_days(self):
+        for t in (RH2, RH3, T):
+            self.watch(t)
+        later = time.time() + 7 * 86400 + 10
+        with mock.patch.object(server.time, "time", return_value=later):
+            self.assertEqual(self.req("/api/alerts/list?chat_id=42")[1]["items"], [])
+            self.assertEqual(self.watch(RH4)[0], 200)
+
+    def test_too_established(self):
+        st = server.alerts_store()                     # последний скан токена — TOO_ESTABLISHED
+        st.record(alerts.snapshot(res(token=RH3, band="TOO_ESTABLISHED", score=None, ops=[], holders=[])))
+        code, d = self.watch(RH3)
+        self.assertEqual((code, d["error"]), (422, "too established"))
+        self.assertEqual(d["message"], "This token is too established for CrawlScan, so it can't be watched.")
+        big = {"age_days": 700, "liquidity_usd": 8e6, "mcap_usd": 1.6e8, "source": "gt"}   # не сканировали: рынок
+        with mock.patch.object(server.market, "fetch_market", return_value=big) as fm:
+            self.assertEqual(self.watch(RH4)[0], 422)
+            self.assertEqual(self.watch(RH4)[0], 422)  # второй раз — из кэша вердикта, без запроса
+        self.assertEqual(fm.call_count, 1)
+        self.assertEqual(self.req("/api/alerts/list?chat_id=42")[1]["items"], [])
+        self.assertEqual(self.watch(RH2)[0], 200)      # рынок не ответил ({}) — подписываем
+
+    def test_bad_input(self):
+        self.assertEqual(self.watch("not an address"), (400, {"error": "not a token address"}))
+        for chat in (None, "abc", True, 1.5, [1]):
+            self.assertEqual(self.watch(RH2, chat=chat)[0], 400, chat)
+        self.assertEqual(self.req("/api/alerts/list")[0], 400)
+        self.assertEqual(self.req("/api/alerts/nope?chat_id=1")[0], 404)
+        self.assertEqual(self.req("/api/alerts/watch?chat_id=1")[0], 404)     # GET на POST-путь
+        r = urllib.request.Request(self.base + "/api/alerts/watch", data=b"[1,2", method="POST",
+                                   headers={"X-Alerts-Secret": SECRET})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(r, timeout=10)
+        self.assertEqual(cm.exception.code, 400)
+        cm.exception.close()
+
+    def test_db_failure_500(self):
+        with mock.patch.object(server, "alerts_store", side_effect=OSError("disk full")):
+            self.assertEqual(self.watch(RH2)[0], 500)
+
+    def test_bot_client(self):
+        """Клиент бота против настоящего сервера: секрет в заголовке, 409/422 — ответом, 404 — AlertsOff."""
+        from bot.api import AlertsOff, CrawlScan, Rejected
+        api = CrawlScan(self.base, alerts_secret=SECRET)
+        self.assertTrue(api.config()["alerts"])
+        self.assertEqual(api.watch(42, RH2)["token"], RH2)
+        api.watch(42, RH3); api.watch(42, T)
+        r = api.watch(42, RH4)
+        self.assertEqual((r["status"], len(r["items"])), (409, 3))
+        self.assertEqual(len(api.watch_list(42)["items"]), 3)
+        self.assertTrue(api.unwatch(42, RH2)["removed"])
+        with self.assertRaises(Rejected):
+            api.watch(42, "0x1234")
+        with mock.patch.dict(os.environ, {"ALERTS_ENABLED": "false"}), self.assertRaises(AlertsOff):
+            api.watch_list(42)
 
 
 if __name__ == "__main__":

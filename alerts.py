@@ -2,16 +2,20 @@
 
 Шаг A1: снимок результата скана по токену (snapshot) и сравнение двух снимков (diff) → список важных
 изменений с коротким текстом на английском. Хранение снимков — alerts_store.py, запись — server.record_snapshot.
+Шаг A2: подписки чатов на токены (alerts_store, API /api/alerts/* в server.py, команды бота), без отправки.
 Всё за выключателем ALERTS_ENABLED (по умолчанию выключено).
 """
 import os, time
 
 BAND_RANK = {"DANGER": 0, "RISKY": 1, "OK": 2, "CLEAN": 3}   # вердикты со скором; остальные не сравниваются
+VERDICT_MIN_MOVE = 8         # смена полосы без DANGER (CLEAN↔OK, OK↔RISKY) — только если скор сдвинулся на ≥ 8
 OPERATOR_SOLD_MIN = 0.30     # крупнейший оператор продал ≥ 30% своей доли
 OPERATOR_MIN_SHARE = 0.001   # ... если держал ≥ 0.1% сапплая (меньше — шум)
 EARLY_DROP_MIN = 0.30        # доля сапплая у ранних покупателей упала ≥ 30%
 EARLY_MIN_SHARE = 0.005      # ... если была ≥ 0.5% сапплая
 ROUND = 6                    # знаков у долей в снимке
+WATCH_LIMIT = 3              # токенов в подписке на один чат
+WATCH_DAYS = 7               # подписка живёт столько дней (повторный watch продлевает)
 
 
 def enabled():
@@ -48,17 +52,20 @@ def _pct(x):
 
 def diff(old, new):
     """Важные изменения между снимками old → new: [{"kind", "text", ...}]. Нет одного из снимков — [].
-    kind: verdict_worse / verdict_better (только между DANGER/RISKY/OK/CLEAN), rug_appeared / rug_gone,
+    kind: verdict_worse / verdict_better (только между DANGER/RISKY/OK/CLEAN; вход в DANGER и выход — всегда,
+    остальные смены полосы — если скор сдвинулся на ≥ VERDICT_MIN_MOVE: 80 → 78 через границу — тишина),
+    rug_appeared / rug_gone (всегда),
     operator_sold (кошельки прежнего крупнейшего оператора держат на ≥ 30% меньше), early_dropped
     (доля ранних покупателей упала на ≥ 30%; только если известна в обоих снимках)."""
     if not old or not new:
         return []
     out = []
     ob, nb = old.get("band"), new.get("band")
-    if ob in BAND_RANK and nb in BAND_RANK and ob != nb:
+    osc, nsc = old.get("score"), new.get("score")
+    moved = osc is None or nsc is None or abs(nsc - osc) >= VERDICT_MIN_MOVE
+    if ob in BAND_RANK and nb in BAND_RANK and ob != nb and ("DANGER" in (ob, nb) or moved):
         worse = BAND_RANK[nb] < BAND_RANK[ob]
-        sc = (f" (score {old['score']} → {new['score']})"
-              if old.get("score") is not None and new.get("score") is not None else "")
+        sc = f" (score {osc} → {nsc})" if osc is not None and nsc is not None else ""
         out.append({"kind": "verdict_worse" if worse else "verdict_better", "from": ob, "to": nb,
                     "text": f"Verdict {'worsened' if worse else 'improved'}: {ob} → {nb}{sc}"})
     if not old.get("rug") and new.get("rug"):

@@ -3,11 +3,13 @@
   python bot/main.py
 
 env: TG_BOT_TOKEN (обязателен, из .env через env.py; нигде не печатается), CRAWLSCAN_API (по умолчанию
-https://crawlscan.fun), TRADE_URL_ROBINHOOD / TRADE_URL_SOLANA — шаблоны кнопки Trade on Axiom (trade.py). Long polling getUpdates (timeout=30): одновременно может работать только один
+https://crawlscan.fun), TRADE_URL_ROBINHOOD / TRADE_URL_SOLANA — шаблоны кнопки Trade on Axiom (trade.py),
+ALERTS_API_SECRET — секрет API подписок сайта (нет — алертов в боте нет; нигде не печатается). Long polling getUpdates (timeout=30): одновременно может работать только один
 экземпляр бота, второй получает 409 Conflict.
 
 Личка: адрес токена (или /scan <адрес>) → скан; /start, /help, /rewards. Группы: только /scan <адрес>
-и /rewards (и /scan@имябота, /rewards@имябота). /rewards — статус наград и сжиганий с сайта (/api/rewards/status). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
+и /rewards (и /scan@имябота, /rewards@имябота). Алерты (только личка, если на сайте /api/config → alerts и задан
+ALERTS_API_SECRET): /watch <адрес>, /watchlist, /unwatch <адрес>, кнопка [Watch] под вердиктом; иначе — «coming soon». /rewards — статус наград и сжиганий с сайта (/api/rewards/status). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
 Лимиты: 1 скан на пользователя в USER_COOLDOWN секунд, не больше WORKERS сканов одновременно (остальные — в очереди).
 """
 import math, os, queue, sys, threading, time, traceback
@@ -19,7 +21,7 @@ if ROOT not in sys.path:
 import env                                          # noqa: E402
 import trade                                        # noqa: E402
 from bot import text as T                           # noqa: E402
-from bot.api import ApiError, CrawlScan, Rejected   # noqa: E402
+from bot.api import AlertsOff, ApiError, CrawlScan, Rejected   # noqa: E402
 from bot.tg import Telegram, TelegramError          # noqa: E402
 
 WORKERS = 3            # сканов одновременно на весь бот
@@ -33,6 +35,10 @@ COMMANDS = [{"command": "start", "description": "What this bot does"},
             {"command": "scan", "description": "Scan a token: /scan <address>"},
             {"command": "help", "description": "How to read a verdict"},
             {"command": "rewards", "description": "Next holder draw, last winner, burns"}]
+WATCH_COMMANDS = [{"command": "watch", "description": "Get alerts for a token: /watch <address>"},
+                  {"command": "watchlist", "description": "Tokens you watch"},
+                  {"command": "unwatch", "description": "Stop alerts: /unwatch <address>"}]
+ALERTS_CHECK_TTL = 60  # секунд: сколько помнить, включены ли алерты на сайте
 
 _log_lock = threading.Lock()
 
@@ -66,6 +72,7 @@ class Bot:
         # запросы к сайту вне цикла опроса (/rewards): по умолчанию — свой поток
         self.trade_urls = trade_urls or trade.templates()   # {сеть: шаблон} для [Trade on Axiom]
         self.spawn = spawn or (lambda f: threading.Thread(target=f, daemon=True).start())
+        self.alerts_seen = None      # (clock(), включены ли алерты на сайте)
 
     # --- Telegram ---------------------------------------------------------------------------------
 
@@ -135,12 +142,14 @@ class Bot:
             if cmd == "help":
                 return self.send(chat_id, T.HELP)
             if cmd == "scan":
-                return self.scan_command(chat_id, user.get("id"), arg, None)
+                return self.scan_command(chat_id, user.get("id"), arg, None, private=True)
             if cmd == "rewards":
                 return self.rewards_command(chat_id, None)
+            if cmd in ("watch", "unwatch", "watchlist"):
+                return self.alerts_command(chat_id, cmd, arg)
             found = T.find_address(txt) if cmd is None else None
             if found:
-                return self.request_scan(chat_id, user.get("id"), found[1], None)
+                return self.request_scan(chat_id, user.get("id"), found[1], None, private=True)
             return self.send(chat_id, T.HINT)
         if chat.get("type") in ("group", "supergroup") and cmd == "scan":
             return self.scan_command(chat_id, user.get("id"), arg, mid)
@@ -149,19 +158,24 @@ class Bot:
 
     def handle_callback(self, cq):
         self.call("answerCallbackQuery", callback_query_id=cq.get("id"))
-        chat_id = ((cq.get("message") or {}).get("chat") or {}).get("id")
+        chat = (cq.get("message") or {}).get("chat") or {}
+        chat_id, data = chat.get("id"), cq.get("data") or ""
         if chat_id is None:
             return
-        if cq.get("data") == "scan":
+        if data.startswith("watch:") and chat.get("type") == "private":
+            found = T.find_address(data[len("watch:"):])
+            if found:
+                self.alerts_command(chat_id, "watch", found[1])
+        elif data == "scan":
             self.send(chat_id, T.ASK_ADDRESS)
-        elif cq.get("data") == "help":
+        elif data == "help":
             self.send(chat_id, T.HELP)
 
-    def scan_command(self, chat_id, user_id, arg, reply_to):
+    def scan_command(self, chat_id, user_id, arg, reply_to, private=False):
         found = T.find_address(arg) if arg else None
         if not found:
             return self.send(chat_id, T.SCAN_USAGE, reply_to=reply_to)
-        self.request_scan(chat_id, user_id, found[1], reply_to)
+        self.request_scan(chat_id, user_id, found[1], reply_to, private)
 
     def rewards_command(self, chat_id, reply_to):
         self.spawn(lambda: self.send(chat_id, *self.rewards_text(), reply_to=reply_to))
@@ -179,9 +193,63 @@ class Bot:
             self.log("rewards text:\n" + self.tg.redact(traceback.format_exc()))
             return T.UNREACHABLE, None
 
+    # --- алерты: подписки (сайт хранит, бот только просит) ---------------------------------------------
+
+    def alerts_on(self):
+        """Алерты включены: у бота есть секрет и сайт отвечает /api/config → alerts. Помним ALERTS_CHECK_TTL секунд;
+        сайт недоступен — выключены (и тоже помним)."""
+        if not getattr(self.api, "alerts_secret", ""):
+            return False
+        now = self.clock()
+        seen = self.alerts_seen
+        if seen and now - seen[0] < ALERTS_CHECK_TTL:
+            return seen[1]
+        try:
+            on = bool(self.api.config().get("alerts"))
+        except (ApiError, Rejected, AttributeError) as e:
+            self.log(f"api config: {e}")
+            on = False
+        self.alerts_seen = (now, on)
+        return on
+
+    def alerts_command(self, chat_id, cmd, arg):
+        """/watch, /unwatch, /watchlist и кнопка [Watch] — запрос к сайту в отдельном потоке."""
+        self.spawn(lambda: self.send(chat_id, self.alerts_text(chat_id, cmd, arg)))
+
+    def alerts_text(self, chat_id, cmd, arg, now=None):
+        if not self.alerts_on():
+            return T.ALERTS_SOON
+        now = time.time() if now is None else now
+        found = T.find_address(arg) if arg else None
+        if cmd != "watchlist" and not found:
+            return T.WATCH_USAGE if cmd == "watch" else T.UNWATCH_USAGE
+        try:
+            if cmd == "watchlist":
+                return T.watchlist(self.api.watch_list(chat_id), now)
+            if cmd == "unwatch":
+                return T.unwatched(self.api.unwatch(chat_id, found[1]))
+            r = self.api.watch(chat_id, found[1])
+            if r.get("status") == 409:
+                return T.watch_limit(r, now)
+            if r.get("status") == 422:
+                return T.watch_established(found[1])
+            self.log(f"watch {found[1]} chat {chat_id}" + (" renewed" if r.get("renewed") else ""))
+            return T.watching(r)
+        except Rejected as e:
+            return T.rejected(found[1] if found else "", str(e))
+        except AlertsOff:
+            self.alerts_seen = (self.clock(), False)
+            return T.ALERTS_SOON
+        except ApiError as e:
+            self.log(f"api {cmd}: {e}")
+            return T.UNREACHABLE
+        except Exception:
+            self.log(f"{cmd} text:\n" + self.tg.redact(traceback.format_exc()))
+            return T.UNREACHABLE
+
     # --- сканы ------------------------------------------------------------------------------------
 
-    def request_scan(self, chat_id, user_id, addr, reply_to):
+    def request_scan(self, chat_id, user_id, addr, reply_to, private=False):
         """Лимиты и очередь: сразу ответ crawling/queued, скан — в рабочем потоке."""
         now = self.clock()
         with self.lock:
@@ -203,7 +271,7 @@ class Bot:
         mid = self.send(chat_id, T.queued(addr) if waiting else T.crawling(addr), reply_to=reply_to)
         if mid is None:
             return
-        self.jobs.put((chat_id, mid, addr, waiting))
+        self.jobs.put((chat_id, mid, addr, waiting, private))
 
     def worker(self):
         while True:
@@ -219,14 +287,15 @@ class Bot:
                     self.busy -= 1
                 self.jobs.task_done()
 
-    def run_scan(self, chat_id, mid, addr, was_queued):
+    def run_scan(self, chat_id, mid, addr, was_queued, private=False):
         if was_queued:
             self.edit(chat_id, mid, T.crawling(addr))
-        html, markup = self.scan_text(addr)
+        html, markup = self.scan_text(addr, watch=private)
         self.edit(chat_id, mid, html, markup)
 
-    def scan_text(self, addr):
-        """Скан через API сайта → (html, кнопки)."""
+    def scan_text(self, addr, watch=False):
+        """Скан через API сайта → (html, кнопки). watch — личка: кнопка [Watch], если алерты включены
+        и токен не too established."""
         deadline = self.clock() + self.scan_timeout
         try:
             job = self.api.scan(addr)
@@ -248,7 +317,8 @@ class Bot:
         res = r["result"]
         token = res.get("token") or addr
         chain = res.get("chain") or T.chain_of(token)
-        return T.verdict(res), T.report_button(token, trade.url(chain, token, self.trade_urls))
+        watch = watch and res.get("band") != T.TOO_ESTABLISHED and self.alerts_on()
+        return T.verdict(res), T.report_button(token, trade.url(chain, token, self.trade_urls), watch)
 
     # --- цикл опроса ------------------------------------------------------------------------------
 
@@ -275,7 +345,7 @@ class Bot:
                 self.username = me.get("username") or ""
             else:
                 self.sleep(5)
-        self.call("setMyCommands", commands=COMMANDS)
+        self.call("setMyCommands", commands=COMMANDS + (WATCH_COMMANDS if self.alerts_on() else []))
         self.start_workers()
         self.log(f"@{self.username} polling, site {self.api.base}")
         offset, backoff = None, 1
@@ -303,7 +373,8 @@ def main():
     if not token:
         print("TG_BOT_TOKEN is not set", file=sys.stderr)
         sys.exit(1)
-    api = CrawlScan(os.environ.get("CRAWLSCAN_API", "").strip() or "https://crawlscan.fun")
+    api = CrawlScan(os.environ.get("CRAWLSCAN_API", "").strip() or "https://crawlscan.fun",
+                    alerts_secret=os.environ.get("ALERTS_API_SECRET", "").strip())
     try:
         Bot(Telegram(token), api).run()
     except KeyboardInterrupt:
