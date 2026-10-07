@@ -436,6 +436,29 @@ class TestRewards(unittest.TestCase):
         self.assertIn('✅ Paid: 12,346 $CrawlScan · <a href="https://robinhoodchain.blockscout.com/tx/0xbeef">tx</a>', txt)
         self.assertNotIn("pending", txt)
 
+    def test_paid_in_eth(self):
+        d = dict(rewards_status()["last_draw"], payout_status="paid", payout_currency="ETH", payout_eth=0.0523,
+                 payout_tokens=None, payout_tx="0xfeed")
+        txt = self.reply(FakeAPI(rewards=rewards_status(last_draw=d)))[0]["text"]
+        self.assertIn('✅ Paid: 0.0523 ETH · <a href="https://robinhoodchain.blockscout.com/tx/0xfeed">tx</a>', txt)
+        self.assertNotIn("$CrawlScan · <a", txt.split("Last winner")[1].split("🔥")[0])
+        self.assertNotIn("pending", txt)
+
+    def test_old_token_payout_with_currency_field(self):
+        d = dict(rewards_status()["last_draw"], payout_status="paid", payout_currency="CRAWLSCAN", payout_eth=None,
+                 payout_tokens=12345.6, payout_tx="0xbeef")
+        txt = self.reply(FakeAPI(rewards=rewards_status(last_draw=d)))[0]["text"]
+        self.assertIn('✅ Paid: 12,346 $CrawlScan · <a href="https://robinhoodchain.blockscout.com/tx/0xbeef">tx</a>', txt)
+
+    def test_eth_format(self):
+        for x, want in ((0.0523, "0.0523"), (0.05234567, "0.0523"), (2.5, "2.5"), (1.0, "1"), (0.00005, "<0.0001"),
+                        (0.0001, "0.0001"), (12.34567, "12.3457"), (0, "0")):
+            self.assertEqual(T.eth(x), want, x)
+
+    def test_start_says_eth(self):
+        self.assertIn("Every 24 hours one holder wins 10% of the creator fees, paid in ETH.", T.START)
+        self.assertNotIn("paid in $CrawlScan", T.START)
+
     def test_no_draw_no_winner_no_burns(self):
         txt = self.reply(FakeAPI(rewards=rewards_status(last_draw=None, last_burn=None, total_burned=None,
                                                          burned_by_dev={"amount": 0})))[0]["text"]

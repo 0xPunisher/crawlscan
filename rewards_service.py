@@ -179,7 +179,8 @@ def check_burns(store, cfg):
 
 
 def check_payouts(store, cfg):
-    """Выплаты: первый перевод токена с DEV_WALLETS победителю после времени розыгрыша. -> сколько отмечено."""
+    """Выплаты: первый перевод с DEV_WALLETS победителю после времени розыгрыша — токена (getLogs) или нативного ETH
+    (alchemy_getAssetTransfers, category external). -> сколько отмечено."""
     devs, token, unpaid = cfg["dev_wallets"], cfg["token"], store.unpaid_draws()
     if not devs or not unpaid:
         return 0
@@ -187,7 +188,9 @@ def check_payouts(store, cfg):
     lo = min(d["end_block"] for d in unpaid)
     if head < lo:
         return 0
-    trs = ch.get_token_transfers(token, lo, head, frm=devs, to=sorted({d["winner"] for d in unpaid}))
+    winners = sorted({d["winner"] for d in unpaid})
+    trs = [t | {"currency": rw.CURRENCY_TOKEN} for t in ch.get_token_transfers(token, lo, head, frm=devs, to=winners)]
+    trs += [t | {"currency": rw.CURRENCY_ETH} for t in ch.eth_sent(devs, lo, head, to=winners)]
     ts_of = timestamps(trs)
     n = 0
     for day, t in rw.match_payouts(unpaid, trs, devs, ts_of, store.payout_keys()).items():
@@ -217,6 +220,21 @@ def _tokens(raw, dec):
     return None if raw is None or dec is None else raw / 10 ** dec
 
 
+def _eth(wei):
+    return None if wei is None else wei / 10 ** 18
+
+
+def payout_fields(row, dec):
+    """Валюта и сумма выплаты для API: payout_currency ("ETH" | "CRAWLSCAN"; старые выплаты — токеном),
+    payout_eth (ETH) или payout_tokens (токены); у другой валюты — None. Нет выплаты — все None."""
+    if not row["payout_tx"]:
+        return {"payout_currency": None, "payout_eth": None, "payout_tokens": None}
+    cur = row["payout_currency"] or rw.CURRENCY_TOKEN
+    eth = cur == rw.CURRENCY_ETH
+    return {"payout_currency": cur, "payout_eth": _eth(row["payout_amount"]) if eth else None,
+            "payout_tokens": None if eth else _tokens(row["payout_amount"], dec)}
+
+
 def _chance(w, total):
     return w / total if w and total else None
 
@@ -229,7 +247,7 @@ def draw_json(row):
     out["status_text"] = "no eligible holders" if row["status"] == "no_eligible" else "winner drawn"
     out["chance"] = _chance(row["winner_weight"], row["total_weight"])
     out["payout_status"] = "paid" if row["payout_tx"] else "pending" if row["winner"] else "no_winner"
-    out["payout_tokens"] = _tokens(row["payout_amount"], row["decimals"])
+    out.update(payout_fields(row, row["decimals"]))
     out["seed_time_iso"], out["draw_time_iso"] = _iso(row["seed_time"]), _iso(rw.draw_at(row["day"]))
     out["period_start_iso"], out["period_end_iso"] = (_iso(x) for x in rw.day_bounds(row["day"]))
     out["paid_at_iso"] = _iso(row["paid_at"])
@@ -258,7 +276,7 @@ def status_json(store, cfg, now=None):
                 "weight": latest["winner_weight"], "weight_tokens": _tokens(latest["winner_weight"], dec),
                 "total_weight": latest["total_weight"], "chance": _chance(latest["winner_weight"], latest["total_weight"]),
                 "participants": latest["participants"], "payout_status": draw_json(latest)["payout_status"],
-                "payout_amount": latest["payout_amount"], "payout_tokens": _tokens(latest["payout_amount"], dec),
+                "payout_amount": latest["payout_amount"], **payout_fields(latest, dec),
                 "payout_tx": latest["payout_tx"]}
     burns = rw.next_burns(now, 2)
     day, at = rw.next_draw(now)

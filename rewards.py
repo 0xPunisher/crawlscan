@@ -133,13 +133,18 @@ def find_burns(transfers, dev_wallets):
     return [t for t in transfers if t["frm"] in devs and t["to"] in BURN_SINKS and t["amount"] > 0]
 
 
+CURRENCY_TOKEN, CURRENCY_ETH = "CRAWLSCAN", "ETH"
+
+
 def match_payouts(draws, transfers, dev_wallets, ts_of, used_txs=()):
-    """Выплаты: для каждого розыгрыша с победителем и без выплаты — первый перевод токена с любого
-    из dev_wallets на кошелёк победителя не раньше расчёта розыгрыша (draw_time, 22:05 UTC). Розыгрыши — по дням
-    по порядку; один перевод — выплата только одного розыгрыша (used_txs — уже засчитанные).
+    """Выплаты: для каждого розыгрыша с победителем и без выплаты — первый перевод с любого из dev_wallets
+    на кошелёк победителя не раньше расчёта розыгрыша (draw_time, 22:05 UTC): токена или нативного ETH
+    (перевод с полем currency; ETH — log_index -1). «Первый» — по блоку, в блоке — по номеру лога (ETH раньше).
+    Розыгрыши — по дням по порядку; один перевод — выплата только одного розыгрыша (used_txs — уже засчитанные).
     -> {day: перевод}."""
     devs = {a.lower() for a in dev_wallets}
     used = {(tx, li) for tx, li in used_txs}
+    transfers = sorted(transfers, key=lambda t: (t["block"], t["log_index"]))
     out = {}
     for d in sorted(draws, key=lambda d: d["day"]):
         if not d.get("winner") or d.get("payout_tx"):

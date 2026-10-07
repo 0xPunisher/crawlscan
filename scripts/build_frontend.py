@@ -364,7 +364,7 @@ tracked = ('<sc-if value="{{rwOn}}" hint-placeholder-val="{{false}}"><a href="#r
 TOKEN_P = 'style="margin:0;font-size:15px;line-height:1.6;color:#8a959c"'
 token_text = "\n".join(f"              <p {TOKEN_P}>{x}</p>" for x in (
     f"Holders of ${TOKEN_TICKER} get rewarded every day. An automatic draw picks one holder, who receives 10% of the "
-    f"day's creator fees in ${TOKEN_TICKER}.",
+    "day's creator fees in ETH.",
     "Twice a day the dev burns tokens from his own supply, so the supply keeps shrinking and each token becomes "
     "more valuable.",
     f"Every draw, payout and burn is {tracked} and verifiable onchain.",
@@ -879,6 +879,8 @@ const fmtUnits=(raw,dec)=>{
   const s=i.toLocaleString('en-US'); if(i>=1000n||f===0n) return s;
   return s+'.'+f.toString().padStart(2,'0').replace(/0$/,'');
 };
+// выплата в ETH: wei -> до 4 знаков после точки без хвостовых нулей; меньше 0.0001 — "<0.0001"
+const fmtEth=wei=>{const n=Number(BigInt(wei))/1e18; return n>0&&n<0.0001?'<0.0001':n.toFixed(4).replace(/\.?0+$/,'');};
 const fmtPctOf=(a,b)=>{if(a==null||!b) return null; const p=Number(BigInt(a)*1000000n/BigInt(b))/10000; return p>=0.01?p.toFixed(2)+'%':p>0?'<0.01%':'0%';};
 const fmtUtcTs=ms=>{const s=new Date(ms).toISOString(); return s.slice(0,10)+' '+s.slice(11,16)+' UTC';};
 const RW_GRACE=1800000;   // сжигание за 30 минут до планового времени засчитывается этому времени
@@ -963,7 +965,7 @@ rep("  blank(ca){return {", r"""  loadRewards(){   // статус Rewards & Bur
       rwWinner:won?rwShort(L.winner):'', rwWinnerFull:won?L.winner:'', rwWinnerUrl:won?RH_ADDR(L.winner):'#',
       copyRwWinner:()=>this.copyText('winner',won?L.winner:''), rwWinDone:cp==='winner', rwWinIdle:cp!=='winner',
       rwChance:won?fmtChance(L.weight,L.total_weight)+' chance':'', rwDayLabel:L?'draw of '+L.day:'',
-      rwPaid:won&&paid, rwPending:won&&!paid, rwPrize:paid?fmtUnits(L.payout_amount,dec):'',
+      rwPaid:won&&paid, rwPending:won&&!paid, rwPrize:!paid?'':L.payout_currency==='ETH'?fmtEth(L.payout_amount)+' ETH':fmtUnits(L.payout_amount,dec)+' $CrawlScan',
       rwTxUrl:paid?RH_TX(L.payout_tx):'#', rwTxShort:paid?rwShort(L.payout_tx):'',
       rwCanVerify:!!L, onRwVerify:()=>this.runRwVerify(), rwVerifyShow:!!vf, rwVerifyText:vf?vf.text:'',
       rwVerifyColor:{ok:G,bad:RD}[vf&&vf.s]||'#8a959c', rwVerifyDetail:vf&&vf.detail?vf.detail:''};
@@ -1008,7 +1010,7 @@ BUSY = f'{MONO};font-size:clamp(20px,2.4vw,26px);letter-spacing:-0.01em;color:#f
 TEXT = 'margin:0;font-size:15px;line-height:1.6;color:#8a959c;text-wrap:pretty'
 BURN_TEXT = ("Every 12 hours the developer burns tokens from his personal supply. Burning makes tokens more valuable "
              "because the supply gets smaller and smaller day by day.")
-DRAW_TEXT = ("Every 24 hours one holder is picked at random and receives 10% of the token's fees, paid in tokens. "
+DRAW_TEXT = ("Every 24 hours one holder is picked at random and receives 10% of the token's fees, paid in ETH. "
              "Every holder takes part, even the smallest. Your chance = your average balance over the day "
              "(1 token = 1 ticket), so buying right before the draw doesn't help.")
 TRUST_TEXT = ("The winner is picked from the hash of a Robinhood Chain block produced after the holder list is locked. "
@@ -1071,7 +1073,7 @@ REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{
               {sif("rwWonNew", winner_line("cs-rw-win cs-rw-reveal"))}
               {sif("rwWon", f'<span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwChance}}}} · {{{{rwDayLabel}}}}</span>')}
               {sif("rwWonNew", f'<span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwChance}}}} · {{{{rwDayLabel}}}}</span>')}
-              {sif("rwPaid", f'<span data-rw-payout="1" style="{MONO};font-size:13px;color:#00c805;overflow-wrap:anywhere">reward sent: {{{{rwPrize}}}} tokens · <a href="{{{{rwTxUrl}}}}" target="_blank" rel="noopener" style="color:#9fd9ff" style-hover="color:#ffffff">{{{{rwTxShort}}}} ↗</a></span>')}
+              {sif("rwPaid", f'<span data-rw-payout="1" style="{MONO};font-size:13px;color:#00c805;overflow-wrap:anywhere">Paid: {{{{rwPrize}}}} · <a href="{{{{rwTxUrl}}}}" target="_blank" rel="noopener" style="color:#9fd9ff" style-hover="color:#ffffff">{{{{rwTxShort}}}} ↗</a></span>')}
               {sif("rwPending", f'<span data-rw-payout="1" style="{MONO};font-size:13px;color:#8a959c">payout pending</span>')}
             </div>
           </div>

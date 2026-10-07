@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS rw_draws (
   start_block INTEGER, end_block INTEGER, list_hash TEXT NOT NULL, seed_time INTEGER NOT NULL,
   seed_block INTEGER, blockhash TEXT, r TEXT, winner TEXT, winner_weight TEXT, total_weight TEXT NOT NULL,
   participants INTEGER NOT NULL, decimals INTEGER, dev_wallets TEXT NOT NULL, created_at INTEGER NOT NULL,
-  payout_amount TEXT, payout_tx TEXT, payout_log_index INTEGER, payout_block INTEGER, payout_from TEXT, paid_at INTEGER);
+  payout_amount TEXT, payout_tx TEXT, payout_log_index INTEGER, payout_block INTEGER, payout_from TEXT, paid_at INTEGER,
+  payout_currency TEXT);
 CREATE TABLE IF NOT EXISTS rw_participants (
   day TEXT NOT NULL, address TEXT NOT NULL, weight TEXT NOT NULL, PRIMARY KEY (day, address));
 CREATE TABLE IF NOT EXISTS rw_burns (
@@ -43,6 +44,9 @@ class RewardsStore:
         self.db.row_factory = sqlite3.Row
         with self._lock, self.db:
             self.db.executescript(SCHEMA)
+            # база до выплат в ETH: колонки валюты нет; старые выплаты (NULL) — токеном
+            if "payout_currency" not in {r["name"] for r in self.db.execute("PRAGMA table_info(rw_draws)")}:
+                self.db.execute("ALTER TABLE rw_draws ADD COLUMN payout_currency TEXT")
 
     def close(self):
         with self._lock:
@@ -101,12 +105,14 @@ class RewardsStore:
                 "SELECT payout_tx, payout_log_index FROM rw_draws WHERE payout_tx IS NOT NULL")}
 
     def set_payout(self, day, t, ts):
-        """Выплата розыгрыша — перевод t (с блокчейна). Уже записана — не меняется. -> True, если записана сейчас."""
+        """Выплата розыгрыша — перевод t (с блокчейна): токен или ETH (t["currency"], сумма — в wei / базовых
+        единицах токена). Уже записана — не меняется. -> True, если записана сейчас."""
         with self._lock, self.db:
             cur = self.db.execute(
-                "UPDATE rw_draws SET payout_amount=?, payout_tx=?, payout_log_index=?, payout_block=?, payout_from=?, paid_at=? "
-                "WHERE day=? AND winner IS NOT NULL AND payout_tx IS NULL",
-                (str(t["amount"]), t["tx"], t["log_index"], t["block"], t["frm"], int(ts), day))
+                "UPDATE rw_draws SET payout_amount=?, payout_tx=?, payout_log_index=?, payout_block=?, payout_from=?, "
+                "paid_at=?, payout_currency=? WHERE day=? AND winner IS NOT NULL AND payout_tx IS NULL",
+                (str(t["amount"]), t["tx"], t["log_index"], t["block"], t["frm"], int(ts),
+                 t.get("currency") or "CRAWLSCAN", day))
             return cur.rowcount > 0
 
     # ---------- сжигания ----------
