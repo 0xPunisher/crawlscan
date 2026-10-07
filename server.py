@@ -37,7 +37,8 @@ Token Burn & Holder Rewards, Robinhood (только при REWARDS_ENABLED=true
 Лента /api/recent кэшируется 20 секунд; запись — после завершения скана, сбой базы скан не ломает.
 Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
 """
-import hmac, json, os, re, threading, time, uuid
+import hashlib, hmac, json, os, re, threading, time, uuid
+from email.utils import formatdate, parsedate_to_datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -62,6 +63,8 @@ ICONS = {                  # путь -> (файл в static/, content-type); .i
     "/favicon.ico": ("favicon.png", "image/png"),
 }
 ICON_CACHE = "public, max-age=86400"
+HTML_CACHE = "no-cache"    # страница: браузер хранит, но каждый раз сверяется (ETag / Last-Modified → 304)
+_PAGE = {}                 # (путь, mtime_ns, size) -> (body, etag, last_modified)
 
 CHART_TTL = 600            # секунд: кэш чарта по токену
 CHART_EMPTY_TTL = 60       # секунд: кэш чарта без свечей (GT не ответил или токен слишком свежий)
@@ -276,6 +279,43 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _send_page(self, path):
+        """index.html с Cache-Control: no-cache, ETag и Last-Modified: после деплоя браузер сразу видит новую
+        страницу, неизменная — 304 без тела. If-None-Match важнее If-Modified-Since; слабый ETag (W/, его ставит
+        Cloudflare при сжатии) сравнивается как сильный."""
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return self._send(200, b"<h1>rh-crawler</h1>", "text/html; charset=utf-8")
+        key = (path, st.st_mtime_ns, st.st_size)
+        page = _PAGE.get(key)
+        if page is None:
+            with open(path, "rb") as f:
+                body = f.read()
+            page = (body, '"' + hashlib.sha256(body).hexdigest()[:20] + '"', formatdate(st.st_mtime, usegmt=True))
+            _PAGE.clear()
+            _PAGE[key] = page
+        body, etag, modified = page
+        inm, ims = self.headers.get("If-None-Match"), self.headers.get("If-Modified-Since")
+        if inm is not None:
+            fresh = any(t.strip().removeprefix("W/") in (etag, "*") for t in inm.split(","))
+        else:
+            try:
+                fresh = ims is not None and int(st.st_mtime) <= parsedate_to_datetime(ims).timestamp()
+            except (TypeError, ValueError):
+                fresh = False
+        self.send_response(304 if fresh else 200)
+        self.send_header("cache-control", HTML_CACHE)
+        self.send_header("etag", etag)
+        self.send_header("last-modified", modified)
+        if fresh:
+            self.end_headers()
+            return
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _job(self, q):
         jid = (q.get("job") or [""])[0]
         with _lock:
@@ -423,11 +463,7 @@ class H(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 return self._send(404, {"error": "not found"})
         if u.path in ("/", "/index.html"):
-            try:
-                with open(os.path.join(ROOT, "index.html"), "rb") as f:
-                    return self._send(200, f.read(), "text/html; charset=utf-8")
-            except FileNotFoundError:
-                return self._send(200, b"<h1>rh-crawler</h1>", "text/html; charset=utf-8")
+            return self._send_page(os.path.join(ROOT, "index.html"))
         return self._send(404, {"error": "not found"})
 
     def log_message(self, *a):

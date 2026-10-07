@@ -142,5 +142,84 @@ class TestServer(unittest.TestCase):
         self.assertEqual(h.get("cache-control"), "no-store")
 
 
+
+class TestPageCache(unittest.TestCase):
+    """index.html: Cache-Control no-cache + ETag / Last-Modified, неизменная страница — 304; иконки — как раньше."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.H)
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.page = os.path.join(self.tmp.name, "index.html")
+        self.write(b"<html>v1</html>", 1_800_000_000)
+        p = mock.patch.object(server, "ROOT", self.tmp.name)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def write(self, body, mtime):
+        with open(self.page, "wb") as f:
+            f.write(body)
+        os.utime(self.page, (mtime, mtime))
+
+    def get(self, path="/", **headers):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            c.request("GET", path, headers=headers)
+            r = c.getresponse()
+            return r.status, r.read(), {k.lower(): v for k, v in r.getheaders()}
+        finally:
+            c.close()
+
+    def test_headers(self):
+        code, body, h = self.get("/")
+        self.assertEqual((code, body), (200, b"<html>v1</html>"))
+        self.assertEqual(h["cache-control"], "no-cache")
+        self.assertRegex(h["etag"], r'^"[0-9a-f]{20}"$')
+        self.assertEqual(h["last-modified"], "Fri, 15 Jan 2027 08:00:00 GMT")
+        self.assertEqual(h["content-type"], "text/html; charset=utf-8")
+        self.assertEqual(self.get("/index.html")[2]["etag"], h["etag"])
+        self.assertEqual(self.get("/?ca=0x" + "ab" * 20)[2]["etag"], h["etag"])   # ссылка на скан — та же страница
+
+    def test_304(self):
+        etag, lm = self.get()[2]["etag"], self.get()[2]["last-modified"]
+        for hdr in ({"If-None-Match": etag}, {"If-None-Match": "W/" + etag},      # Cloudflare при сжатии: W/
+                    {"If-None-Match": '"other", ' + etag}, {"If-None-Match": "*"}, {"If-Modified-Since": lm}):
+            code, body, h = self.get(**hdr)
+            self.assertEqual((code, body), (304, b""), hdr)
+            self.assertEqual((h["etag"], h["cache-control"]), (etag, "no-cache"), hdr)
+        for hdr in ({"If-None-Match": '"other"'}, {"If-Modified-Since": "Thu, 01 Jan 2026 00:00:00 GMT"},
+                    {"If-Modified-Since": "garbage"},
+                    {"If-None-Match": '"other"', "If-Modified-Since": lm}):           # If-None-Match важнее
+            self.assertEqual(self.get(**hdr)[0], 200, hdr)
+
+    def test_new_deploy_new_etag(self):
+        old = self.get()[2]["etag"]
+        self.write(b"<html>v2 with early buyers</html>", 1_800_000_600)
+        code, body, h = self.get(**{"If-None-Match": old})
+        self.assertEqual((code, body), (200, b"<html>v2 with early buyers</html>"))
+        self.assertNotEqual(h["etag"], old)
+
+    def test_missing_page(self):
+        os.remove(self.page)
+        self.assertEqual(self.get()[:2], (200, b"<h1>rh-crawler</h1>"))
+
+    def test_icons_cached_as_before(self):
+        with mock.patch.object(server, "ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+            code, _, h = self.get("/favicon.svg")
+        self.assertEqual((code, h["cache-control"]), (200, "public, max-age=86400"))
+        self.assertNotIn("etag", h)
+
+
 if __name__ == "__main__":
     unittest.main()
