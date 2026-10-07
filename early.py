@@ -127,3 +127,13 @@ def _fallback(base, key, flags, err):
     if hit and time.time() - hit[0] < STALE_TTL:
         return _out(base, hit, flags, stale=True)
     return base | {"available": True, "error": err}
+
+
+def known_share(chain, token):
+    """Доля сапплая у первых N покупателей сейчас из последнего удачного расчёта моложе STALE_TTL, без сети;
+    не считали — None (для снимков alerts)."""
+    with _lock:
+        hit = _STATUS.get((chain, token))
+    if not hit or time.time() - hit[0] >= STALE_TTL:
+        return None
+    return d.early_report(hit[1], hit[2])["summary"]["now_share_supply"]

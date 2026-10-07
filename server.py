@@ -36,6 +36,7 @@ Token Burn & Holder Rewards, Robinhood (только при REWARDS_ENABLED=true
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
 Лента /api/recent кэшируется 20 секунд; запись — после завершения скана, сбой базы скан не ломает.
+При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан.
 Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
 """
 import hashlib, hmac, json, os, re, threading, time, uuid
@@ -43,6 +44,7 @@ from email.utils import formatdate, parsedate_to_datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+import alerts
 import early
 import engine
 import market
@@ -52,6 +54,7 @@ import rewards_service as rs
 from draw_store import Store
 from rewards_store import RewardsStore
 from recent_store import RecentStore
+from alerts_store import AlertsStore
 
 CACHE_TTL = 600            # секунд: кэш результата по токену
 MAX_CONCURRENT = 3         # одновременных сканов
@@ -109,6 +112,7 @@ def _run(job_id, token):
             job["done"] = True
     if not err:
         record_recent(res)
+        record_snapshot(res)
 
 
 def start_scan(token):
@@ -245,6 +249,31 @@ def record_recent(result):
                 RECENT.clear()
     except Exception as e:
         print(f"recent: not saved: {type(e).__name__}: {e}", flush=True)
+
+
+_alerts_stores = {}
+
+
+def alerts_store():
+    """Хранилище снимков alerts (файл DRAW_DB_PATH), одно на путь."""
+    path = os.environ.get("DRAW_DB_PATH") or ""
+    with _stores_lock:
+        if path not in _alerts_stores:
+            _alerts_stores[path] = AlertsStore(path or None)
+        return _alerts_stores[path]
+
+
+def record_snapshot(result):
+    """Снимок завершённого скана для alerts (только при ALERTS_ENABLED). Вызывается после done, как лента:
+    клиент уже получил вердикт; сбой базы только логируется."""
+    if not alerts.enabled():
+        return
+    try:
+        snap = alerts.snapshot(result, early.known_share(result.get("chain"), result.get("token")))
+        if snap:
+            alerts_store().record(snap)
+    except Exception as e:
+        print(f"alerts: snapshot not saved: {type(e).__name__}: {e}", flush=True)
 
 
 def get_recent(limit):

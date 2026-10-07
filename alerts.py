@@ -1,0 +1,87 @@
+"""Telegram alerts: правила. Чистые функции без сети и базы.
+
+Шаг A1: снимок результата скана по токену (snapshot) и сравнение двух снимков (diff) → список важных
+изменений с коротким текстом на английском. Хранение снимков — alerts_store.py, запись — server.record_snapshot.
+Всё за выключателем ALERTS_ENABLED (по умолчанию выключено).
+"""
+import os, time
+
+BAND_RANK = {"DANGER": 0, "RISKY": 1, "OK": 2, "CLEAN": 3}   # вердикты со скором; остальные не сравниваются
+OPERATOR_SOLD_MIN = 0.30     # крупнейший оператор продал ≥ 30% своей доли
+OPERATOR_MIN_SHARE = 0.001   # ... если держал ≥ 0.1% сапплая (меньше — шум)
+EARLY_DROP_MIN = 0.30        # доля сапплая у ранних покупателей упала ≥ 30%
+EARLY_MIN_SHARE = 0.005      # ... если была ≥ 0.5% сапплая
+ROUND = 6                    # знаков у долей в снимке
+
+
+def enabled():
+    return os.environ.get("ALERTS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+
+def _r(x):
+    return round(float(x), ROUND) if isinstance(x, (int, float)) else None
+
+
+def snapshot(result, early_share=None, ts=None):
+    """Результат engine.scan → короткий снимок или None (нет токена или вердикта).
+    early_share — доля сапплая у первых 20 покупателей сейчас, если уже известна (кэш early.py), иначе None.
+    top — {кошелёк: доля сапплая} топ-холдеров скана: по ним diff смотрит, сколько осталось у прежнего
+    крупнейшего оператора."""
+    if not isinstance(result, dict) or not result.get("token") or not result.get("band"):
+        return None
+    score, rug, ops = result.get("score"), result.get("rug"), result.get("operators") or []
+    big = ops[0] if ops else None
+    return {
+        "token": result["token"], "chain": result.get("chain") or "robinhood",
+        "ts": int(ts if ts is not None else time.time()),
+        "band": result["band"], "score": int(score) if isinstance(score, (int, float)) else None,
+        "rug": bool(rug), "rug_drop": _r(rug.get("drop")) if rug else None,
+        "operator": {"wallets": list(big["wallets"]), "share_supply": _r(big.get("share_supply"))} if big else None,
+        "top": {h["wallet"]: _r(h.get("share_supply")) for h in result.get("holders") or [] if h.get("wallet")},
+        "early_share": _r(early_share),
+    }
+
+
+def _pct(x):
+    return f"{x * 100:.1f}%"
+
+
+def diff(old, new):
+    """Важные изменения между снимками old → new: [{"kind", "text", ...}]. Нет одного из снимков — [].
+    kind: verdict_worse / verdict_better (только между DANGER/RISKY/OK/CLEAN), rug_appeared / rug_gone,
+    operator_sold (кошельки прежнего крупнейшего оператора держат на ≥ 30% меньше), early_dropped
+    (доля ранних покупателей упала на ≥ 30%; только если известна в обоих снимках)."""
+    if not old or not new:
+        return []
+    out = []
+    ob, nb = old.get("band"), new.get("band")
+    if ob in BAND_RANK and nb in BAND_RANK and ob != nb:
+        worse = BAND_RANK[nb] < BAND_RANK[ob]
+        sc = (f" (score {old['score']} → {new['score']})"
+              if old.get("score") is not None and new.get("score") is not None else "")
+        out.append({"kind": "verdict_worse" if worse else "verdict_better", "from": ob, "to": nb,
+                    "text": f"Verdict {'worsened' if worse else 'improved'}: {ob} → {nb}{sc}"})
+    if not old.get("rug") and new.get("rug"):
+        drop = new.get("rug_drop")
+        out.append({"kind": "rug_appeared", "drop": drop,
+                    "text": "Probably rug" + (f": −{drop * 100:.0f}% if suspicious holders sell" if drop else "")})
+    elif old.get("rug") and not new.get("rug"):
+        drop = old.get("rug_drop")
+        out.append({"kind": "rug_gone", "text": "Probably rug is gone" + (f" (was −{drop * 100:.0f}%)" if drop else "")})
+    op = old.get("operator")
+    if op and new.get("top") and (op.get("share_supply") or 0) >= OPERATOR_MIN_SHARE:
+        before = op["share_supply"]
+        # кошелёк выпал из топа нового скана — считаем, что его доли там больше нет
+        now = sum(new["top"].get(w) or 0 for w in op["wallets"])
+        sold = round(1 - now / before, 4)   # округление: ровно 30% не теряется на 0.2999…
+        if sold >= OPERATOR_SOLD_MIN:
+            out.append({"kind": "operator_sold", "sold": sold, "from": before, "to": round(now, ROUND),
+                        "text": f"Biggest operator sold {sold * 100:.0f}% of their holdings "
+                                f"({_pct(before)} → {_pct(now)} of supply)"})
+    oe, ne = old.get("early_share"), new.get("early_share")
+    if oe is not None and ne is not None and oe >= EARLY_MIN_SHARE:
+        fell = round(1 - ne / oe, 4)
+        if fell >= EARLY_DROP_MIN:
+            out.append({"kind": "early_dropped", "fell": fell, "from": oe, "to": ne,
+                        "text": f"Early buyers' share fell {fell * 100:.0f}% ({_pct(oe)} → {_pct(ne)} of supply)"})
+    return out
