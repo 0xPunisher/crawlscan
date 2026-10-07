@@ -302,7 +302,7 @@ TOKEN_CA_SHORT = TOKEN_CA[:6] + "…" + TOKEN_CA[-4:]
 # GeckoTerminal — пул кривой Pons (dex pons-v2, реальная ликвидность и объём). Пары Dexscreener
 # для этого токена — сторонние V4-пулы с ликвидностью около $1: их график показывал бы ложную цену.
 CHART_KIND = "gecko"
-CHART_POOL = "0x75777d4b075af933df9264d460a3ce2ba7b2e9dd"   # кривая токена (get_launch)
+CHART_POOL = "0x835f8dfd0065bb0538b3944f286baafd70a779d433cb76a8a27e6ad0a4517892"   # пул pons-v2-dex после миграции
 DEX_PAIR = None                                              # пара Dexscreener, если появится настоящая
 CHART_URL = {
     "gecko": f"https://www.geckoterminal.com/robinhood/pools/{CHART_POOL}?embed=1&info=0&swaps=0&grayscale=0&light_chart=0",
