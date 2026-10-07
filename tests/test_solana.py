@@ -1,6 +1,6 @@
 """Тесты Solana-ветки движка на подставных данных (без сети): сеть по адресу, флаг SOLANA_ENABLED,
 окно стаи по сети, unread-входы, токен целиком в кривой."""
-import os, unittest
+import os, time, unittest
 from contextlib import ExitStack
 from unittest import mock
 
@@ -13,7 +13,7 @@ SOL_TOKEN = sol.b58encode(bytes([7]) * 32)
 SOL_CURVE = sol.b58encode(bytes([8]) * 32)
 SOL_WALLETS = [sol.b58encode(bytes([20 + i]) * 32) for i in range(12)]
 EVM_WALLETS = ["0x" + f"{20 + i:02x}" * 20 for i in range(12)]
-LAUNCH_SLOT, LAUNCH_TS = 1000, 1_700_000_000
+LAUNCH_SLOT, LAUNCH_TS = 1000, int(time.time()) - 3600   # свежий запуск: час назад
 SUPPLY = 10 ** 15
 PACK = 3                                   # первые 3 кошелька — стая в соседних слотах
 

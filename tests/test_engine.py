@@ -116,7 +116,7 @@ class TestMarketTimeout(unittest.TestCase):
     """Шапка GeckoTerminal не задерживает скан: ≤ 3 с на запрос, движок ждёт ≤ MARKET_WAIT от старта."""
 
     def test_slow_header_not_awaited(self):
-        def slow(token, network="robinhood"):
+        def slow(token, network="robinhood", **kw):
             time.sleep(1.5)
             return {"name": "Late", "liquidity_usd": 10.0}
         with fakes.patched(), mock.patch.object(fakes.market, "fetch_market", side_effect=slow), \

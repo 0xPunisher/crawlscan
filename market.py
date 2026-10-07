@@ -2,8 +2,11 @@
 На HTTP 429 повторяем с нарастающей паузой. Шапка — один запрос /tokens/{token}:
 бесплатный тариф GT быстро отвечает 429, а в этом ответе уже есть всё для шапки.
 Тот же ответ (с include=top_pools) даёт возраст пулов и FDV для проверки «too established» до скана.
-Чарт (fetch_chart) в скан не входит: его отдаёт отдельный /api/chart."""
-import json, time, urllib.request, urllib.error
+Чарт (fetch_chart) в скан не входит: его отдаёт отдельный /api/chart.
+Удачные ответы GT кэшируются по пути запроса на GT_CACHE_TTL (общий кэш для проверки перед сканом,
+шапки и чарта); вердикт «too established» — на ESTABLISHED_TTL (established_get / established_put).
+Каждый сбой GT пишется в лог одной строкой: путь, исход попыток (http-код / timeout), время."""
+import json, socket, threading, time, urllib.request, urllib.error
 from datetime import datetime
 
 GT = "https://api.geckoterminal.com/api/v2/networks"
@@ -14,39 +17,103 @@ CURVE_DEX = "pump-fun"  # пул бондинг-кривой pump.fun: посл�
 # таймфрейм по возрасту токена: (возраст до, часов; GT timeframe; aggregate; подпись)
 TIMEFRAMES = ((2, "minute", 1, "1m"), (6, "minute", 5, "5m"), (48, "minute", 15, "15m"),
               (240, "hour", 1, "1h"), (None, "hour", 4, "4h"))
+GT_CACHE_TTL = 15 * 60       # секунд: удачный ответ GT по пути запроса
+GT_CACHE_MAX = 2000          # путей в кэше; старые вытесняются
+ESTABLISHED_TTL = 24 * 3600  # секунд: вердикт «too established» по токену — повторный скан не идёт в GT
+
+_CACHE, _EST, _lock = {}, {}, threading.Lock()
+
+
+def clear_cache():
+    with _lock:
+        _CACHE.clear()
+        _EST.clear()
+
+
+def _key(token, network):
+    return network, token.lower() if network == "robinhood" else token
+
+
+def established_get(token, network="robinhood"):
+    """Данные GT, по которым токен признан too established, если вердикт моложе ESTABLISHED_TTL, иначе None."""
+    with _lock:
+        hit = _EST.get(_key(token, network))
+    return dict(hit[1]) if hit and time.time() - hit[0] < ESTABLISHED_TTL else None
+
+
+def established_put(token, network, market):
+    with _lock:
+        _EST[_key(token, network)] = (time.time(), dict(market))
+        if len(_EST) > GT_CACHE_MAX:
+            for k, _ in sorted(_EST.items(), key=lambda kv: kv[1][0])[:len(_EST) - GT_CACHE_MAX]:
+                del _EST[k]
+
+
+def _why(e):
+    """Исход неудачной попытки для лога: http-код, timeout или тип ошибки."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"http {e.code}"
+    if isinstance(e, (TimeoutError, socket.timeout)) or isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout)):
+        return "timeout"
+    return type(e).__name__
 
 
 def _gt(path, budget=GT_BUDGET):
-    """GET к GeckoTerminal. На все попытки (включая паузу после 429) не больше budget секунд:
-    шапка не должна задерживать скан."""
-    end = time.time() + budget
-    last = None
+    """GET к GeckoTerminal. На все попытки (включая паузы после 429) не больше budget секунд:
+    шапка не должна задерживать скан. Удачный ответ кэшируется на GT_CACHE_TTL. Неудачные попытки
+    пишутся в лог одной строкой (и при итоговом сбое, и при успехе после повторов)."""
+    with _lock:
+        hit = _CACHE.get(path)
+    if hit and time.time() - hit[0] < GT_CACHE_TTL:
+        return hit[1]
+    t0 = time.time()
+    end = t0 + budget
+    last, fails = None, []
+
+    def log(outcome):
+        print(f"gt: {outcome} {path} [{', '.join(fails)}] {time.time() - t0:.1f}s", flush=True)
+
     while True:
         left = end - time.time()
         if left <= 0.2:
+            fails.append("no time left")
+            log("fail")
             raise last or TimeoutError("geckoterminal: no time left")
         req = urllib.request.Request(GT + path, headers={"accept": "application/json", "user-agent": "rh-crawler/0.1"})
         try:
-            with urllib.request.urlopen(req, timeout=min(GT_BUDGET, left)) as r:
-                return json.loads(r.read())
+            with urllib.request.urlopen(req, timeout=left) as r:
+                data = json.loads(r.read())
+            if fails:
+                log("ok after")
+            with _lock:
+                _CACHE[path] = (time.time(), data)
+                if len(_CACHE) > GT_CACHE_MAX:
+                    for k, _ in sorted(_CACHE.items(), key=lambda kv: kv[1][0])[:len(_CACHE) - GT_CACHE_MAX]:
+                        del _CACHE[k]
+            return data
         except urllib.error.HTTPError as e:
             last = e
+            fails.append(_why(e))
             if e.code != 429:
+                log("fail")
                 raise
         except Exception as e:
             last = e
-        time.sleep(min(0.5, max(0.0, end - time.time() - 0.2)))
+            fails.append(_why(e))
+        # пауза растёт: 0.5, 1, 2, 4 с — на 429 не добиваем GT частыми повторами
+        time.sleep(min(0.5 * 2 ** (len(fails) - 1), 4.0, max(0.0, end - time.time() - 0.2)))
 
 
-def fetch_market(token, network="robinhood", now=None):
+def fetch_market(token, network="robinhood", now=None, budget=GT_BUDGET):
     """{"name", "ticker", "price_usd", "mcap_usd", "fdv_usd", "liquidity_usd", "vol24h_usd", "age_days"}
     или {} при ошибке. Один запрос /tokens/{token}?include=top_pools.
     mcap — market_cap_usd, если GT его знает, иначе fdv; liquidity — сумма пулов (total_reserve_in_usd);
     age_days — от создания самого раннего из топ-пулов (None, если GT не дал дат).
-    network — сеть GT: "robinhood" | "solana" (адреса Solana регистрозависимы, их не приводим к нижнему регистру)."""
+    network — сеть GT: "robinhood" | "solana" (адреса Solana регистрозависимы, их не приводим к нижнему регистру).
+    budget — секунд на все попытки (движок ждёт ответ в фоне дольше, чем шапку)."""
     tok = token.lower() if network == "robinhood" else token
     try:
-        d = _gt(f"/{network}/tokens/{tok}?include=top_pools")
+        d = _gt(f"/{network}/tokens/{tok}?include=top_pools", budget=budget)
     except Exception:
         return {}
     a = (d.get("data") or {}).get("attributes") or {}

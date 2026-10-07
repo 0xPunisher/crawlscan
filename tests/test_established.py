@@ -77,12 +77,14 @@ class TestEngine(unittest.TestCase):
 
     def test_gt_down_or_slow_scans_normally(self):
         with fakes.patched(), mock.patch.object(market, "fetch_market", REAL_FETCH), \
+                mock.patch.object(engine, "MARKET_LATE", 0.3), \
                 mock.patch.object(market.urllib.request, "urlopen", side_effect=OSError("geckoterminal down")):
             res = engine.scan(fakes.TOKEN)                               # настоящий fetch_market: сеть GT упала → {}
+            time.sleep(0.4)                                              # фоновый запрос GT кончился под моком
         self.assertNotEqual(res["band"], "TOO_ESTABLISHED")
         self.assertIsNone(res["header"]["liquidity_usd"])
 
-        def slow(token, network="robinhood"):
+        def slow(token, network="robinhood", **kw):
             time.sleep(0.5)
             return BIG_OLD
         with fakes.patched(), mock.patch.object(market, "fetch_market", side_effect=slow), \
@@ -102,6 +104,215 @@ class TestEngine(unittest.TestCase):
         res, _, _ = scan(BIG_OLD)
         e = recent_store.entry(res, ts=1)
         self.assertEqual((e["band"], e["score"], e["rug"], e["ticker"]), ("TOO_ESTABLISHED", None, False, "Fartcoin"))
+
+
+def gt_response(age_days=718.8, liq=7.6e6, mcap=168e6):
+    """Ответ GT /tokens/{ca}?include=top_pools для настоящего fetch_market."""
+    born = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age_days * 86400))
+    return {"data": {"attributes": {"name": "Fartcoin", "symbol": "Fartcoin", "price_usd": "0.17",
+                                    "market_cap_usd": str(mcap), "fdv_usd": str(mcap),
+                                    "total_reserve_in_usd": str(liq), "volume_usd": {"h24": "2300000"}}},
+            "included": [{"type": "pool", "attributes": {"pool_created_at": born}}]}
+
+
+class TestGtCache(unittest.TestCase):
+    """Кэш GT (market._gt) и вердикта too established (market.established_*). Без сети."""
+
+    def setUp(self):
+        market.clear_cache()
+        self.calls = []
+
+    def tearDown(self):
+        market.clear_cache()
+
+    def gt(self, resp):
+        def fn(path, budget=market.GT_BUDGET):
+            self.calls.append(path)
+            if isinstance(resp, Exception):
+                raise resp
+            return resp
+        return fn
+
+    def urlopen(self, body):
+        class R:
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+            def read(s): return __import__("json").dumps(body).encode()
+
+        def fn(req, timeout):
+            self.calls.append(req.full_url)
+            return R()
+        return fn
+
+    def test_repeat_request_cached(self):
+        with mock.patch.object(market.urllib.request, "urlopen", side_effect=self.urlopen(gt_response())):
+            a = market.fetch_market(fakes.TOKEN)
+            b = market.fetch_market(fakes.TOKEN)
+        self.assertEqual(a, b)
+        self.assertEqual(len(self.calls), 1)                          # повтор — из кэша
+        with mock.patch.object(market.urllib.request, "urlopen", side_effect=self.urlopen(gt_response())), \
+                mock.patch.object(market, "GT_CACHE_TTL", 0):
+            market.fetch_market(fakes.TOKEN)
+        self.assertEqual(len(self.calls), 2)                          # кэш устарел — снова в GT
+
+    def test_failure_not_cached_and_logged(self):
+        def boom(req, timeout):
+            self.calls.append(req.full_url)
+            raise market.urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
+        with mock.patch.object(market.urllib.request, "urlopen", side_effect=boom), \
+                mock.patch("builtins.print") as pr:
+            self.assertEqual(market.fetch_market(fakes.TOKEN, budget=0.8), {})
+        line = " ".join(str(a) for c in pr.call_args_list for a in c.args)
+        self.assertIn("gt: fail /robinhood/tokens/", line)
+        self.assertIn("http 429", line)
+        n = len(self.calls)
+        with mock.patch.object(market.urllib.request, "urlopen", side_effect=self.urlopen(gt_response())):
+            self.assertTrue(market.fetch_market(fakes.TOKEN))
+        self.assertEqual(len(self.calls), n + 1)                      # сбой не кэшируется
+
+    def test_timeout_logged(self):
+        def slow(req, timeout):
+            raise market.urllib.error.URLError(TimeoutError("timed out"))
+        with mock.patch.object(market.urllib.request, "urlopen", side_effect=slow), \
+                mock.patch("builtins.print") as pr:
+            market.fetch_market(fakes.TOKEN, budget=0.6)
+        self.assertIn("timeout", " ".join(str(a) for c in pr.call_args_list for a in c.args))
+
+    def test_established_verdict_cached_for_a_day(self):
+        with fakes.patched(), mock.patch.object(market, "fetch_market", REAL_FETCH), \
+                mock.patch.object(market, "_gt", side_effect=self.gt(gt_response())):
+            first = engine.scan(fakes.TOKEN)
+            market._CACHE.clear()                                     # ответ GT забыт, вердикт — нет
+            second = engine.scan(fakes.TOKEN)
+            launched = ch.get_launch.called
+        self.assertEqual((first["band"], second["band"]), ("TOO_ESTABLISHED", "TOO_ESTABLISHED"))
+        self.assertEqual(len(self.calls), 1)                          # повторный скан GT не запрашивал
+        self.assertFalse(launched)
+        self.assertEqual(second["established"]["age_days"], first["established"]["age_days"])
+        hit = market._EST[market._key(fakes.TOKEN, "robinhood")]
+        market._EST[market._key(fakes.TOKEN, "robinhood")] = (hit[0] - market.ESTABLISHED_TTL - 1, hit[1])
+        self.assertIsNone(market.established_get(fakes.TOKEN))        # сутки прошли — вердикт устарел
+        market._CACHE.clear()
+
+
+class TestLateAndLimited(unittest.TestCase):
+    """Поздний ответ GT и подстраховка для старого токена без данных рынка."""
+
+    def scan(self, fetch, launch_age_days, wait=0.1):
+        ts0 = time.time() - launch_age_days * 86400
+        with fakes.patched(), mock.patch.object(market, "fetch_market", side_effect=fetch), \
+                mock.patch.object(engine, "MARKET_WAIT", wait), \
+                mock.patch.object(ch, "block_timestamps",
+                                  side_effect=lambda bl: {b: int(ts0) + (b - fakes.LAUNCH_BLOCK) for b in bl}):
+            return engine.scan(fakes.TOKEN), ch.get_launch.called
+
+    def test_late_gt_gives_too_established(self):
+        def slow(token, network="robinhood", **kw):
+            time.sleep(0.3)
+            return BIG_OLD
+
+        def slow_history(*a, **k):
+            time.sleep(0.4)                                           # скан дольше, чем ждёт GT
+            return fakes.history(*a, **k)
+        with fakes.patched(history_fn=slow_history), mock.patch.object(market, "fetch_market", side_effect=slow), \
+                mock.patch.object(engine, "MARKET_WAIT", 0.1):
+            res = engine.scan(fakes.TOKEN)
+            launched = ch.get_launch.called
+            est = market.established_get(fakes.TOKEN)
+        self.assertTrue(launched)                                     # скан начался без GT
+        self.assertEqual((res["band"], res["score"], res["rug"]), ("TOO_ESTABLISHED", None, None))
+        self.assertEqual(est["mcap_usd"], BIG_OLD["mcap_usd"])        # поздний вердикт тоже в кэше
+
+    def test_late_gt_fresh_token_used_for_header(self):
+        fresh = BIG_OLD | {"age_days": 0.5, "liquidity_usd": 500.0}
+
+        def slow(token, network="robinhood", **kw):
+            time.sleep(0.2)
+            return fresh
+
+        def slow_history(*a, **k):
+            time.sleep(0.4)
+            return fakes.history(*a, **k)
+        with fakes.patched(history_fn=slow_history), mock.patch.object(market, "fetch_market", side_effect=slow), \
+                mock.patch.object(engine, "MARKET_WAIT", 0.05):
+            res = engine.scan(fakes.TOKEN)
+        self.assertNotEqual(res["band"], "TOO_ESTABLISHED")
+        self.assertEqual(res["header"]["liquidity_usd"], 500.0)       # поздний ответ — в шапке и в правилах
+        self.assertTrue([g for g in res["gates"] if "liquidity too thin" in g])
+
+    def gated(self):
+        """Сценарий, где без подстраховки срабатывают жёсткие правила impact и transfer."""
+        real_facts = ch.token_facts
+
+        def facts(token, launch):
+            f = real_facts(token, launch)
+            return f | {"reserve": 1, "reserve_ok": True}            # ничтожный резерв: impact ≈ 100%
+        def classify(token, trs, wallets):
+            out = fakes.classify_entries(token, trs, wallets)
+            for w in fakes.WALLETS[:5]:
+                out[w] = out[w] | {"kind": "transfer", "eth_in": None}  # 5 крупнейших получили переводом
+            return out
+        return facts, classify
+
+    def scan_gated(self, fetch, age_days):
+        facts, classify = self.gated()
+        ts0 = time.time() - age_days * 86400
+        with fakes.patched(), mock.patch.object(market, "fetch_market", side_effect=fetch), \
+                mock.patch.object(engine, "MARKET_WAIT", 0.1), \
+                mock.patch.object(ch, "classify_entries", side_effect=classify), \
+                mock.patch.object(ch, "token_facts", side_effect=facts, create=True), \
+                mock.patch.object(ch, "block_timestamps",
+                                  side_effect=lambda bl: {b: int(ts0) + (b - fakes.LAUNCH_BLOCK) for b in bl}):
+            return engine.scan(fakes.TOKEN)
+
+    def test_gated_scenario_is_danger_with_market(self):
+        res = self.scan_gated(lambda *a, **k: {"liquidity_usd": 5e4}, 400)
+        self.assertEqual(res["band"], "DANGER")                       # с данными рынка — как раньше
+        self.assertFalse(res["limited"])
+        self.assertTrue([g for g in res["gates"] if "could move price" in g])
+        self.assertTrue([g for g in res["gates"] if "received by transfer" in g])
+
+    def test_gt_down_old_token_limited(self):
+        res = self.scan_gated(lambda *a, **k: {}, 400)
+        self.assertTrue(res["limited"])
+        self.assertFalse([g for g in res["gates"] if "could move price" in g or "received by transfer" in g])
+        self.assertIsNone(res["rug"])
+        self.assertTrue(res["headline"].endswith("market data unavailable, older token: holder signals are limited"))
+        self.assertIn(res["band"], ("CLEAN", "OK", "RISKY"))           # не ниже RISKY
+        self.assertIsNotNone(res["score"])
+
+    def test_gt_down_young_token_unchanged(self):
+        down = self.scan_gated(lambda *a, **k: {}, 2)
+        self.assertFalse(down["limited"])
+        self.assertEqual(down["band"], "DANGER")                      # молодой токен — правила как раньше
+        self.assertTrue([g for g in down["gates"] if "could move price" in g])
+        self.assertTrue([g for g in down["gates"] if "received by transfer" in g])
+        self.assertIsNotNone(down["rug"])
+        self.assertNotIn("market data unavailable", down["headline"])
+        # тот же молодой токен на обычном скане (fakes) — ровно прежний скор
+        res, _ = self.scan(lambda *a, **k: {}, 2)
+        base, _ = self.scan(lambda *a, **k: {}, 0.04)
+        self.assertEqual((res["score"], res["band"], res["gates"], res["headline"]),
+                         (base["score"], base["band"], base["gates"], base["headline"]))
+
+    def test_limited_score_pure(self):
+        s = TestRugProjection.build(self)
+        sig = signals(s)
+        plain = d.score(s.holders, sig, s.ops, s.base, s.reserve)
+        lim = d.score(s.holders, sig, s.ops, s.base, s.reserve, limited=True)
+        self.assertEqual(plain["parts"], lim["parts"])                # части скора те же
+        self.assertEqual(lim["headline"], plain["headline"] + d.LIMITED_NOTE)
+        self.assertFalse([g for g in lim["gates"] if "could move price" in g or "received by transfer" in g])
+
+    def test_limited_band_not_below_risky(self):
+        s = TestRugProjection.build(self)
+        sig = signals(s)
+        for v in sig.values():
+            v["virgin"] = True                                        # жёсткое правило virgin → DANGER
+        plain = d.score(s.holders, sig, s.ops, s.base, s.reserve)
+        lim = d.score(s.holders, sig, s.ops, s.base, s.reserve, limited=True)
+        self.assertEqual(plain["band"], "DANGER")
+        self.assertEqual(lim["band"], "RISKY")
 
 
 class TestReserveOk(unittest.TestCase):

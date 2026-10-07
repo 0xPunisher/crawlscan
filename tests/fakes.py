@@ -18,7 +18,7 @@ OTHER = "0x" + "cd" * 20              # не Pons V2: get_launch вернёт No
 CURVE = "0x" + "c0" * 20
 DEPLOYER = "0x" + "de" * 20
 ZERO = "0x" + "0" * 40
-LAUNCH_BLOCK, LAUNCH_TS = 1000, 1_700_000_000
+LAUNCH_BLOCK, LAUNCH_TS = 1000, int(time.time()) - 3600   # свежий запуск: час назад
 SUPPLY = 1_000_000 * 10 ** 18
 N_WALLETS = 15
 BUNDLE = 3                            # первые 3 кошелька купили одной транзакцией
@@ -61,9 +61,10 @@ def history(wallet_, before_block, token, window=None, cap=4):
 
 
 def patched(history_fn=history, launch=True):
-    """Контекст: адаптер и рынок подменены, сеть запрещена, кэш истории движка очищен."""
+    """Контекст: адаптер и рынок подменены, сеть запрещена, кэш истории движка и кэш GT очищены."""
     stack = ExitStack()
     engine._HIST.clear()
+    market.clear_cache()
     launch_info = {"block": LAUNCH_BLOCK, "curve": CURVE, "deployer": DEPLOYER, "tx": "0xlaunch"}
     p = lambda name, **kw: stack.enter_context(mock.patch.object(ch, name, **kw))
     p("_post", side_effect=_no_network)
