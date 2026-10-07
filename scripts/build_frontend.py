@@ -23,7 +23,8 @@
     между «crawlers at work» и «how it works», строка CA с copy в герое;
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
     переносы в логах, отступы 16 px;
-  - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора;
+  - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора; TOO ESTABLISHED (TOO_ESTABLISHED) — без скора,
+    таблицы холдеров и критериев: шапка, чарт, карточка вердикта с пояснением, Trade on Axiom;
   - цвета частей скора и критериев: больше баллов = чище = зелёный, мало = красный;
   - две сети: сеть по адресу (0x + 40 hex — Robinhood, base58 32–44 — Solana, регистр Solana
     не меняется), переключатель «Robinhood | Solana» над полем (плейсхолдер и sample сети),
@@ -99,7 +100,7 @@ rep('<meta name="viewport" content="width=device-width, initial-scale=1">\n<scri
 
 # полоса TOO EARLY
 rep("const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD};",
-    "const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD,'TOO EARLY':'#8a959c'};")
+    "const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD,'TOO EARLY':'#8a959c','TOO ESTABLISHED':'#8a959c'};")
 
 # нормализация API -> формат дизайна (перед классом)
 rep("class Component extends DCLogic {", r'''// ---- live API (rh-crawler server.py) -> design format ----
@@ -136,7 +137,7 @@ function normalizeEvent(e){
       break;
     }
     case 'done':
-      o.band=e.band==='TOO_EARLY_OR_LATE'?'TOO EARLY':e.band; break;
+      o.band=e.band==='TOO_EARLY_OR_LATE'?'TOO EARLY':e.band==='TOO_ESTABLISHED'?'TOO ESTABLISHED':e.band; break;
     case 'error': o.detail=e.detail||'error'; break;
   }
   return o;
@@ -1210,11 +1211,12 @@ rep("  blank(ca){return {", r"""  loadRecent(){   // лента «recently scann
     const items=this.state.recent||[], now=Date.now()/1000;
     const ago=ts=>{const s=Math.max(0,Math.floor(now-ts)); return s<60?'just now':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago';};
     const rows=items.map(x=>{
-      const early=x.band==='TOO_EARLY_OR_LATE', band=early?'TOO EARLY':x.band, col=BANDS[band]||'#8a959c', sol=x.chain==='solana';
+      const early=x.band==='TOO_EARLY_OR_LATE', est=x.band==='TOO_ESTABLISHED', band=early?'TOO EARLY':est?'TOO ESTABLISHED':x.band,
+        col=BANDS[band]||'#8a959c', sol=x.chain==='solana';
       return {ticker:x.ticker?'$'+x.ticker:(x.name||x.token.slice(0,6)+'…'+x.token.slice(-4)),
         chain:sol?'Solana':'Robinhood', chainColor:sol?'#9945FF':'#00c805',
         addr:x.token.slice(0,6)+'…'+x.token.slice(-4), full:x.token,
-        score:x.score!=null&&!early?String(x.score):'—', band:early?'too early':band, color:col,
+        score:est?'':x.score!=null&&!early?String(x.score):'—', band:early?'too early':est?'too established':band, color:col,
         rug:!!x.rug, ago:ago(x.ts), href:'/?ca='+encodeURIComponent(x.token),
         go:e=>{e.preventDefault(); this.startScan(x.token);},
         copy:e=>{e.preventDefault(); e.stopPropagation(); this.copyCa('r:'+x.token,x.token);},
@@ -1249,7 +1251,7 @@ RECENT_BLOCK = f'''          <sc-if value="{{{{recentOn}}}}" hint-placeholder-va
 '''
 rep('try a sample →</a>\n        </div>\n', 'try a sample →</a>\n        </div>\n' + RECENT_BLOCK)
 RECENT_CSS = """
-.cs-recent-row{grid-template-columns:minmax(0,1fr) 92px 110px 34px 84px 116px 62px;grid-template-areas:"t c a s v r g";column-gap:12px}
+.cs-recent-row{grid-template-columns:minmax(0,1fr) 92px 110px 34px 116px 116px 62px;grid-template-areas:"t c a s v r g";column-gap:12px}
 .cs-rc-t{grid-area:t}.cs-rc-c{grid-area:c}.cs-rc-a{grid-area:a}.cs-rc-s{grid-area:s}.cs-rc-v{grid-area:v}.cs-rc-r{grid-area:r}.cs-rc-g{grid-area:g}
 @media (max-width:640px){.cs-recent-row{grid-template-columns:auto auto minmax(0,1fr) auto!important;grid-template-areas:"t t s v" "c a r g"!important;row-gap:6px}.cs-rc-r{justify-self:end!important}.cs-rc-pw{display:none}}
 """
@@ -1273,6 +1275,36 @@ TRADE_BTN = (f'<sc-if value="{{{{tradeOn}}}}" hint-placeholder-val="{{{{false}}}
              f'style-hover="background:rgba(0,200,5,0.16);border-color:#00c805">Trade on Axiom ↗</a></sc-if>\n')
 REASON = '{{reason}}</span>\n              <div style="display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid #141b20">'
 rep(REASON, REASON.replace('</span>\n', '</span>\n              ' + TRADE_BTN, 1))
+
+# ---------------------------------------------------------------------------
+# «too established» (band TOO_ESTABLISHED): полный скан не запускался. На странице результата — шапка,
+# чарт, карточка вердикта (TOO ESTABLISHED, без скора, заголовок и пояснение) и Trade on Axiom;
+# таблица холдеров, части скора, факты и «What the crawlers checked» скрыты (data-est="1" на main).
+# В ленте — пометка «too established» вместо скора.
+# ---------------------------------------------------------------------------
+rep('<main data-screen-label="Scan" style="position:relative;z-index:1;padding-bottom:120px">',
+    '<main data-screen-label="Scan" data-est="{{estFlag}}" style="position:relative;z-index:1;padding-bottom:120px">')
+rep('''<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));border-bottom:1px solid #12181c;font-family:'JetBrains Mono',monospace">''',
+    '''<div class="cs-facts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));border-bottom:1px solid #12181c;font-family:'JetBrains Mono',monospace">''')
+rep('<div style="display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid #141b20">',
+    '<div class="cs-parts" style="display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid #141b20">')
+rep('<div style="margin-top:56px;display:flex;flex-direction:column;gap:18px">',
+    '<div class="cs-crit" style="margin-top:56px;display:flex;flex-direction:column;gap:18px">')
+rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}"
+    "\n[data-est=\"1\"] .cs-facts,[data-est=\"1\"] .cs-scan-table,[data-est=\"1\"] .cs-parts,[data-est=\"1\"] .cs-crit,"
+    "[data-est=\"1\"] .cs-score{display:none!important}"
+    "\n[data-est=\"1\"] aside{max-width:720px!important}\n")
+rep("  blank(ca){return {", """  estVals(){   // too established: полный скан не запускался
+    const dn=this.state.view==='scan'&&this.m&&this.m.done;
+    return {estFlag:dn&&dn.band==='TOO ESTABLISHED'?'1':'0'};
+  }
+  blank(ca){return {""")
+rep("      ...this.tradeVals(),", "      ...this.tradeVals(),\n      ...this.estVals(),")
+# число скора скрыто (его нет); в логе вердикта без «null» (и для TOO EARLY)
+rep('<div data-grip="1" style="display:flex;align-items:baseline;gap:8px">',
+    '<div class="cs-score" data-grip="1" style="display:flex;align-items:baseline;gap:8px">')
+rep("this.log('verdict',BANDS[e.band]||A,`${e.score} ${e.band} · ${e.detail||''}`,BANDS[e.band]||A);",
+    "this.log('verdict',BANDS[e.band]||A,`${e.score!=null?e.score+' ':''}${e.band} · ${e.detail||''}`,BANDS[e.band]||A);")
 
 # суммы меньше $1K — без хвоста знаков (тонкая ликвидность на Solana)
 rep("':'$'+v;", "':'$'+(v>=10?Math.round(v):v.toFixed(2));")

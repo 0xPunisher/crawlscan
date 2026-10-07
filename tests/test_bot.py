@@ -316,6 +316,23 @@ class TestVerdict(unittest.TestCase):
         self.assertNotIn("Score", msg["text"])
         self.assertIn(PUMP, msg["reply_markup"]["inline_keyboard"][0][0]["url"])
 
+    def test_too_established(self):
+        res = {"token": PUMP, "chain": "solana", "header": {"name": "Fartcoin", "ticker": "Fartcoin"},
+               "band": "TOO_ESTABLISHED", "score": None, "headline": "This token is too established for CrawlScan.",
+               "reason": T.ESTABLISHED_TEXT, "holders": [], "operators": [], "metrics": {}, "gates": []}
+        msg = self.scan(FakeAPI(res))
+        self.assertEqual(msg["text"], "<b>$Fartcoin</b> · Solana\n\n"
+                                      "🏛 <b>This token is too established for CrawlScan.</b>\n" + T.ESTABLISHED_TEXT)
+        self.assertNotIn("Score", msg["text"])
+        self.assertEqual([b["text"] for b in msg["reply_markup"]["inline_keyboard"][0]], ["Full report", "Trade on Axiom"])
+        self.assertIn("don't mean what they mean on a fresh launch.", T.ESTABLISHED_TEXT)
+
+    def test_liquidity_not_measured(self):
+        t = self.scan(FakeAPI(result(metrics={"impact": None, "operator": 0.123, "virgin": 0, "transfer": 0,
+                                              "sniper": 0})))["text"]
+        self.assertIn("Biggest operator (2 wallets) holds 12.3% of float · liquidity not measured", t)
+        self.assertNotIn("could move price", t)
+
     def test_errors(self):
         cases = [(FakeAPI(reject="not a token address"), "is not a token address"),
                  (FakeAPI(reject="Solana support is coming soon"), "Solana support is coming soon"),

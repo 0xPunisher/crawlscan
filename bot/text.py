@@ -13,6 +13,12 @@ B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 CHAIN_NAME = {"robinhood": "Robinhood Chain", "solana": "Solana"}
 BAND_ICON = {"CLEAN": "🟢", "OK": "🟡", "RISKY": "🟠", "DANGER": "🔴"}
 TOO_EARLY = "TOO_EARLY_OR_LATE"
+TOO_ESTABLISHED = "TOO_ESTABLISHED"
+ESTABLISHED_HEADLINE = "This token is too established for CrawlScan."
+ESTABLISHED_TEXT = ("CrawlScan is built for fresh memecoins. On large, older tokens the top holders are mostly "
+                    "exchanges and big liquidity pools: tokens reach exchange wallets by transfer, not by buying, "
+                    "and liquidity is spread across many pools, so holder patterns don't mean what they mean "
+                    "on a fresh launch.")
 
 
 def _b58_len(s):
@@ -75,7 +81,8 @@ START_BUTTONS = {"inline_keyboard": [
 HELP = (
     "<b>How to read a verdict</b>\n\n"
     "<b>Score 0–100</b>: 100 = clean. The lower it is, the more the top holders look like a few people.\n"
-    "<b>Verdict</b>: 🟢 CLEAN · 🟡 OK · 🟠 RISKY · 🔴 DANGER. ⏳ TOO EARLY OR LATE: too few holders to judge.\n"
+    "<b>Verdict</b>: 🟢 CLEAN · 🟡 OK · 🟠 RISKY · 🔴 DANGER. ⏳ TOO EARLY OR LATE: too few holders to judge. "
+    "🏛 TOO ESTABLISHED: a large, older token, not scanned.\n"
     "<b>Operators</b>: real people behind the top holders. Wallets linked by shared buys or transfers "
     "count as one operator.\n"
     "<b>Dump impact</b>: how far the price could drop if the biggest operator sold everything.\n"
@@ -171,6 +178,10 @@ def verdict(res):
     lines = [title(res), ""]
     holders = len(res.get("holders") or [])
     ops = res.get("operators") or []
+    if res.get("band") == TOO_ESTABLISHED:     # полный скан не запускался: без скора
+        lines.append(f"🏛 <b>{e(res.get('headline') or ESTABLISHED_HEADLINE)}</b>")
+        lines.append(e(res.get("reason") or ESTABLISHED_TEXT))
+        return "\n".join(lines)
     if res.get("band") == TOO_EARLY:
         lines.append("⏳ <b>Too early or too late</b>")
         lines.append(f"Only {res.get('holders_total', 0)} holders, too few to judge.")
@@ -183,7 +194,10 @@ def verdict(res):
     if ops and "impact" in m:
         n = len(ops[0].get("wallets") or [])
         who = f"Biggest operator ({n} wallets)" if n > 1 else "Biggest operator"
-        lines.append(f"{who} could move price {impact_phrase(m['impact'])} if sold")
+        if m["impact"] is None:                   # резерв не измерен надёжно: падение не считаем
+            lines.append(f"{who} holds {_pct(m.get('operator') or 0, 1)}% of float · liquidity not measured")
+        else:
+            lines.append(f"{who} could move price {impact_phrase(m['impact'])} if sold")
     if res.get("rug"):
         lines += [""] + rug_lines(res["rug"])
 

@@ -76,6 +76,13 @@ DEX = {  # участие в транзакции = сделка (роутеры
     "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4": "Jupiter v6",
     "6m2CDdhRgxpH4WjvdzxAYbGxwdGUz5MziiL5jek2kBma": "OKX DEX",
 }
+# Общие authority хранилищ пулов: PDA без данных (getAccountInfo → null, «system-owned»), поэтому по
+# программе-владельцу их не узнать. Выведены из сидов программ (find_pda), проверено 2026-10-07.
+VAULT_AUTHORITIES = {
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1": "Raydium AMM v4",   # [b"amm authority"]
+    "GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL": "Raydium CPMM",     # [b"vault_and_lp_mint_auth_seed"]
+    "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC": "Meteora DAMM v2",  # [b"pool_authority"]
+}
 INFRA = {  # не холдеры ни для какого токена; кривая, её аккаунт и PDA рынка — в excluded_addresses
     BURN, SYSTEM, PUMP, PUMP_SWAP, PUMP_MINT_AUTH, PUMP_GLOBAL, PUMP_MIGRATION, PUMP_FEE,
 } | set(DEX)
@@ -455,7 +462,9 @@ def top_accounts(token):
         for a, info in zip(pdas, rpc("getMultipleAccounts", [pdas, {"encoding": "base64", "dataSlice": {"offset": 0, "length": 0}}])["value"]):
             prog = info["owner"] if info else None
             _OWNER_PROG[a] = prog
-            _LABEL[a] = {PUMP_SWAP: "PumpSwap pool", PUMP: "pump.fun", SYSTEM: "system-owned PDA"}.get(prog, f"PDA of {DEX.get(prog, prog)}")
+            _LABEL[a] = ({PUMP_SWAP: "PumpSwap pool", PUMP: "pump.fun"}.get(prog) or
+                         (f"{VAULT_AUTHORITIES[a]} pool" if a in VAULT_AUTHORITIES else None) or
+                         ("system-owned PDA" if prog == SYSTEM else f"PDA of {DEX.get(prog, prog)}"))
     for r in rows:
         if r["owner"] == BURN:
             _LABEL[r["owner"]] = "burn"
@@ -484,25 +493,32 @@ def supply_base(token, launch):
     return {"supply": supply, "circulating": supply - infra, "holders_total": len(bal), "balances": dict(bal)}
 
 
+def is_pool_owner(owner):
+    """Владелец токен-аккаунта — пул DEX: PDA DEX-программы или общий authority хранилищ (VAULT_AUTHORITIES)."""
+    return owner in VAULT_AUTHORITIES or _OWNER_PROG.get(owner) in DEX
+
+
 def token_facts(token, launch):
     """Факты о токене для движка (общий контракт сетей): {"supply", "transfers", "excluded",
-    "market", "reserve", "base"}. base — балансы топ-20 (форма detect.supply_base); transfers — только
+    "market", "reserve", "reserve_ok", "base"}. base — балансы топ-20 (форма detect.supply_base); transfers — только
     по токен-аккаунтам холдеров топ-20 (продажи, раздатчики, прямые переводы, входы).
     reserve — токены ликвидности для dump_impact: на кривой — её virtual_token_reserves (по ним
     кривая считает цену; нет поля — реальный баланс кривой), после миграции (complete) — реальный
-    баланс пулов: аккаунты топ-20, чей владелец — PDA DEX-программы (PumpSwap, Raydium, Meteora, ...)."""
+    баланс пулов: аккаунты топ-20, чей владелец — пул DEX (is_pool_owner: PDA DEX-программы или
+    authority хранилищ Raydium/Meteora). reserve_ok — резерв определён надёжно: на кривой всегда,
+    после миграции — только если пул найден (reserve > 0; 0 значит «не нашли», а не «ликвидности нет»)."""
     base = supply_base(token, launch)
     transfers = get_token_transfers(token, launch["block"])
     rows = top_accounts(token)
     if launch.get("complete"):
-        reserve = sum(r["amount"] for r in rows
-                      if r["owner"] != launch["curve"] and _OWNER_PROG.get(r["owner"]) in DEX)
+        reserve = sum(r["amount"] for r in rows if r["owner"] != launch["curve"] and is_pool_owner(r["owner"]))
+        ok = reserve > 0
     elif launch.get("virtual_token_reserves"):
-        reserve = launch["virtual_token_reserves"]
+        reserve, ok = launch["virtual_token_reserves"], True
     else:
-        reserve = sum(r["amount"] for r in rows if r["owner"] == launch["curve"])
+        reserve, ok = sum(r["amount"] for r in rows if r["owner"] == launch["curve"]), True
     return {"supply": base["supply"], "transfers": transfers, "excluded": excluded_addresses(launch["curve"]),
-            "market": market_addresses(launch["curve"]), "reserve": reserve, "base": base}
+            "market": market_addresses(launch["curve"]), "reserve": reserve, "reserve_ok": ok, "base": base}
 
 
 def market_addresses(curve):
