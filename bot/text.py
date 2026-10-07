@@ -78,21 +78,30 @@ START_BUTTONS = {"inline_keyboard": [
     [{"text": "Website", "url": WEBSITE}, {"text": "Buy $CrawlScan", "url": BUY_URL}],
 ]}
 
+
+def start_buttons(alerts=False):
+    """Кнопки /start; алерты включены — [🔔 Watchlist] в первом ряду рядом со Scan a token / Help."""
+    if not alerts:
+        return START_BUTTONS
+    first, *rest = START_BUTTONS["inline_keyboard"]
+    return {"inline_keyboard": [first + [{"text": "🔔 Watchlist", "callback_data": "watchlist"}], *rest]}
+
 HELP = (
-    "<b>How to read a verdict</b>\n\n"
-    "<b>Score 0–100</b>: 100 = clean. The lower it is, the more the top holders look like a few people.\n"
-    "<b>Verdict</b>: 🟢 CLEAN · 🟡 OK · 🟠 RISKY · 🔴 DANGER. ⏳ TOO EARLY OR LATE: too few holders to judge. "
-    "🏛 TOO ESTABLISHED: a large, older token, not scanned.\n"
-    "<b>Operators</b>: real people behind the top holders. Wallets linked by shared buys or transfers "
-    "count as one operator.\n"
-    "<b>Dump impact</b>: how far the price could drop if the biggest operator sold everything.\n"
+    "<b>How to read a verdict?</b>\n\n"
+    "<b>Score 0–100</b>: 100 = clean.\n\n"
+    "The lower it is, the more the top holders look like a few people.\n\n"
+    "<b>Verdicts</b>: 🟢 CLEAN · 🟡 OK · 🟠 RISKY · 🔴 DANGER.\n\n"
+    "⏳ <b>TOO EARLY OR LATE</b>: too few holders to judge.\n\n"
+    "🏛 <b>TOO ESTABLISHED</b>: a large, older token, not scanned.\n\n"
+    "<b>Operators</b>: real people behind the top holders.\n\n"
+    "Wallets linked by shared buys or transfers count as one operator.\n\n"
+    "<b>Dump impact</b>: how far the price could drop if the biggest operator sold everything.\n\n"
     "<b>Virgin wallets</b>: top holders with no trading history before this token, a typical sign "
-    "of prepared wallets.\n"
-    "<b>Transfer supply</b>: share of the float received by transfer instead of bought.\n"
-    "<b>Snipers</b>: wallets that bought right after launch and still hold.\n"
+    "of prepared wallets.\n\n"
+    "<b>Transfer supply</b>: share of the float received by transfer instead of bought.\n\n"
+    "<b>Snipers</b>: wallets that bought right after launch and still hold.\n\n"
     "<b>Why</b>: rules that forced the verdict down.\n\n"
-    "Send a token address to scan it. In groups: /scan &lt;address&gt;.\n"
-    "/rewards: next holder draw, last winner and token burns."
+    "Send a token address to scan it."
 )
 
 ASK_ADDRESS = "Send me a token address from Robinhood Chain or Solana"
@@ -311,8 +320,12 @@ def rewards(st):
 ALERTS_SOON = "🔔 Alerts are coming soon."
 WATCH_USAGE = "Usage: /watch &lt;token address&gt;"
 UNWATCH_USAGE = "Usage: /unwatch &lt;token address&gt;"
-WATCH_WHAT = ("I'll message you when something important changes: the verdict, a probably rug warning, "
-              "the biggest operator selling, or early buyers exiting. Alerts arrive within about 15 minutes.")
+WATCH_WHAT = ("I'll message you when something important changes:\n\n"
+              "- the verdict\n- a probably rug warning\n- the biggest operator selling\n- early buyers exiting")
+WATCHLIST_EMPTY = "You're not watching any tokens yet."
+ASK_WATCH = "Send me the token address to watch."
+ASK_WATCH_AGAIN = "That's not a token address. Send me the token address to watch (Robinhood Chain 0x… or Solana)."
+NEW_BUTTON = {"text": "➕ New", "callback_data": "new"}
 
 
 def watch_button(addr):
@@ -335,11 +348,11 @@ def _watch_line(w, now):
 
 
 def watching(r):
-    """Ответ /api/alerts/watch (200) → HTML."""
-    head = (f"🔔 Still watching {e(short(r['token']))}, extended to {r['days']} days." if r.get("renewed")
-            else f"🔔 Watching {e(short(r['token']))} for {r['days']} days.")
-    return (f"{head}\n\n{WATCH_WHAT}\n\n"
-            f"Watching {len(r.get('items') or [])}/{r['limit']} tokens · /watchlist · /unwatch &lt;address&gt;")
+    """Ответ /api/alerts/watch (200) → HTML, полный адрес."""
+    addr = f"<code>{e(r['token'])}</code>"
+    head = (f"🔔 Still watching {addr}, extended to {r['days']} days." if r.get("renewed")
+            else f"🔔 Watching {addr} for {r['days']} days.")
+    return f"{head}\n\n{WATCH_WHAT}\n\nWatching {len(r.get('items') or [])}/{r['limit']} tokens for now."
 
 
 def watch_limit(r, now):
@@ -358,9 +371,36 @@ def unwatched(r):
     return f"You weren't watching {e(short(r['token']))}. /watchlist shows what you watch."
 
 
-def watchlist(r, now):
-    items = r.get("items") or []
+def days_left(ts, now):
+    """Сколько дней осталось подписке, вверх: "7 days left", "1 day left"; меньше часа — "<1 hour left"."""
+    s = ts - now
+    if s < 3600:
+        return "<1 hour left"
+    d = -(-int(s) // 86400)
+    return f"{d} day{'' if d == 1 else 's'} left"
+
+
+def watchlist_view(r, now, tickers=None, head=None):
+    """Список подписок с кнопками: [Remove …] на каждую (callback rm:<адрес>) и [➕ New] → (html, кнопки).
+    tickers — {адрес: тикер}, что бот видел в сканах (сайт тикеры подписок не хранит)."""
+    items, tickers = r.get("items") or [], tickers or {}
     if not items:
-        return "You're not watching any tokens. Send /watch &lt;address&gt; or tap Watch under a verdict."
-    return "\n".join([f"🔔 <b>Watching {len(items)}/{r['limit']} tokens</b>", ""]
-                     + [_watch_line(w, now) for w in items] + ["", "/unwatch &lt;address&gt; to stop."])
+        return ((head + "\n\n" if head else "") + WATCHLIST_EMPTY), {"inline_keyboard": [[NEW_BUTTON]]}
+    lines = [head or f"🔔 <b>Watching {len(items)}/{r['limit']} tokens</b>", ""]
+    rows = []
+    for i, w in enumerate(items, 1):
+        t = tickers.get(w["token"])
+        meta = " · ".join(x for x in (f"${e(t)}" if t else None,
+                                      CHAIN_NAME.get(w.get("chain"), e(w.get("chain", ""))),
+                                      days_left(w["expires_at"], now)) if x)
+        lines += [f"{i}. <code>{e(w['token'])}</code>", f"{meta}", ""]
+        rows.append([{"text": f"🗑 Remove {i}. " + (f"${t}" if t else short(w["token"])),
+                      "callback_data": f"rm:{w['token']}"}])
+    rows.append([NEW_BUTTON])
+    return "\n".join(lines).rstrip(), {"inline_keyboard": rows}
+
+
+def watch_limit_view(r, now, tickers=None):
+    """409 из [➕ New]: лимит — сообщение и список с кнопками Remove."""
+    head = f"You're already watching {r['limit']} tokens, the maximum. Remove one to add another:"
+    return watchlist_view(r, now, tickers, head=head)

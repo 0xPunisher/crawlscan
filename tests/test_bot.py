@@ -566,7 +566,12 @@ class TestAlerts(unittest.TestCase):
         bot, tg, clock = make(api)
         real = bot.alerts_text
         bot.alerts_text = lambda chat, cmd, arg, now=None: real(chat, cmd, arg, NOW + 3600)
+        self.clock = clock
         return bot, tg, api
+
+    def tap(self, bot, data, chat=1, mid=500, kind="private"):
+        bot.handle_update({"callback_query": {"id": "cb", "data": data,
+                                              "message": {"message_id": mid, "chat": {"id": chat, "type": kind}}}})
 
     def last(self, tg):
         return tg.texts()[-1]
@@ -616,14 +621,14 @@ class TestAlerts(unittest.TestCase):
     def test_watch_command(self):
         bot, tg, api = self.make()
         bot.handle_update(private(f"/watch {RH}"))
-        txt = self.last(tg)
-        self.assertTrue(txt.startswith("🔔 Watching 0x19dc…45e1 for 7 days."), txt)
-        for word in ("verdict", "probably rug", "biggest operator", "early buyers", "15 minutes"):
-            self.assertIn(word, txt)
-        self.assertIn("Watching 1/3 tokens", txt)
+        self.assertEqual(self.last(tg),
+                         f"🔔 Watching <code>{RH.lower()}</code> for 7 days.\n\n"
+                         "I'll message you when something important changes:\n\n"
+                         "- the verdict\n- a probably rug warning\n- the biggest operator selling\n- early buyers exiting\n\n"
+                         "Watching 1/3 tokens for now.")
         self.assertEqual(list(api.watches[1]), [RH.lower()])
         bot.handle_update(private(f"/watch {RH}"))
-        self.assertTrue(self.last(tg).startswith("🔔 Still watching 0x19dc…45e1, extended to 7 days."))
+        self.assertTrue(self.last(tg).startswith(f"🔔 Still watching <code>{RH.lower()}</code>, extended to 7 days."))
 
     def test_watch_callback(self):
         bot, tg, api = self.make()
@@ -671,16 +676,152 @@ class TestAlerts(unittest.TestCase):
     def test_watchlist_and_unwatch(self):
         bot, tg, _ = self.make()
         bot.handle_update(private("/watchlist"))
-        self.assertTrue(self.last(tg).startswith("You're not watching any tokens."))
+        self.assertEqual(self.last(tg), "You're not watching any tokens yet.")
         bot.handle_update(private(f"/watch {RH}")); bot.handle_update(private(f"/watch {PUMP}"))
         bot.handle_update(private("/watchlist"))
         txt = self.last(tg)
         self.assertIn("<b>Watching 2/3 tokens</b>", txt)
-        self.assertIn(f"<code>{PUMP}</code>\n  Solana · expires in 6d 23h", txt)
+        self.assertIn(f"2. <code>{PUMP}</code>\nSolana · 7 days left", txt)
         bot.handle_update(private(f"/unwatch {RH}"))
         self.assertEqual(self.last(tg), "🔕 Stopped watching 0x19dc…45e1.")
         bot.handle_update(private(f"/unwatch {RH}"))
         self.assertTrue(self.last(tg).startswith("You weren't watching 0x19dc…45e1."))
+
+    # --- Watchlist / Remove / New -------------------------------------------------------------------
+
+    def start_markup(self, tg):
+        return (tg.of("sendPhoto") or tg.of("sendMessage"))[-1]["reply_markup"]["inline_keyboard"]
+
+    def test_start_watchlist_button(self):
+        bot, tg, _ = self.make()
+        bot.handle_update(private("/start"))
+        first = self.start_markup(tg)[0]
+        self.assertEqual([b["text"] for b in first], ["Scan a token", "Help", "🔔 Watchlist"])
+        self.assertEqual(first[2]["callback_data"], "watchlist")
+        self.assertEqual(self.start_markup(tg)[1:], T.START_BUTTONS["inline_keyboard"][1:])
+        for kw in ({"on": False}, {"down": True}):                  # выключены / сайт недоступен — кнопки нет
+            bot, tg, _ = self.make(**kw)
+            bot.handle_update(private("/start"))
+            self.assertEqual(self.start_markup(tg), T.START_BUTTONS["inline_keyboard"], kw)
+        bot, tg, _ = make()                                          # бот без секрета
+        bot.handle_update(private("/start"))
+        self.assertEqual(self.start_markup(tg), T.START_BUTTONS["inline_keyboard"])
+
+    def test_watchlist_button_with_remove(self):
+        bot, tg, api = self.make()
+        bot.handle_update(private(RH)); drain(bot)                   # скан: бот запомнил тикер
+        for a in (RH, PUMP):
+            bot.handle_update(private(f"/watch {a}"))
+        self.tap(bot, "watchlist")
+        msg = tg.of("sendMessage")[-1]
+        self.assertEqual(msg["text"], "🔔 <b>Watching 2/3 tokens</b>\n\n"
+                                      f"1. <code>{RH.lower()}</code>\n$CRAWL · Robinhood Chain · 7 days left\n\n"
+                                      f"2. <code>{PUMP}</code>\nSolana · 7 days left")
+        rows = msg["reply_markup"]["inline_keyboard"]
+        self.assertEqual(rows, [[{"text": "🗑 Remove 1. $CRAWL", "callback_data": f"rm:{RH.lower()}"}],
+                                [{"text": "🗑 Remove 2. 9BB6NF…pump", "callback_data": f"rm:{PUMP}"}],
+                                [{"text": "➕ New", "callback_data": "new"}]])
+        self.assertTrue(all(len(b["callback_data"].encode()) <= 64 for r in rows for b in r))
+        n_sent = len(tg.of("sendMessage"))
+        self.tap(bot, f"rm:{RH.lower()}", mid=777)                   # Remove: то же сообщение обновляется
+        self.assertEqual(len(tg.of("sendMessage")), n_sent)
+        ed = tg.of("editMessageText")[-1]
+        self.assertEqual(ed["message_id"], 777)
+        self.assertNotIn(RH.lower(), ed["text"])
+        self.assertIn("<b>Watching 1/3 tokens</b>", ed["text"])
+        self.assertEqual(list(api.watches[1]), [PUMP])
+        self.tap(bot, f"rm:{PUMP}", mid=777)
+        ed = tg.of("editMessageText")[-1]
+        self.assertEqual(ed["text"], "You're not watching any tokens yet.")
+        self.assertEqual(ed["reply_markup"], {"inline_keyboard": [[{"text": "➕ New", "callback_data": "new"}]]})
+
+    def test_new_then_address_watches_not_scans(self):
+        bot, tg, api = self.make()
+        self.tap(bot, "new")
+        self.assertEqual(self.last(tg), "Send me the token address to watch.")
+        bot.handle_update(private("hello"))                          # не адрес — подсказка, ждём дальше
+        self.assertEqual(self.last(tg), T.ASK_WATCH_AGAIN)
+        bot.handle_update(private(f"https://crawlscan.fun/?ca={RH}"))
+        self.assertTrue(self.last(tg).startswith(f"🔔 Watching <code>{RH.lower()}</code> for 7 days."))
+        self.assertEqual(api.scans, [])
+        self.assertTrue(bot.jobs.empty())
+        bot.handle_update(private(RH_B))                             # дальше — снова обычный скан
+        self.assertEqual(len(api.watches[1]), 1)
+        self.assertFalse(bot.jobs.empty())
+
+    def test_new_expires_after_5_minutes(self):
+        bot, tg, api = self.make()
+        self.tap(bot, "new")
+        self.clock.t += bm.AWAIT_WATCH - 1
+        bot.handle_update(private("nope"))
+        self.assertEqual(self.last(tg), T.ASK_WATCH_AGAIN)
+        self.clock.t += 1
+        bot.handle_update(private(RH))                               # окно кончилось — это скан
+        self.assertEqual(api.watches.get(1, {}), {})
+        self.assertFalse(bot.jobs.empty())
+        self.assertEqual(bot.awaiting, {})
+
+    def test_new_only_private_and_per_chat(self):
+        bot, tg, api = self.make()
+        self.tap(bot, "new", chat=-100, kind="supergroup")
+        self.assertEqual(tg.texts(), [])
+        self.tap(bot, "new", chat=1)
+        bot.handle_update(private(RH, user=2))                       # другой чат не ждёт — скан
+        self.assertNotIn(2, api.watches)
+        self.assertFalse(bot.jobs.empty())
+
+    def test_new_commands_still_work_while_waiting(self):
+        bot, tg, api = self.make()
+        self.tap(bot, "new")
+        bot.handle_update(private("/help"))
+        self.assertEqual(self.last(tg), T.HELP)
+        bot.handle_update(private(RH))
+        self.assertIn(RH.lower(), api.watches[1])
+
+    def test_new_at_limit(self):
+        bot, tg, api = self.make()
+        for a in (RH, RH_B, RH_C):
+            bot.handle_update(private(f"/watch {a}"))
+        self.tap(bot, "new")                                         # уже 3 — сразу сообщение и список
+        msg = tg.of("sendMessage")[-1]
+        self.assertTrue(msg["text"].startswith("You're already watching 3 tokens, the maximum. Remove one to add another:"))
+        self.assertEqual(len(msg["reply_markup"]["inline_keyboard"]), 4)     # 3 × Remove + New
+        self.assertEqual(bot.awaiting, {})
+        bot.handle_update(private(RH_D))                             # ожидания нет — скан
+        self.assertFalse(bot.jobs.empty())
+
+    def test_new_limit_reached_while_waiting(self):
+        bot, tg, api = self.make()
+        self.tap(bot, "new")
+        for a in (RH, RH_B, RH_C):                                   # за это время подписался командами
+            bot.handle_update(private(f"/watch {a}"))
+        bot.handle_update(private(RH_D))
+        msg = tg.of("sendMessage")[-1]
+        self.assertTrue(msg["text"].startswith("You're already watching 3 tokens, the maximum."))
+        self.assertEqual(msg["reply_markup"]["inline_keyboard"][0][0]["callback_data"], f"rm:{RH.lower()}")
+
+    def test_buttons_when_alerts_off(self):
+        bot, tg, api = self.make(on=False)
+        for data in ("watchlist", "new", f"rm:{RH.lower()}"):
+            self.tap(bot, data)
+            self.assertEqual(self.last(tg), T.ALERTS_SOON, data)
+        self.assertEqual(bot.awaiting, {})
+
+    def test_help_text(self):
+        bot, tg, _ = make()
+        bot.handle_update(private("/help"))
+        self.tap(bot, "help")
+        self.assertEqual(tg.texts(), [T.HELP, T.HELP])
+        self.assertTrue(T.HELP.startswith("<b>How to read a verdict?</b>\n\n<b>Score 0–100</b>: 100 = clean.\n\n"))
+        self.assertTrue(T.HELP.endswith("<b>Why</b>: rules that forced the verdict down.\n\nSend a token address to scan it."))
+        self.assertIn("⏳ <b>TOO EARLY OR LATE</b>: too few holders to judge.", T.HELP)
+        self.assertIn("🏛 <b>TOO ESTABLISHED</b>: a large, older token, not scanned.", T.HELP)
+
+    def test_days_left(self):
+        self.assertEqual(T.days_left(NOW + 7 * 86400, NOW), "7 days left")
+        self.assertEqual(T.days_left(NOW + 6 * 86400 + 1, NOW), "7 days left")
+        self.assertEqual(T.days_left(NOW + 86400, NOW), "1 day left")
+        self.assertEqual(T.days_left(NOW + 3599, NOW), "<1 hour left")
 
     def test_usage_and_bad_address(self):
         bot, tg, _ = self.make()

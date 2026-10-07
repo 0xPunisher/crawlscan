@@ -40,6 +40,8 @@ WATCH_COMMANDS = [{"command": "watch", "description": "Get alerts for a token: /
                   {"command": "watchlist", "description": "Tokens you watch"},
                   {"command": "unwatch", "description": "Stop alerts: /unwatch <address>"}]
 ALERTS_CHECK_TTL = 60  # секунд: сколько помнить, включены ли алерты на сайте
+AWAIT_WATCH = 300      # секунд: после [➕ New] следующий адрес от чата — подписка, а не скан
+TICKERS_MAX = 2000     # тикеров из сканов в памяти (для списка подписок)
 
 _log_lock = threading.Lock()
 
@@ -74,6 +76,8 @@ class Bot:
         self.trade_urls = trade_urls or trade.templates()   # {сеть: шаблон} для [Trade on Axiom]
         self.spawn = spawn or (lambda f: threading.Thread(target=f, daemon=True).start())
         self.alerts_seen = None      # (clock(), включены ли алерты на сайте)
+        self.awaiting = {}           # chat_id -> clock() до которого ждём адрес для подписки ([➕ New])
+        self.tickers = {}            # адрес токена -> тикер из последнего скана (сайт тикеры подписок не хранит)
 
     # --- Telegram ---------------------------------------------------------------------------------
 
@@ -100,8 +104,10 @@ class Bot:
 
     def send_start(self, chat_id):
         """Баннер с приветствием в подписи; по file_id, если баннер уже загружали.
-        Нет файла или sendPhoto не прошёл — то же приветствие обычным сообщением."""
-        params = dict(chat_id=chat_id, caption=T.START, parse_mode="HTML", reply_markup=T.START_BUTTONS)
+        Нет файла или sendPhoto не прошёл — то же приветствие обычным сообщением.
+        Алерты включены — кнопка [🔔 Watchlist]."""
+        buttons = T.start_buttons(self.alerts_on())
+        params = dict(chat_id=chat_id, caption=T.START, parse_mode="HTML", reply_markup=buttons)
         msg = None
         if self.banner_id:
             msg = self.call("sendPhoto", photo=self.banner_id, **params)
@@ -113,7 +119,7 @@ class Bot:
             if sizes:
                 self.banner_id = sizes[-1]["file_id"]   # самый большой размер
         if msg is None:
-            return self.send(chat_id, T.START, T.START_BUTTONS)
+            return self.send(chat_id, T.START, buttons)
         return msg.get("message_id") if isinstance(msg, dict) else None
 
     def edit(self, chat_id, message_id, html, markup=None):
@@ -138,8 +144,14 @@ class Bot:
             return                               # команда другому боту
         chat_id, mid = chat.get("id"), m.get("message_id")
         if chat.get("type") == "private":
-            if cmd == "start":
-                return self.send_start(chat_id)
+            if cmd is None and self.awaiting_watch(chat_id):       # после [➕ New]: адрес — подписка, не скан
+                found = T.find_address(txt)
+                if not found:
+                    return self.send(chat_id, T.ASK_WATCH_AGAIN)
+                self.awaiting.pop(chat_id, None)
+                return self.alerts_command(chat_id, "new", found[1])
+            if cmd == "start":   # проверка алертов (кнопка Watchlist) может сходить на сайт — не в цикле опроса
+                return self.spawn(lambda: self.send_start(chat_id))
             if cmd == "help":
                 return self.send(chat_id, T.HELP)
             if cmd == "scan":
@@ -164,11 +176,18 @@ class Bot:
         if chat_id is None:
             return
         cmd, _, addr = data.partition(":")
-        if cmd in ("watch", "unwatch") and addr and chat.get("type") == "private":
-            # [Watch] под вердиктом, [Unwatch] под уведомлением сайта (alerts_notify)
+        private = chat.get("type") == "private"
+        if cmd in ("watch", "unwatch", "rm") and addr and private:
+            # [Watch] под вердиктом, [Unwatch] под уведомлением сайта (alerts_notify), [Remove] в списке подписок
             found = T.find_address(addr)
             if found:
-                self.alerts_command(chat_id, cmd, found[1])
+                mid = (cq.get("message") or {}).get("message_id") if cmd == "rm" else None
+                self.alerts_command(chat_id, "remove" if cmd == "rm" else cmd, found[1], edit=mid)
+        elif data == "watchlist" and private:
+            self.alerts_command(chat_id, "watchlist", "")
+        elif data == "new" and private:
+            self.awaiting[chat_id] = self.clock() + AWAIT_WATCH    # сразу: адрес может прийти раньше ответа сайта
+            self.alerts_command(chat_id, "ask", "")
         elif data == "scan":
             self.send(chat_id, T.ASK_ADDRESS)
         elif data == "help":
@@ -215,40 +234,73 @@ class Bot:
         self.alerts_seen = (now, on)
         return on
 
-    def alerts_command(self, chat_id, cmd, arg):
-        """/watch, /unwatch, /watchlist и кнопка [Watch] — запрос к сайту в отдельном потоке."""
-        self.spawn(lambda: self.send(chat_id, self.alerts_text(chat_id, cmd, arg)))
+    def awaiting_watch(self, chat_id):
+        """Ждём ли от чата адрес для подписки ([➕ New], AWAIT_WATCH секунд); истекло — сбрасываем."""
+        until = self.awaiting.get(chat_id)
+        if until is None:
+            return False
+        if self.clock() >= until:
+            self.awaiting.pop(chat_id, None)
+            return False
+        return True
+
+    def alerts_command(self, chat_id, cmd, arg, edit=None):
+        """Подписки — запрос к сайту в отдельном потоке. edit — message_id: обновить это сообщение ([Remove]).
+        cmd: watch / unwatch / watchlist (команды и кнопки), new (адрес после [➕ New]), ask ([➕ New]),
+        remove ([Remove] в списке)."""
+        def run():
+            html, markup = self.alerts_text(chat_id, cmd, arg)
+            if edit:
+                self.edit(chat_id, edit, html, markup)
+            else:
+                self.send(chat_id, html, markup)
+        self.spawn(run)
 
     def alerts_text(self, chat_id, cmd, arg, now=None):
+        """→ (html, кнопки)."""
         if not self.alerts_on():
-            return T.ALERTS_SOON
+            self.awaiting.pop(chat_id, None)
+            return T.ALERTS_SOON, None
         now = time.time() if now is None else now
         found = T.find_address(arg) if arg else None
-        if cmd != "watchlist" and not found:
-            return T.WATCH_USAGE if cmd == "watch" else T.UNWATCH_USAGE
+        if cmd in ("watch", "unwatch", "new", "remove") and not found:
+            return (T.UNWATCH_USAGE if cmd == "unwatch" else T.WATCH_USAGE), None
         try:
             if cmd == "watchlist":
-                return T.watchlist(self.api.watch_list(chat_id), now)
+                return T.watchlist_view(self.api.watch_list(chat_id), now, self.tickers)
+            if cmd == "ask":
+                r = self.api.watch_list(chat_id)
+                if len(r.get("items") or []) >= r.get("limit", 3):
+                    self.awaiting.pop(chat_id, None)
+                    return T.watch_limit_view(r, now, self.tickers)
+                return T.ASK_WATCH, None
             if cmd == "unwatch":
-                return T.unwatched(self.api.unwatch(chat_id, found[1]))
+                return T.unwatched(self.api.unwatch(chat_id, found[1])), None
+            if cmd == "remove":
+                self.api.unwatch(chat_id, found[1])
+                self.log(f"unwatch {found[1]} chat {chat_id}")
+                return T.watchlist_view(self.api.watch_list(chat_id), now, self.tickers)
             r = self.api.watch(chat_id, found[1])
             if r.get("status") == 409:
-                return T.watch_limit(r, now)
+                if cmd == "new":
+                    return T.watch_limit_view(r, now, self.tickers)
+                return T.watch_limit(r, now), None
             if r.get("status") == 422:
-                return T.watch_established(found[1])
+                return T.watch_established(found[1]), None
             self.log(f"watch {found[1]} chat {chat_id}" + (" renewed" if r.get("renewed") else ""))
-            return T.watching(r)
+            return T.watching(r), None
         except Rejected as e:
-            return T.rejected(found[1] if found else "", str(e))
+            return T.rejected(found[1] if found else "", str(e)), None
         except AlertsOff:
             self.alerts_seen = (self.clock(), False)
-            return T.ALERTS_SOON
+            self.awaiting.pop(chat_id, None)
+            return T.ALERTS_SOON, None
         except ApiError as e:
             self.log(f"api {cmd}: {e}")
-            return T.UNREACHABLE
+            return T.UNREACHABLE, None
         except Exception:
             self.log(f"{cmd} text:\n" + self.tg.redact(traceback.format_exc()))
-            return T.UNREACHABLE
+            return T.UNREACHABLE, None
 
     # --- сканы ------------------------------------------------------------------------------------
 
@@ -319,6 +371,11 @@ class Bot:
             return T.scan_error(addr, r.get("error")), None
         res = r["result"]
         token = res.get("token") or addr
+        ticker = (res.get("header") or {}).get("ticker")
+        if ticker:
+            if len(self.tickers) >= TICKERS_MAX:
+                self.tickers.clear()
+            self.tickers[token] = ticker
         chain = res.get("chain") or T.chain_of(token)
         watch = watch and res.get("band") != T.TOO_ESTABLISHED and self.alerts_on()
         return T.verdict(res), T.report_button(token, trade.url(chain, token, self.trade_urls), watch)
