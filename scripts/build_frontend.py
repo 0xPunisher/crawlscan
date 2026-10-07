@@ -534,6 +534,14 @@ rep('<sc-if value="{{inputError}}" hint-placeholder-val="{{false}}"><span style=
     '<sc-if value="{{inputNotice}}" hint-placeholder-val="{{false}}"><span data-notice="1" style="display:inline-flex;align-items:center;gap:8px;color:#9fd9ff">'
     '<span style="width:6px;height:6px;border-radius:50%;background:#9fd9ff;box-shadow:0 0 6px #9fd9ff"></span>{{inputNotice}}</span></sc-if>')
 
+# шапка токена на узком экране: строка «имя · тикер · сеть» переносится, колонка не шире экрана (адрес
+# с word-break иначе растягивает её, и у страницы появляется горизонтальный скролл)
+rep('          <div style="display:flex;flex-direction:column;gap:10px">\n'
+    '            <div style="display:flex;align-items:baseline;gap:14px">\n'
+    '              <span data-grip="1" style="font-size:42px;',
+    '          <div data-token-head="1" style="display:flex;flex-direction:column;gap:10px;min-width:0;max-width:100%">\n'
+    '            <div style="display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px;min-width:0">\n'
+    '              <span data-grip="1" style="font-size:42px;overflow-wrap:anywhere;min-width:0;')
 # бейдж сети у тикера; адрес токена — копируется кликом (ссылки на эксплорер у токена нет, у кошельков — есть)
 TICKER = "<span data-grip=\"1\" style=\"font-family:'JetBrains Mono',monospace;font-size:14px;color:#9fd9ff\">${{hTicker}}</span>"
 rep(TICKER, TICKER + f'<span data-chain="1" style="align-self:center;{MONO};font-size:10.5px;padding:2px 8px;border-radius:999px;color:#c9d1d6;'
