@@ -4,7 +4,7 @@ Read-only: скан идёт в фоне, браузер опрашивает с
   POST /api/scan {"token": "0x..."}      -> {"job": id}
   GET  /api/events?job=ID&after=N        -> {"events": [...], "done": bool}  (события с i >= N)
   GET  /api/result?job=ID                -> {"done", "result" | "error"}
-  GET  /api/chart?token=CA               -> {"token", "chain", "pool", "dex", "timeframe", "candles", "price_usd"[, "stale_at"]}
+  GET  /api/chart?token=CA               -> {"token", "chain", "pool", "dex", "timeframe", "candles", "price_usd"[, "stale_at" | "unavailable"]}
                                             свечи GeckoTerminal [[ts, o, h, l, c, v]] от старых к новым; в скан не входит
   GET  /api/recent?limit=12              -> {"items": [{"token", "chain", "ticker", "name", "score", "band", "rug", "ts"}]}
                                             лента «Recently scanned»: последние уникальные токены, новые сверху
@@ -127,7 +127,8 @@ def start_scan(token):
 
 def get_chart(token):
     """Ответ /api/chart: адрес через engine.chain_of (ScanError — плохой адрес / Solana выключена),
-    свечи из market.fetch_chart с кэшем. Любой сбой GT — не исключение: последний удачный чарт моложе
+    свечи из market.fetch_chart с кэшем. Любой сбой GT — не исключение: unavailable = True (свечей нет из-за
+    сбоя, а не потому, что сделок мало) или последний удачный чарт моложе
     CHART_STALE_TTL с полем stale_at (unix-время, когда он получен), иначе пустой. Пустой ответ удачный
     кэш не перезаписывает."""
     chain, token = engine.chain_of(token)
@@ -148,9 +149,11 @@ def get_chart(token):
     try:
         c = market.fetch_chart(token, engine.GT_NETWORK[chain])
     except Exception:
-        c = {}
+        c = {"failed": True}
     out = {"token": token, "chain": chain, "pool": c.get("pool"), "dex": c.get("dex"),
            "timeframe": c.get("timeframe"), "candles": c.get("candles") or [], "price_usd": c.get("price_usd")}
+    if c.get("failed") and not out["candles"]:
+        out["unavailable"] = True
     with _lock:
         e = CHARTS.get(token) or {"ok": None, "miss": None}
         res = out

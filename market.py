@@ -268,18 +268,18 @@ def _candles(network, pool, tf, tok, end):
 
 def fetch_chart(token, network="robinhood", now=None):
     """Свечи цены токена (USD) для чарта: {"pool", "dex", "timeframe", "candles", "price_usd",
-    "age_h", "stitched"} или {} (GT не знает токен или не ответил). Не дольше CHART_BUDGET секунд.
+    "age_h", "stitched", "failed"}, {} (GT не знает токен) или {"failed": True} (GT не ответил). Не дольше CHART_BUDGET секунд.
     Пул — самый ликвидный из пулов токена. Таймфрейм — по возрасту (TIMEFRAMES), возраст — от
     создания самого раннего из использованных пулов. Solana: если основной пул не кривая pump.fun,
     а пул кривой есть (токен мигрировал), его свечи до первой свечи основного пула идут в начало
-    (stitched). Свечи не получены — candles = [], пул и цена всё равно отдаются."""
+    (stitched). Свечи не получены — candles = [] и failed = True, пул и цена всё равно отдаются."""
     end = time.time() + CHART_BUDGET
     tok = token.lower() if network == "robinhood" else token
     try:
         data = _gt(f"/{network}/tokens/{tok}/pools", budget=min(GT_BUDGET, end - time.time())).get("data") or []
         pools = sorted((_pool(p, tok, network) for p in data), key=lambda p: -p["liquidity"])
     except Exception:
-        return {}
+        return {"failed": True}
     pools = [p for p in pools if p["address"]]
     if not pools:
         return {}
@@ -290,10 +290,11 @@ def fetch_chart(token, network="robinhood", now=None):
     born = [p["created"] for p in (main, curve) if p and p["created"]]
     age_h = ((now or time.time()) - min(born)) / 3600 if born else None
     tf = timeframe(age_h)
+    failed = False
     try:
         candles = _candles(network, main["address"], tf, tok, end)
     except Exception:
-        candles = []
+        candles, failed = [], True
     stitched = False
     if curve and end - time.time() > 0.3:
         try:
@@ -305,4 +306,4 @@ def fetch_chart(token, network="robinhood", now=None):
             pass
     return {"pool": main["address"], "dex": main["dex"], "timeframe": tf[2], "candles": candles,
             "price_usd": main["price_usd"], "age_h": None if age_h is None else round(age_h, 1),
-            "stitched": stitched}
+            "stitched": stitched, "failed": failed}
