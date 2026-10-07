@@ -49,6 +49,10 @@
     (parts) под чартом. Меньше 5 свечей — линия now и «not enough trades to chart yet»; нет данных
     GeckoTerminal — текстовая карточка.
 
+  - лента «recently scanned» в герое под полем поиска: GET /api/recent?limit=12 при загрузке, раз в 30 с
+    (только при открытой вкладке) и при возврате на лендинг; строка — тикер, сеть, адрес, скор, вердикт,
+    probably rug, «2m ago»; клик запускает скан токена. Пусто — секции нет.
+
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
 и index.html не перезаписывает.
 
@@ -1183,6 +1187,64 @@ CHART_CSS = """
 @media (max-width:640px){.cs-rug-row{grid-template-columns:minmax(0,1fr) auto!important}.cs-rug-row>:nth-child(2){grid-column:1/-1;grid-row:2}}
 """
 rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}" + CHART_CSS)
+
+# ---------------------------------------------------------------------------
+# лента «recently scanned» в герое, сразу под полем поиска (внутри data-nocrawl: пауки лендинга
+# её не закрывают). GET /api/recent?limit=12 при загрузке, раз в 30 с, при возврате на вкладку и
+# на лендинг; вкладка скрыта — запросов нет. Пусто или ошибка — секции нет.
+# Строка: тикер, сеть, адрес, скор и вердикт цветом полосы, «probably rug», «2m ago»; клик — скан (?ca=).
+# ---------------------------------------------------------------------------
+rep("  blank(ca){return {", r"""  loadRecent(){   // лента «recently scanned»: только при открытой вкладке
+    if(document.hidden) return;
+    fetch('/api/recent?limit=12').then(r=>r.ok?r.json():null)
+      .then(d=>{if(d&&Array.isArray(d.items)) this.setState({recent:d.items});}).catch(()=>{});
+  }
+  recentVals(){
+    const items=this.state.recent||[], now=Date.now()/1000;
+    const ago=ts=>{const s=Math.max(0,Math.floor(now-ts)); return s<60?'just now':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago';};
+    const rows=items.map(x=>{
+      const early=x.band==='TOO_EARLY_OR_LATE', band=early?'TOO EARLY':x.band, col=BANDS[band]||'#8a959c', sol=x.chain==='solana';
+      return {ticker:x.ticker?'$'+x.ticker:(x.name||x.token.slice(0,6)+'…'+x.token.slice(-4)),
+        chain:sol?'Solana':'Robinhood', chainColor:sol?'#9945FF':'#00c805',
+        addr:x.token.slice(0,6)+'…'+x.token.slice(-4), full:x.token,
+        score:x.score!=null&&!early?String(x.score):'—', band:early?'too early':band, color:col,
+        rug:!!x.rug, ago:ago(x.ts), href:'/?ca='+encodeURIComponent(x.token),
+        go:e=>{e.preventDefault(); this.startScan(x.token);}};
+    });
+    return {recentOn:rows.length>0, recentRows:rows};
+  }
+  blank(ca){return {""")
+rep("  state={view:'landing',", "  state={recent:[],view:'landing',")
+rep("    this.loadDraw();\n    this.loadRewards();\n",
+    "    this.loadDraw();\n    this.loadRewards();\n"
+    "    this.loadRecent(); this._recentT=setInterval(()=>this.loadRecent(),30000);\n"
+    "    this._vis=()=>{if(!document.hidden) this.loadRecent();}; document.addEventListener('visibilitychange',this._vis);\n")
+rep("clearInterval(this._drawT); clearInterval(this._rwT);",
+    "clearInterval(this._drawT); clearInterval(this._rwT); clearInterval(this._recentT); document.removeEventListener('visibilitychange',this._vis);")
+rep("    this.setState({view:'landing'});\n    window.scrollTo(0,0);\n    this.startLanding();",
+    "    this.setState({view:'landing'});\n    window.scrollTo(0,0);\n    this.startLanding();\n    this.loadRecent();")
+rep("      ...this.rwVals(),", "      ...this.rwVals(),\n      ...this.recentVals(),")
+PILL = f"{MONO};font-size:10.5px;padding:2px 8px;border-radius:999px;white-space:nowrap"
+RECENT_BLOCK = f'''          <sc-if value="{{{{recentOn}}}}" hint-placeholder-val="{{{{false}}}}"><div data-recent="1" style="margin-top:22px;border:1px solid #141b20;border-radius:12px;background:#090c0f;padding:6px 12px;box-sizing:border-box;min-width:0">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 4px 8px;{MONO};font-size:12px"><span style="display:inline-flex;align-items:center;gap:8px;color:#00c805"><span style="width:6px;height:6px;border-radius:50%;background:#00c805;box-shadow:0 0 6px #00c805"></span>recently scanned</span><span style="color:#5f6b72">click to open</span></div>
+            <sc-for list="{{{{recentRows}}}}" as="r" hint-placeholder-count="4"><a href="{{{{r.href}}}}" sc-camel-on-click="{{{{r.go}}}}" title="{{{{r.full}}}}" class="cs-recent-row" style="display:grid;align-items:center;padding:10px 4px;border-top:1px solid #12181c;{MONO};font-size:13px;color:#dfe5e8;text-decoration:none" style-hover="background:#0d1317">
+              <span class="cs-rc-t" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#eef1f3">{{{{r.ticker}}}}</span>
+              <span class="cs-rc-c" style="{PILL};color:{{{{r.chainColor}}}};border:1px solid {{{{r.chainColor}}}};justify-self:start">{{{{r.chain}}}}</span>
+              <span class="cs-rc-a" style="color:#5f6b72;font-size:12px;white-space:nowrap">{{{{r.addr}}}}</span>
+              <span class="cs-rc-s" style="color:{{{{r.color}}}};text-align:right;font-variant-numeric:tabular-nums">{{{{r.score}}}}</span>
+              <span class="cs-rc-v" style="color:{{{{r.color}}}};font-size:11.5px;letter-spacing:0.04em;white-space:nowrap">{{{{r.band}}}}</span>
+              <span class="cs-rc-r" style="justify-self:start"><sc-if value="{{{{r.rug}}}}" hint-placeholder-val="{{{{false}}}}"><span style="{PILL};color:#ff4d4d;background:rgba(255,77,77,0.1);border:1px solid rgba(255,77,77,0.45)">▼ <span class="cs-rc-pw">probably </span>rug</span></sc-if></span>
+              <span class="cs-rc-g" style="color:#5f6b72;font-size:12px;text-align:right;white-space:nowrap">{{{{r.ago}}}}</span>
+            </a></sc-for>
+          </div></sc-if>
+'''
+rep('try a sample →</a>\n        </div>\n', 'try a sample →</a>\n        </div>\n' + RECENT_BLOCK)
+RECENT_CSS = """
+.cs-recent-row{grid-template-columns:minmax(0,1fr) 92px 110px 34px 84px 116px 62px;grid-template-areas:"t c a s v r g";column-gap:12px}
+.cs-rc-t{grid-area:t}.cs-rc-c{grid-area:c}.cs-rc-a{grid-area:a}.cs-rc-s{grid-area:s}.cs-rc-v{grid-area:v}.cs-rc-r{grid-area:r}.cs-rc-g{grid-area:g}
+@media (max-width:640px){.cs-recent-row{grid-template-columns:auto auto minmax(0,1fr) auto!important;grid-template-areas:"t t s v" "c a r g"!important;row-gap:6px}.cs-rc-r{justify-self:end!important}.cs-rc-pw{display:none}}
+"""
+rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}" + RECENT_CSS)
 
 # суммы меньше $1K — без хвоста знаков (тонкая ликвидность на Solana)
 rep("':'$'+v;", "':'$'+(v>=10?Math.round(v):v.toFixed(2));")

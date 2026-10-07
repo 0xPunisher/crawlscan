@@ -6,6 +6,8 @@ Read-only: скан идёт в фоне, браузер опрашивает с
   GET  /api/result?job=ID                -> {"done", "result" | "error"}
   GET  /api/chart?token=CA               -> {"token", "chain", "pool", "dex", "timeframe", "candles", "price_usd"}
                                             свечи GeckoTerminal [[ts, o, h, l, c, v]] от старых к новым; в скан не входит
+  GET  /api/recent?limit=12              -> {"items": [{"token", "chain", "ticker", "name", "score", "band", "rug", "ts"}]}
+                                            лента «Recently scanned»: последние уникальные токены, новые сверху
   GET  /                                 -> index.html
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
   GET  /health
@@ -28,6 +30,7 @@ Token Burn & Holder Rewards, Robinhood (только при REWARDS_ENABLED=true
 
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
+Лента /api/recent кэшируется 20 секунд; запись — после завершения скана, сбой базы скан не ломает.
 Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
 """
 import hmac, json, os, re, threading, time, uuid
@@ -40,6 +43,7 @@ import draw_service as ds
 import rewards_service as rs
 from draw_store import Store
 from rewards_store import RewardsStore
+from recent_store import RecentStore
 
 CACHE_TTL = 600            # секунд: кэш результата по токену
 MAX_CONCURRENT = 3         # одновременных сканов
@@ -56,9 +60,12 @@ ICON_CACHE = "public, max-age=86400"
 CHART_TTL = 600            # секунд: кэш чарта по токену
 CHART_EMPTY_TTL = 60       # секунд: кэш чарта без свечей (GT не ответил или токен слишком свежий)
 CHART_MAX = 500            # чартов в памяти, старые вытесняются
+RECENT_TTL = 20            # секунд: кэш ленты /api/recent
+RECENT_DEFAULT = 12        # записей в ленте по умолчанию
 
 JOBS = {}                  # job_id -> {"token", "chain", "events", "done", "result", "error", "ts"}
 CHARTS = {}                # token -> (ts, ответ /api/chart)
+RECENT = {}                # limit -> (ts, ответ /api/recent)
 BY_TOKEN = {}              # token -> job_id последнего скана
 _lock = threading.Lock()
 _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
@@ -89,6 +96,8 @@ def _run(job_id, token):
                                       "type": "error", "spider": None, "wallet": None, "detail": err,
                                       "chain": job["chain"]})
             job["done"] = True
+    if not err:
+        record_recent(res)
 
 
 def start_scan(token):
@@ -163,6 +172,46 @@ def rewards_store():
         if path not in _rw_stores:
             _rw_stores[path] = RewardsStore(path or None)
         return _rw_stores[path]
+
+
+_recent_stores = {}
+
+
+def recent_store():
+    """Хранилище ленты (файл DRAW_DB_PATH), одно на путь."""
+    path = os.environ.get("DRAW_DB_PATH") or ""
+    with _stores_lock:
+        if path not in _recent_stores:
+            _recent_stores[path] = RecentStore(path or None)
+        return _recent_stores[path]
+
+
+def record_recent(result):
+    """Записать завершённый скан в ленту. Вызывается после done: клиент уже получил вердикт.
+    Любой сбой базы только логируется — скан от ленты не зависит."""
+    try:
+        if recent_store().record(result):
+            with _lock:
+                RECENT.clear()
+    except Exception as e:
+        print(f"recent: not saved: {type(e).__name__}: {e}", flush=True)
+
+
+def get_recent(limit):
+    """Ответ /api/recent с кэшем RECENT_TTL. Сбой базы — пустая лента, не ошибка."""
+    now = time.time()
+    with _lock:
+        hit = RECENT.get(limit)
+        if hit and now - hit[0] < RECENT_TTL:
+            return hit[1]
+    try:
+        out = {"items": recent_store().recent(limit)}
+    except Exception as e:
+        print(f"recent: not read: {type(e).__name__}: {e}", flush=True)
+        return {"items": []}
+    with _lock:
+        RECENT[limit] = (now, out)
+    return out
 
 
 def admin_ok(header):
@@ -288,6 +337,12 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, get_chart((q.get("token") or [""])[0]))
             except engine.ScanError as e:
                 return self._send(400, {"error": str(e)})
+        if u.path == "/api/recent":
+            try:
+                limit = min(50, max(1, int((q.get("limit") or [str(RECENT_DEFAULT)])[0])))
+            except ValueError:
+                limit = RECENT_DEFAULT
+            return self._send(200, get_recent(limit), cache=f"public, max-age={RECENT_TTL}")
         if u.path == "/api/events":
             job = self._job(q)
             if job is None:

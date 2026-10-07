@@ -1,4 +1,5 @@
-"""Клиент API сайта CrawlScan: POST /api/scan → job, GET /api/result?job= → результат.
+"""Клиент API сайта CrawlScan: POST /api/scan → job, GET /api/result?job= → результат,
+GET /api/rewards/status → награды и сжигания (/rewards).
 Бот сам в блокчейн не ходит. Кэш (10 минут) и очередь сканов — на стороне сайта."""
 import json, urllib.error, urllib.parse, urllib.request
 
@@ -46,3 +47,7 @@ class CrawlScan:
     def result(self, job):
         """{"done": False} | {"done": True, "result": {...}} | {"done": True, "error": "..."}."""
         return self._req("/api/result?job=" + urllib.parse.quote(job))
+
+    def rewards_status(self):
+        """Статус Rewards & Burns сайта: {"enabled": False} или полный статус (см. rewards_service.status_json)."""
+        return self._req("/api/rewards/status")

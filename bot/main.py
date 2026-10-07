@@ -6,8 +6,8 @@ env: TG_BOT_TOKEN (обязателен, из .env через env.py; нигде
 https://crawlscan.fun). Long polling getUpdates (timeout=30): одновременно может работать только один
 экземпляр бота, второй получает 409 Conflict.
 
-Личка: адрес токена (или /scan <адрес>) → скан; /start, /help. Группы: только /scan <адрес>
-(и /scan@имябота). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
+Личка: адрес токена (или /scan <адрес>) → скан; /start, /help, /rewards. Группы: только /scan <адрес>
+и /rewards (и /scan@имябота, /rewards@имябота). /rewards — статус наград и сжиганий с сайта (/api/rewards/status). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
 Лимиты: 1 скан на пользователя в USER_COOLDOWN секунд, не больше WORKERS сканов одновременно (остальные — в очереди).
 """
 import math, os, queue, sys, threading, time, traceback
@@ -30,7 +30,8 @@ POLL_EVERY = 1.5       # секунд между запросами /api/result
 LONG_POLL = 30         # getUpdates timeout
 COMMANDS = [{"command": "start", "description": "What this bot does"},
             {"command": "scan", "description": "Scan a token: /scan <address>"},
-            {"command": "help", "description": "How to read a verdict"}]
+            {"command": "help", "description": "How to read a verdict"},
+            {"command": "rewards", "description": "Next holder draw, last winner, burns"}]
 
 _log_lock = threading.Lock()
 
@@ -51,7 +52,7 @@ def parse_command(text):
 
 class Bot:
     def __init__(self, tg, api, username="", workers=WORKERS, cooldown=USER_COOLDOWN, scan_timeout=SCAN_TIMEOUT,
-                 poll_every=POLL_EVERY, clock=time.monotonic, sleep=time.sleep, log=log, banner=BANNER):
+                 poll_every=POLL_EVERY, clock=time.monotonic, sleep=time.sleep, log=log, banner=BANNER, spawn=None):
         self.tg, self.api, self.username = tg, api, username
         self.workers, self.cooldown, self.scan_timeout, self.poll_every = workers, cooldown, scan_timeout, poll_every
         self.clock, self.sleep, self.log = clock, sleep, log
@@ -61,6 +62,8 @@ class Bot:
         self.lock = threading.Lock()
         self.banner = banner
         self.banner_id = None        # file_id баннера после первой загрузки: дальше шлём без файла
+        # запросы к сайту вне цикла опроса (/rewards): по умолчанию — свой поток
+        self.spawn = spawn or (lambda f: threading.Thread(target=f, daemon=True).start())
 
     # --- Telegram ---------------------------------------------------------------------------------
 
@@ -131,12 +134,16 @@ class Bot:
                 return self.send(chat_id, T.HELP)
             if cmd == "scan":
                 return self.scan_command(chat_id, user.get("id"), arg, None)
+            if cmd == "rewards":
+                return self.rewards_command(chat_id, None)
             found = T.find_address(txt) if cmd is None else None
             if found:
                 return self.request_scan(chat_id, user.get("id"), found[1], None)
             return self.send(chat_id, T.HINT)
         if chat.get("type") in ("group", "supergroup") and cmd == "scan":
             return self.scan_command(chat_id, user.get("id"), arg, mid)
+        if chat.get("type") in ("group", "supergroup") and cmd == "rewards":
+            return self.rewards_command(chat_id, mid)
 
     def handle_callback(self, cq):
         self.call("answerCallbackQuery", callback_query_id=cq.get("id"))
@@ -153,6 +160,22 @@ class Bot:
         if not found:
             return self.send(chat_id, T.SCAN_USAGE, reply_to=reply_to)
         self.request_scan(chat_id, user_id, found[1], reply_to)
+
+    def rewards_command(self, chat_id, reply_to):
+        self.spawn(lambda: self.send(chat_id, *self.rewards_text(), reply_to=reply_to))
+
+    def rewards_text(self):
+        """/api/rewards/status сайта → (html, кнопки). Сайт недоступен — UNREACHABLE без кнопок."""
+        try:
+            st = self.api.rewards_status()
+        except (ApiError, Rejected) as e:
+            self.log(f"api rewards: {e}")
+            return T.UNREACHABLE, None
+        try:
+            return T.rewards(st), T.REWARDS_BUTTON
+        except Exception:
+            self.log("rewards text:\n" + self.tg.redact(traceback.format_exc()))
+            return T.UNREACHABLE, None
 
     # --- сканы ------------------------------------------------------------------------------------
 

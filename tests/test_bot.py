@@ -52,12 +52,31 @@ def result(**kw):
     return r
 
 
+def rewards_status(**kw):
+    """Ответ /api/rewards/status сайта (как rewards_service.status_json)."""
+    st = {"enabled": True, "chain": "robinhood", "decimals": 18, "now": "2026-10-07T16:48:00+00:00",
+          "next_draw": "2026-10-07T22:00:00+00:00", "next_burn": "2026-10-07T22:00:00+00:00",
+          "last_burn": {"tx": "0x47f0" + "a" * 60, "amount_tokens": 500000.0, "time": 1791323882},
+          "burned_by_dev": {"amount": 1500001 * 10 ** 18, "amount_tokens": 1500001.0, "count": 3},
+          "total_burned": {"amount": 1500001 * 10 ** 18, "amount_tokens": 1500001.0, "minted": 10 ** 27},
+          "last_draw": {"day": "2026-10-06", "status": "done", "winner": "0x2dc4382d0959791e45c7beb0e13c610a4a824e58",
+                        "chance": 0.003856, "payout_status": "pending", "payout_tokens": None, "payout_tx": None}}
+    st.update(kw)
+    return st
+
+
 class FakeAPI:
     base = "https://crawlscan.test"
 
-    def __init__(self, res=None, error=None, reject=None, down=False, pending=0):
+    def __init__(self, res=None, error=None, reject=None, down=False, pending=0, rewards=None):
         self.res, self.error, self.reject, self.down, self.pending = res or result(), error, reject, down, pending
+        self.rewards = rewards if rewards is not None else rewards_status()
         self.scans = []
+
+    def rewards_status(self):
+        if self.down:
+            raise ApiError("connection refused")
+        return self.rewards
 
     def scan(self, token):
         if self.down:
@@ -99,7 +118,7 @@ def group(text, user=1):
 def make(api=None, tg=None, **kw):
     tg, clock = tg or FakeTG(), Clock()
     bot = bm.Bot(tg, api or FakeAPI(), username="CrawlScanBot", clock=clock, sleep=clock.sleep,
-                 log=lambda m: None, **{"banner": None} | kw)
+                 log=lambda m: None, **{"banner": None, "spawn": lambda f: f()} | kw)
     return bot, tg, clock
 
 
@@ -358,6 +377,75 @@ class TestLimits(unittest.TestCase):
         edits = [p["text"] for p in tg.of("editMessageText")]
         self.assertEqual(sum(t.startswith("🕷 crawling") for t in edits), 2)   # из очереди → crawling
         self.assertEqual(sum("Score 79/100" in t for t in edits), 5)
+
+
+class TestRewards(unittest.TestCase):
+
+    def reply(self, api, update=None):
+        bot, tg, _ = make(api)
+        bot.handle_update(update or private("/rewards"))
+        return tg.of("sendMessage")
+
+    def test_pending_payout(self):
+        [m] = self.reply(FakeAPI())
+        self.assertEqual(m["parse_mode"], "HTML")
+        self.assertEqual(m["reply_markup"], {"inline_keyboard": [[{"text": "Rewards on website",
+                                                                    "url": "https://crawlscan.fun"}]]})
+        txt = m["text"]
+        self.assertIn("🎲 Next draw: <b>22:00 UTC</b> · in 5h 12m", txt)
+        self.assertIn("🔥 Next burn: <b>22:00 UTC</b> · in 5h 12m", txt)
+        self.assertIn("<code>0x2dc4…4e58</code> · chance 0.39%", txt)
+        self.assertIn("⏳ Payout pending", txt)
+        self.assertIn("🔥 <b>Burned</b>: 1,500,001 $CrawlScan (0.15% of supply)", txt)
+        self.assertIn("Last burn: 500,000 $CrawlScan · 2026-10-06 21:58 UTC · "
+                      '<a href="https://robinhoodchain.blockscout.com/tx/0x47f0', txt)
+
+    def test_paid(self):
+        d = dict(rewards_status()["last_draw"], payout_status="paid", payout_tokens=12345.6, payout_tx="0xbeef")
+        txt = self.reply(FakeAPI(rewards=rewards_status(last_draw=d)))[0]["text"]
+        self.assertIn('✅ Paid: 12,346 $CrawlScan · <a href="https://robinhoodchain.blockscout.com/tx/0xbeef">tx</a>', txt)
+        self.assertNotIn("pending", txt)
+
+    def test_no_draw_no_winner_no_burns(self):
+        txt = self.reply(FakeAPI(rewards=rewards_status(last_draw=None, last_burn=None, total_burned=None,
+                                                         burned_by_dev={"amount": 0})))[0]["text"]
+        self.assertIn("No draws yet", txt)
+        self.assertIn("🔥 <b>Burned</b>: nothing yet", txt)
+        self.assertNotIn("Last burn", txt)
+        d = {"day": "2026-10-06", "status": "no_eligible", "winner": None}
+        txt = self.reply(FakeAPI(rewards=rewards_status(last_draw=d)))[0]["text"]
+        self.assertIn("no eligible holders, the prize carries over", txt)
+
+    def test_disabled_and_unreachable(self):
+        [m] = self.reply(FakeAPI(rewards={"enabled": False}))
+        self.assertEqual(m["text"], T.REWARDS_OFF)
+        [m] = self.reply(FakeAPI(down=True))
+        self.assertEqual((m["text"], m["reply_markup"]), (T.UNREACHABLE, None))
+        [m] = self.reply(FakeAPI(rewards={"enabled": True, "last_draw": "garbage"}))
+        self.assertEqual(m["text"], T.UNREACHABLE)              # кривой ответ сайта — не падение
+
+    def test_group_reply_and_other_bot(self):
+        [m] = self.reply(FakeAPI(), group("/rewards@CrawlScanBot"))
+        self.assertEqual(m["reply_parameters"]["message_id"], 7)
+        self.assertEqual(self.reply(FakeAPI(), group("/rewards@OtherBot")), [])
+
+    def test_until(self):
+        self.assertEqual([T.until(t, 0) for t in (-5, 0, 30, 60, 3599, 3600, 90061)],
+                         ["now", "now", "in <1m", "in 1m", "in 59m", "in 1h 0m", "in 25h 1m"])
+
+    def test_menu_commands(self):
+        bot, tg, _ = make()
+
+        def call(method, **p):          # первый getUpdates останавливает run()
+            if method == "getUpdates":
+                raise KeyboardInterrupt
+            return FakeTG.call(tg, method, **p)
+
+        tg.call, bot.start_workers = call, lambda: None
+        with self.assertRaises(KeyboardInterrupt):
+            bot.run()
+        [cmds] = [p["commands"] for m, p in tg.calls if m == "setMyCommands"]
+        self.assertEqual([c["command"] for c in cmds], ["start", "scan", "help", "rewards"])
 
 
 class TestResilience(unittest.TestCase):

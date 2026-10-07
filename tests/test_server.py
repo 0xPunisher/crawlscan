@@ -1,5 +1,5 @@
 """Тесты HTTP-сервера: настоящий ThreadingHTTPServer на свободном порту, движок на подставном адаптере."""
-import json, os, threading, time, unittest, urllib.error, urllib.request
+import json, os, tempfile, threading, time, unittest, urllib.error, urllib.request
 from unittest import mock
 from http.server import ThreadingHTTPServer
 
@@ -26,9 +26,19 @@ class TestServer(unittest.TestCase):
             server.JOBS.clear(); server.BY_TOKEN.clear()
         self.fakes = fakes.patched()
         self.fakes.__enter__()
+        # лента пишет в DRAW_DB_PATH: в тестах — временный файл, не ./data/draw.db
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"DRAW_DB_PATH": os.path.join(self.tmp.name, "t.db")})
+        self.env.__enter__()
 
     def tearDown(self):
+        with server._stores_lock:
+            for st in server._recent_stores.values():
+                st.close()
+            server._recent_stores.clear()
+        self.env.__exit__(None, None, None)
         self.fakes.__exit__(None, None, None)
+        self.tmp.cleanup()
 
     def request(self, path, body=None, raw=None):
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
