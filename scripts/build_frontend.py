@@ -19,7 +19,8 @@
     «All-chain support» (больше EVM-сетей и не только); Launch radar — в конец LATER;
   - герой: обе сети — бейдж «memecoin holder scanner · Robinhood and Solana», заголовок «for Robinhood and
     Solana memecoins», подпись под полем «… · Robinhood and Solana»; Solana — цветом Solana (#9945FF);
-  - токен проекта: PONS -> страница токена, секция «the token» (чарт, coming soon, CA с copy)
+  - токен проекта: PONS -> страница токена, секция «the token» (чарт, live rewards, Trade $CrawlScan, тексты наград
+    и сжиганий — «tracked live on this site» ведёт на #rewards, когда секция наград показана; CA с copy)
     между «crawlers at work» и «how it works», строка CA с copy в герое;
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
     переносы в логах, отступы 16 px;
@@ -347,9 +348,32 @@ else:
              f'<a href="{PONS_URL}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#04140a;background:#00c805;'
              f'padding:10px 18px;border-radius:8px" style-hover="background:#19dd1f">open on Pons ↗</a></div>')
 
-badge_soon = ('<span style="display:inline-flex;align-items:center;gap:6px;' + MONO + ';font-size:10.5px;padding:3px 8px;'
+badge_live = ('<span style="display:inline-flex;align-items:center;gap:6px;' + MONO + ';font-size:10.5px;padding:3px 8px;'
               'border-radius:999px;color:#00c805;border:1px solid rgba(0,200,5,0.45);background:rgba(0,200,5,0.08)">'
-              '<span style="width:5px;height:5px;border-radius:50%;background:#00c805;box-shadow:0 0 6px #00c805"></span>coming soon</span>')
+              '<span style="width:5px;height:5px;border-radius:50%;background:#00c805;box-shadow:0 0 6px #00c805"></span>live rewards</span>')
+
+# «Trade $CrawlScan ↗» справа от заголовка карточки — в стиле «Trade on Axiom» на странице результата;
+# на телефоне — под заголовком на всю ширину (.cs-tok-head / .cs-tok-trade в @media ниже)
+TOKEN_TRADE_URL = "https://axiom.trade/t/0x19dcb63c4d2f29a6f077f094a4f858fc790145e1/@crawlscan?chain=robinhood"
+token_trade = (f'<a class="cs-tok-trade" href="{TOKEN_TRADE_URL}" target="_blank" rel="noopener" data-grip="1" '
+               f'style="flex:none;display:flex;align-items:center;justify-content:center;gap:8px;height:44px;padding:0 16px;'
+               f'border:1px solid rgba(0,200,5,0.55);border-radius:8px;background:rgba(0,200,5,0.08);color:#eef1f3;{MONO};'
+               f'font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap;box-sizing:border-box" '
+               f'style-hover="background:rgba(0,200,5,0.16);border-color:#00c805">Trade ${TOKEN_TICKER} ↗</a>')
+
+# «tracked live on this site» — ссылка на секцию наград (#rewards), только когда она показана (rwOn)
+tracked = ('<sc-if value="{{rwOn}}" hint-placeholder-val="{{false}}"><a href="#rewards" style="color:#9fd9ff" '
+           'style-hover="color:#ffffff">tracked live on this site</a></sc-if>'
+           '<sc-if value="{{rwOff}}" hint-placeholder-val="{{true}}">tracked live on this site</sc-if>')
+TOKEN_P = 'style="margin:0;font-size:15px;line-height:1.6;color:#8a959c"'
+token_text = "\n".join(f"              <p {TOKEN_P}>{x}</p>" for x in (
+    f"Holders of ${TOKEN_TICKER} get rewarded every day. An automatic draw picks one holder, who receives 10% of the "
+    f"day's creator fees in ${TOKEN_TICKER}. Every token is a ticket, and your chance is your average balance over the day.",
+    "Twice a day the dev burns tokens from his own supply, so the supply keeps shrinking and each token left is "
+    "a bigger share of a smaller supply.",
+    f"Every draw, payout and burn is {tracked} and verifiable onchain.",
+    "Next for holders: premium features and priority crawling, coming soon. "
+    "The scanner stays free and read-only for everyone."))
 
 links = ext_link(PONS_URL, "Pons") + (ext_link(DEX_URL, "Dexscreener") if DEX_URL else "")
 TOKEN_SECTION = f'''      <section id="token" style="max-width:1280px;margin:0 auto;padding:40px 32px 120px;box-sizing:border-box">
@@ -360,10 +384,15 @@ TOKEN_SECTION = f'''      <section id="token" style="max-width:1280px;margin:0 a
         <div style="display:flex;flex-wrap:wrap;gap:24px;align-items:stretch">
           {chart}
           <div data-grip="1" style="flex:1 1 320px;min-width:0;display:flex;flex-direction:column;gap:18px;padding:28px 26px;border:1px solid #141b20;border-radius:14px;background:linear-gradient(180deg,#0c1114,#090c0f);box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);box-sizing:border-box">
-            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">${TOKEN_TICKER}</span>{badge_soon}</div>
-            <h3 style="margin:0;font-size:28px;font-weight:500;letter-spacing:-0.02em;color:#eef1f3">CRAWLSCAN has a token</h3>
-            <p style="margin:0;font-size:15px;line-height:1.6;color:#8a959c">Holders of ${TOKEN_TICKER} will unlock premium features and priority crawling. Both are coming soon; the scanner stays free and read-only for everyone.</p>
-            <p style="margin:0;{MONO};font-size:11.5px;line-height:1.6;color:#5f6b72">Utility only. Not financial advice.</p>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">${TOKEN_TICKER}</span>{badge_live}</div>
+            <div class="cs-tok-head" style="display:flex;align-items:center;justify-content:space-between;gap:16px">
+              <h3 style="margin:0;min-width:0;font-size:28px;font-weight:500;letter-spacing:-0.02em;color:#eef1f3">CRAWLSCAN has a token</h3>
+              {token_trade}
+            </div>
+            <div style="display:flex;flex-direction:column;gap:14px">
+{token_text}
+            </div>
+            <p style="margin:auto 0 0;{MONO};font-size:11.5px;line-height:1.6;color:#5f6b72">Not financial advice.</p>
           </div>
         </div>
         <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px 16px;margin-top:20px;padding:16px 18px;border:1px solid #141b20;border-radius:12px;background:#090c0f">
@@ -423,6 +452,8 @@ MOBILE_CSS = """
 .cs-menu>summary::-webkit-details-marker{display:none}
 @media (max-width:640px){
   .cs-wrap{padding-left:16px!important;padding-right:16px!important}
+  .cs-tok-head{flex-direction:column!important;align-items:stretch!important;gap:14px!important}
+  .cs-tok-trade{width:100%!important}
   .cs-head{gap:12px!important}
   .cs-nav{gap:14px!important}
   .cs-wide{display:none!important}
@@ -913,7 +944,7 @@ rep("  blank(ca){return {", r"""  loadRewards(){   // статус Rewards & Bur
   }
   rwVals(){
     const st=this.state.rw;
-    if(!st) return {rwOn:false};
+    if(!st) return {rwOn:false,rwOff:true};
     const now=this.state.rwNow||Date.now(), dec=st.decimals, b=this._rwBurn, d=this._rwDraw;
     const waiting=now>=b.target, picking=now>=d.target;
     const lb=st.last_burn, tb=st.total_burned, L=st.last_draw, won=!!(L&&L.winner), paid=!!(L&&L.payout_tx);
@@ -921,7 +952,7 @@ rep("  blank(ca){return {", r"""  loadRewards(){   // статус Rewards & Bur
     const vf=L&&this.state.rwVerify&&this.state.rwVerify.day===L.day?this.state.rwVerify:null;
     const cp=this.state.rwCopied, devs=k=>(st.dev_wallets||[]).map((a,i)=>({full:a, short:rwShort(a), url:RH_ADDR(a),
       copy:()=>this.copyText(k+i,a), idle:cp!==k+i, done:cp===k+i})), drawLeft=picking?'Picking the winner…':fmtLeft(d.target-now);
-    return {rwOn:true,
+    return {rwOn:true,rwOff:false,
       rwBurnCount:!waiting, rwBurnWait:waiting, rwBurnLeft:fmtLeft(b.target-now), rwBurnAt:fmtUtcTs(b.target),
       rwBurnFlash:flash, rwBurnFlashText:flash?fl.text:'',
       rwHasBurn:!!lb, rwNoBurn:!lb, rwLastAmt:lb?fmtUnits(lb.amount,dec):'', rwLastTime:lb?fmtUtcTs(lb.time*1000):'',
