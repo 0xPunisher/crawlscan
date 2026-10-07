@@ -78,21 +78,30 @@ START_BUTTONS = {"inline_keyboard": [
     [{"text": "Website", "url": WEBSITE}, {"text": "Buy $CrawlScan", "url": BUY_URL}],
 ]}
 
+
+def start_buttons(alerts=False):
+    """Кнопки /start; алерты включены — [🔔 Watchlist] в первом ряду рядом со Scan a token / Help."""
+    if not alerts:
+        return START_BUTTONS
+    first, *rest = START_BUTTONS["inline_keyboard"]
+    return {"inline_keyboard": [first + [{"text": "🔔 Watchlist", "callback_data": "watchlist"}], *rest]}
+
 HELP = (
-    "<b>How to read a verdict</b>\n\n"
-    "<b>Score 0–100</b>: 100 = clean. The lower it is, the more the top holders look like a few people.\n"
-    "<b>Verdict</b>: 🟢 CLEAN · 🟡 OK · 🟠 RISKY · 🔴 DANGER. ⏳ TOO EARLY OR LATE: too few holders to judge. "
-    "🏛 TOO ESTABLISHED: a large, older token, not scanned.\n"
-    "<b>Operators</b>: real people behind the top holders. Wallets linked by shared buys or transfers "
-    "count as one operator.\n"
-    "<b>Dump impact</b>: how far the price could drop if the biggest operator sold everything.\n"
+    "<b>How to read a verdict?</b>\n\n"
+    "<b>Score 0–100</b>: 100 = clean.\n\n"
+    "The lower it is, the more the top holders look like a few people.\n\n"
+    "<b>Verdicts</b>: 🟢 CLEAN · 🟡 OK · 🟠 RISKY · 🔴 DANGER.\n\n"
+    "⏳ <b>TOO EARLY OR LATE</b>: too few holders to judge.\n\n"
+    "🏛 <b>TOO ESTABLISHED</b>: a large, older token, not scanned.\n\n"
+    "<b>Operators</b>: real people behind the top holders.\n\n"
+    "Wallets linked by shared buys or transfers count as one operator.\n\n"
+    "<b>Dump impact</b>: how far the price could drop if the biggest operator sold everything.\n\n"
     "<b>Virgin wallets</b>: top holders with no trading history before this token, a typical sign "
-    "of prepared wallets.\n"
-    "<b>Transfer supply</b>: share of the float received by transfer instead of bought.\n"
-    "<b>Snipers</b>: wallets that bought right after launch and still hold.\n"
+    "of prepared wallets.\n\n"
+    "<b>Transfer supply</b>: share of the float received by transfer instead of bought.\n\n"
+    "<b>Snipers</b>: wallets that bought right after launch and still hold.\n\n"
     "<b>Why</b>: rules that forced the verdict down.\n\n"
-    "Send a token address to scan it. In groups: /scan &lt;address&gt;.\n"
-    "/rewards: next holder draw, last winner and token burns."
+    "Send a token address to scan it."
 )
 
 ASK_ADDRESS = "Send me a token address from Robinhood Chain or Solana"
@@ -116,12 +125,12 @@ def wait(seconds):
     return f"⏳ please wait {seconds} s"
 
 
-def report_button(addr, trade_url=None):
-    """[Full report] и, если есть ссылка, [Trade on Axiom] в одном ряду."""
+def report_button(addr, trade_url=None, watch=False):
+    """[Full report] и, если есть ссылка, [Trade on Axiom] в одном ряду; watch — второй ряд [Watch]."""
     row = [{"text": "Full report", "url": f"{WEBSITE}/?ca={addr}"}]
     if trade_url:
         row.append({"text": "Trade on Axiom", "url": trade_url})
-    return {"inline_keyboard": [row]}
+    return {"inline_keyboard": [row] + ([watch_button(addr)] if watch else [])}
 
 
 def rejected(addr, error):
@@ -305,3 +314,93 @@ def rewards(st):
         when = f" · {_utc(lb['time'])}" if lb.get("time") else ""
         lines.append(f"Last burn: {tokens(lb.get('amount_tokens'))} $CrawlScan{when} · {tx_link(lb['tx'])}")
     return "\n".join(lines)
+
+
+# ---------- alerts: /watch, /watchlist, /unwatch ----------
+ALERTS_SOON = "🔔 Alerts are coming soon."
+WATCH_USAGE = "Usage: /watch &lt;token address&gt;"
+UNWATCH_USAGE = "Usage: /unwatch &lt;token address&gt;"
+WATCH_WHAT = ("I'll message you when something important changes:\n\n"
+              "- the verdict\n- a probably rug warning\n- the biggest operator selling\n- early buyers exiting")
+WATCHLIST_EMPTY = "You're not watching any tokens yet."
+ASK_WATCH = "Send me the token address to watch."
+ASK_WATCH_AGAIN = "That's not a token address. Send me the token address to watch (Robinhood Chain 0x… or Solana)."
+NEW_BUTTON = {"text": "➕ New", "callback_data": "new"}
+
+
+def watch_button(addr):
+    """Ряд [Watch] под вердиктом (только личка, алерты включены). callback_data ≤ 64 байт: адрес ≤ 44 символов."""
+    return [{"text": "🔔 Watch", "callback_data": f"watch:{addr}"}]
+
+
+def expires_in(ts, now):
+    """Сколько осталось подписке: "6d 23h", "5h", "<1h"."""
+    s = int(ts - now)
+    d, h = s // 86400, s // 3600 % 24
+    if d:
+        return f"{d}d {h}h" if h else f"{d}d"
+    return f"{h}h" if h else "<1h"
+
+
+def _watch_line(w, now):
+    return (f"• <code>{e(w['token'])}</code>\n  {CHAIN_NAME.get(w.get('chain'), e(w.get('chain', '')))} · "
+            f"expires in {expires_in(w['expires_at'], now)}")
+
+
+def watching(r):
+    """Ответ /api/alerts/watch (200) → HTML, полный адрес."""
+    addr = f"<code>{e(r['token'])}</code>"
+    head = (f"🔔 Still watching {addr}, extended to {r['days']} days." if r.get("renewed")
+            else f"🔔 Watching {addr} for {r['days']} days.")
+    return f"{head}\n\n{WATCH_WHAT}\n\nWatching {len(r.get('items') or [])}/{r['limit']} tokens for now."
+
+
+def watch_limit(r, now):
+    """409: уже limit токенов."""
+    return "\n".join([f"You're already watching {r['limit']} tokens, the maximum. /unwatch one first:", ""]
+                     + [_watch_line(w, now) for w in r.get("items") or []])
+
+
+def watch_established(addr):
+    return f"🏛 {e(short(addr))} is too established for CrawlScan, so it can't be watched."
+
+
+def unwatched(r):
+    if r.get("removed"):
+        return f"🔕 Stopped watching {e(short(r['token']))}."
+    return f"You weren't watching {e(short(r['token']))}. /watchlist shows what you watch."
+
+
+def days_left(ts, now):
+    """Сколько дней осталось подписке, вверх: "7 days left", "1 day left"; меньше часа — "<1 hour left"."""
+    s = ts - now
+    if s < 3600:
+        return "<1 hour left"
+    d = -(-int(s) // 86400)
+    return f"{d} day{'' if d == 1 else 's'} left"
+
+
+def watchlist_view(r, now, tickers=None, head=None):
+    """Список подписок с кнопками: [Remove …] на каждую (callback rm:<адрес>) и [➕ New] → (html, кнопки).
+    Тикер — из ответа /api/alerts/list (последний снимок токена), иначе из tickers — {адрес: тикер} сканов бота."""
+    items, tickers = r.get("items") or [], tickers or {}
+    if not items:
+        return ((head + "\n\n" if head else "") + WATCHLIST_EMPTY), {"inline_keyboard": [[NEW_BUTTON]]}
+    lines = [head or f"🔔 <b>Watching {len(items)}/{r['limit']} tokens</b>", ""]
+    rows = []
+    for i, w in enumerate(items, 1):
+        t = w.get("ticker") or tickers.get(w["token"])   # сайт: тикер из последнего снимка; иначе — из сканов бота
+        meta = " · ".join(x for x in (f"${e(t)}" if t else None,
+                                      CHAIN_NAME.get(w.get("chain"), e(w.get("chain", ""))),
+                                      days_left(w["expires_at"], now)) if x)
+        lines += [f"{i}. <code>{e(w['token'])}</code>", f"{meta}", ""]
+        rows.append([{"text": f"🗑 Remove {i}. " + (f"${t}" if t else short(w["token"])),
+                      "callback_data": f"rm:{w['token']}"}])
+    rows.append([NEW_BUTTON])
+    return "\n".join(lines).rstrip(), {"inline_keyboard": rows}
+
+
+def watch_limit_view(r, now, tickers=None):
+    """409 из [➕ New]: лимит — сообщение и список с кнопками Remove."""
+    head = f"You're already watching {r['limit']} tokens, the maximum. Remove one to add another:"
+    return watchlist_view(r, now, tickers, head=head)

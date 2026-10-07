@@ -10,7 +10,7 @@ Read-only: скан идёт в фоне, браузер опрашивает с
                                             первые 20 покупателей и их статус сейчас (early.py); в скан не входит
   GET  /api/recent?limit=12              -> {"items": [{"token", "chain", "ticker", "name", "score", "band", "rug", "ts"}]}
                                             лента «Recently scanned»: последние уникальные токены, новые сверху
-  GET  /api/config                       -> {"solana": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
+  GET  /api/config                       -> {"solana": bool, "alerts": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
                                             шаблоны ссылки Trade on Axiom ({address}), env TRADE_URL_* (trade.py)
   GET  /                                 -> index.html
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
@@ -33,9 +33,21 @@ Token Burn & Holder Rewards, Robinhood (только при REWARDS_ENABLED=true
   GET  /api/rewards/<YYYY-MM-DD>/participants -> полный список участников с весами
   GET  /api/rewards/<YYYY-MM-DD>/verify  -> входные данные и пересчёт победителя
 
+Alerts, подписки для бота (только при ALERTS_ENABLED=true, иначе 404; X-Alerts-Secret == ALERTS_API_SECRET, иначе 403):
+  POST /api/alerts/watch {"chat_id", "token"}   -> подписка на WATCH_DAYS дней; 409 — уже WATCH_LIMIT токенов,
+                                                   422 — токен too established, 400 — плохой адрес
+  POST /api/alerts/unwatch {"chat_id", "token"} -> {"ok", "removed"}
+  GET  /api/alerts/list?chat_id=N               -> {"items": [{"token", "chain", "created_at", "expires_at"}], ...}
+  POST /api/alerts/test {"chat_id", "token"}    -> пробное уведомление в chat_id сразу (без cooldown и подписки) по
+                                                   последнему снимку токена, нет снимка — по свежему скану;
+                                                   {"ok", "source": "snapshot" | "scan"}; 502 — Telegram отказал
+
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
 Лента /api/recent кэшируется 20 секунд; запись — после завершения скана, сбой базы скан не ломает.
+При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан;
+изменился важный показатель — уведомление подписчикам в Telegram (alerts_notify.py, свой поток, TG_BOT_TOKEN);
+плановые перепроверки отслеживаемых токенов — alerts_recheck.py (свой поток, уступает живым сканам).
 Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
 """
 import hashlib, hmac, json, os, re, threading, time, uuid
@@ -43,6 +55,11 @@ from email.utils import formatdate, parsedate_to_datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+import alerts
+import alerts_notify
+import alerts_recheck
+import detect
+from chains import priority
 import early
 import engine
 import market
@@ -52,6 +69,8 @@ import rewards_service as rs
 from draw_store import Store
 from rewards_store import RewardsStore
 from recent_store import RecentStore
+from alerts_store import AlertsStore
+from bot.tg import TelegramError
 
 CACHE_TTL = 600            # секунд: кэш результата по токену
 MAX_CONCURRENT = 3         # одновременных сканов
@@ -83,6 +102,11 @@ _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
 
 
 def _run(job_id, token):
+    with priority.live():   # живой скан: фоновые перепроверки alerts ждут и не стартуют
+        _run_job(job_id, token)
+
+
+def _run_job(job_id, token):
     job = JOBS[job_id]
 
     def emit(e):
@@ -109,6 +133,7 @@ def _run(job_id, token):
             job["done"] = True
     if not err:
         record_recent(res)
+        record_snapshot(res)
 
 
 def start_scan(token):
@@ -245,6 +270,198 @@ def record_recent(result):
                 RECENT.clear()
     except Exception as e:
         print(f"recent: not saved: {type(e).__name__}: {e}", flush=True)
+
+
+_alerts_stores = {}
+
+
+def alerts_store():
+    """Хранилище снимков alerts (файл DRAW_DB_PATH), одно на путь."""
+    path = os.environ.get("DRAW_DB_PATH") or ""
+    with _stores_lock:
+        if path not in _alerts_stores:
+            _alerts_stores[path] = AlertsStore(path or None)
+        return _alerts_stores[path]
+
+
+_notifier = {"obj": None, "warned": False}
+
+
+def notifier():
+    """Отправщик уведомлений (свой фоновый поток, alerts_notify) или None без TG_BOT_TOKEN — тогда одно
+    предупреждение в лог. Токен нигде не печатается."""
+    token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    with _stores_lock:
+        if not token:
+            if not _notifier["warned"]:
+                _notifier["warned"] = True
+                print("alerts: TG_BOT_TOKEN is not set, notifications are not sent", flush=True)
+            return None
+        if _notifier["obj"] is None:
+            _notifier["obj"] = alerts_notify.Notifier(alerts_store, alerts_notify.telegram(token)).start()
+        return _notifier["obj"]
+
+
+def notify_message(chat_id, text, markup=None):
+    """Служебное сообщение подписчику через очередь отправщика; без TG_BOT_TOKEN — не пишем."""
+    n = notifier()
+    if n:
+        n.push_message(chat_id, text, markup)
+
+
+def record_snapshot(result):
+    """Снимок завершённого скана для alerts (только при ALERTS_ENABLED) — у живого скана и у перепроверки.
+    Вызывается после done, как лента: клиент уже получил вердикт; сбой базы только логируется.
+    diff со старым снимком не пуст — событие в очередь уведомлений (подписчиков ищет и шлёт фоновый поток;
+    здесь — без сети и ожидания). TOO_ESTABLISHED — авто-отписка всех подписчиков токена с одним сообщением."""
+    if not alerts.enabled():
+        return
+    try:
+        snap = alerts.snapshot(result, early.known_share(result.get("chain"), result.get("token")))
+        if not snap:
+            return
+        prev, cur = alerts_store().record(snap)
+        if cur["band"] == detect.TOO_ESTABLISHED:
+            chats = alerts_store().unwatch_token(cur["token"])
+            if chats:
+                print(f"alerts: {cur['token']} became too established, unwatched {len(chats)} chats", flush=True)
+            for chat_id in chats:
+                notify_message(chat_id, *alerts.established_message(cur["token"], cur.get("ticker"), cur.get("chain")))
+            return
+        changes = alerts.diff(prev, cur)
+        if changes:
+            n = notifier()
+            if n:
+                n.push(prev, cur, changes)
+    except Exception as e:
+        print(f"alerts: snapshot not saved: {type(e).__name__}: {e}", flush=True)
+
+
+def record_early(body):
+    """/api/early посчитал блок → доля ранних покупателей в последний снимок токена (только при ALERTS_ENABLED).
+    Вызывается после ответа клиенту; без сети; сбой только логируется. Устаревший ответ (stale_at) и ошибки не пишутся."""
+    if not alerts.enabled():
+        return
+    try:
+        if body.get("available") and not body.get("error") and not body.get("stale_at") and body.get("summary"):
+            alerts_store().set_early(body["token"], body["summary"]["now_share_supply"])
+    except Exception as e:
+        print(f"alerts: early share not saved: {type(e).__name__}: {e}", flush=True)
+
+
+WATCH_MARKET_BUDGET = 3.0  # секунд на проверку «too established» при подписке на токен, который ещё не сканировали
+TOO_ESTABLISHED_WATCH = "This token is too established for CrawlScan, so it can't be watched."
+WATCH_LIMIT_TEXT = f"You can watch up to {alerts.WATCH_LIMIT} tokens. Unwatch one first."
+
+
+def too_established(chain, token):
+    """Можно ли подписать: последний снимок, вердикт too established в кэше или рынок (GT / DexScreener, кэш 15 мин;
+    в блокчейн не ходим). Рынок не ответил — подписываем (плановая перепроверка отпишет)."""
+    try:
+        _, cur = alerts_store().get(token)
+    except Exception:
+        cur = None
+    if cur and cur.get("band") == detect.TOO_ESTABLISHED:
+        return True
+    network, limits = engine.GT_NETWORK[chain], engine.established_limits()
+    cached = market.established_get(token, network)
+    if cached is not None:
+        return detect.too_established(cached, limits)
+    try:
+        gt = market.fetch_market(token, network, budget=WATCH_MARKET_BUDGET)
+    except Exception:
+        return False
+    if detect.too_established(gt, limits):
+        market.established_put(token, network, gt)
+        return True
+    return False
+
+
+def alerts_secret_ok(header):
+    """X-Alerts-Secret == ALERTS_API_SECRET за постоянное время; секрет не задан — всегда нет. Нигде не логируется."""
+    secret = os.environ.get("ALERTS_API_SECRET", "")
+    return bool(secret) and hmac.compare_digest((header or "").encode(), secret.encode())
+
+
+def _chat_id(v):
+    if isinstance(v, bool):
+        raise ValueError
+    if isinstance(v, str):
+        v = int(v)
+    if not isinstance(v, int):
+        raise ValueError
+    return v
+
+
+TEST_SCAN_WAIT = 60   # секунд: ждать скан для пробного уведомления, если снимка токена нет
+
+
+def test_snapshot(chain, token):
+    """(снимок, diff, источник) для пробного уведомления: последний снимок токена; нет — готовый результат скана
+    из памяти или новый скан (ждём до TEST_SCAN_WAIT). → (None, None, текст ошибки), если результата нет."""
+    prev, cur = alerts_store().get(token)
+    if cur:
+        return cur, alerts.diff(prev, cur), "snapshot"
+    jid = start_scan(token)
+    t0 = time.time()
+    while time.time() - t0 < TEST_SCAN_WAIT:
+        with _lock:
+            job = JOBS.get(jid)
+            done, res, err = job["done"], job["result"], job["error"]
+        if done:
+            if err or not res:
+                return None, None, err or "scan failed"
+            return alerts.snapshot(res), [], "scan"
+        time.sleep(0.2)
+    return None, None, "scan timed out"
+
+
+def alerts_test(body):
+    """POST /api/alerts/test → (код, тело). Шлёт сразу, в этом потоке: без очереди, cooldown и проверки подписки;
+    403 Telegram подписки не трогает."""
+    token_env = os.environ.get("TG_BOT_TOKEN", "").strip()
+    if not token_env:
+        return 503, {"error": "TG_BOT_TOKEN is not set"}
+    snap, changes, source = test_snapshot(*engine.chain_of(body.get("token")))
+    if snap is None:
+        return 409, {"error": f"no result for this token: {source}"}
+    text, markup = alerts.message(snap, changes, trade.url(snap.get("chain"), snap["token"]), test=True)
+    try:
+        alerts_notify.telegram(token_env)(body["chat_id"], text, markup)
+    except TelegramError as e:
+        return 502, {"error": f"telegram: {e.description}", "code": e.code}
+    print(f"alerts: test alert {snap['token']} to {body['chat_id']} ({source})", flush=True)
+    return 200, {"ok": True, "token": snap["token"], "source": source, "band": snap.get("band"),
+                 "changes": [c["kind"] for c in changes]}
+
+
+def alerts_api(method, path, body, q):
+    """/api/alerts/* → (код, тело). Выключатель и секрет проверяет вызывающий."""
+    try:
+        chat_id = _chat_id((q.get("chat_id") or [None])[0] if method == "GET" else body.get("chat_id"))
+    except (ValueError, TypeError, AttributeError):
+        return 400, {"error": "need chat_id"}
+    store, now = alerts_store(), int(time.time())
+    meta = {"limit": alerts.WATCH_LIMIT, "days": alerts.WATCH_DAYS}
+    if method == "GET" and path == "/api/alerts/list":
+        return 200, {"chat_id": chat_id, "items": store.watches(chat_id, now)} | meta
+    if method != "POST" or path not in ("/api/alerts/watch", "/api/alerts/unwatch", "/api/alerts/test"):
+        return 404, {"error": "not found"}
+    try:
+        chain, token = engine.chain_of(body.get("token"))
+    except engine.ScanError as e:
+        return 400, {"error": str(e)}
+    if path == "/api/alerts/test":
+        return alerts_test(body | {"chat_id": chat_id})
+    if path == "/api/alerts/unwatch":
+        removed = store.unwatch(chat_id, token)
+        return 200, {"ok": True, "token": token, "removed": removed, "items": store.watches(chat_id, now)} | meta
+    if too_established(chain, token):
+        return 422, {"error": "too established", "message": TOO_ESTABLISHED_WATCH, "token": token}
+    status, w, items = store.watch(chat_id, token, chain, now)
+    if status == "limit":
+        return 409, {"error": "watch limit", "message": WATCH_LIMIT_TEXT, "items": items} | meta
+    return 200, {"ok": True, "renewed": status == "renewed", **w, "items": items} | meta
 
 
 def get_recent(limit):
@@ -395,7 +612,30 @@ class H(BaseHTTPRequestHandler):
         body = rs.participants_json(store, day) if what == "participants" else rs.verify_json(store, day)
         return self._send(200, body) if body else self._send(404, {"error": "no draw for this day"})
 
+    def _alerts(self, method, path, q):
+        if not alerts.enabled():
+            return self._send(404, {"error": "alerts are disabled"})
+        if not alerts_secret_ok(self.headers.get("X-Alerts-Secret")):
+            return self._send(403, {"error": "forbidden"})
+        body = {}
+        if method == "POST":
+            try:
+                n = int(self.headers.get("content-length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError
+            except ValueError:
+                return self._send(400, {"error": "bad json"})
+        try:
+            return self._send(*alerts_api(method, path, body, q))
+        except Exception as e:   # сбой базы и т.п.: бот покажет «недоступно»
+            print(f"alerts: {path} failed: {type(e).__name__}: {e}", flush=True)
+            return self._send(500, {"error": "alerts temporarily unavailable"})
+
     def do_POST(self):
+        u = urlparse(self.path)
+        if u.path.startswith("/api/alerts/"):
+            return self._alerts("POST", u.path, parse_qs(u.query))
         m = DRAW_PATH.match(urlparse(self.path).path)
         if m and m.group(2) == "payout":
             return self._draw_payout(m.group(1))
@@ -423,8 +663,11 @@ class H(BaseHTTPRequestHandler):
             return self._draw_get(u.path, q)
         if u.path.startswith("/api/rewards/"):
             return self._rewards_get(u.path, q)
-        if u.path == "/api/config":  # фронт: какие сети включены (Solana — флаг SOLANA_ENABLED), шаблоны Trade on Axiom
-            return self._send(200, {"solana": engine.solana_enabled(), "trade": trade.templates()})
+        if u.path.startswith("/api/alerts/"):
+            return self._alerts("GET", u.path, q)
+        if u.path == "/api/config":  # фронт и бот: какие сети включены (SOLANA_ENABLED), алерты (ALERTS_ENABLED), Trade on Axiom
+            return self._send(200, {"solana": engine.solana_enabled(), "alerts": alerts.enabled(),
+                                    "trade": trade.templates()})
         if u.path == "/api/chart":
             try:
                 return self._send(200, get_chart((q.get("token") or [""])[0]))
@@ -433,9 +676,12 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/early":
             try:
                 token = (q.get("token") or [""])[0]
-                return self._send(200, early.get(token, scan_flags(engine.chain_of(token)[1])))
+                with priority.live():
+                    body = early.get(token, scan_flags(engine.chain_of(token)[1]))
             except engine.ScanError as e:
                 return self._send(400, {"error": str(e)})
+            self._send(200, body)
+            return record_early(body)
         if u.path == "/api/recent":
             try:
                 limit = min(50, max(1, int((q.get("limit") or [str(RECENT_DEFAULT)])[0])))
@@ -500,9 +746,26 @@ def start_rewards_scheduler():
     return sch
 
 
+def recheck_scan(token):
+    """Перепроверка: обычный скан движка без задачи, ленты и событий."""
+    return engine.scan(token)
+
+
+def start_alerts_rechecker():
+    """Плановые перепроверки отслеживаемых токенов — только при ALERTS_ENABLED=true."""
+    if not alerts.enabled():
+        return None
+    cfg = alerts_recheck.config()
+    print(f"alerts: rechecks every {cfg['recheck_min']} min, max {cfg['max_per_hour']}/hour", flush=True)
+    return alerts_recheck.Rechecker(
+        alerts_store, recheck_scan, record_snapshot, notify_message,
+        rate_limited=lambda: sum(a.RATE_LIMITED[0] for a in engine.CHAINS.values()), cfg=cfg).start()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"rh-crawler on http://0.0.0.0:{port}", flush=True)
     start_draw_scheduler()
     start_rewards_scheduler()
+    start_alerts_rechecker()
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()

@@ -32,6 +32,7 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from env import load_dotenv
+from chains import priority
 load_dotenv()
 
 RPC = os.environ.get("SOLANA_RPC")
@@ -186,6 +187,7 @@ _next_slot = [0.0]
 def _rate_limit():
     # Разносит HTTP-запросы во времени. Вес — один HTTP, а не элемент батча: Alchemy Solana
     # ограничивает compute units, и батч из 100 getTransaction проходит без 429; per-item 429 ретраим.
+    priority.wait_turn()   # фоновая перепроверка alerts уступает живым сканам
     with _rl_lock:
         now = time.time()
         wait = _next_slot[0] - now
@@ -195,6 +197,7 @@ def _rate_limit():
 
 
 REQUESTS = [0]  # счётчик HTTP-запросов к RPC (включая ретраи)
+RATE_LIMITED = [0]  # сколько раз RPC ответил rate-limit / 429 (пауза перепроверок alerts)
 
 
 def _is_rate_limited(err):
@@ -220,10 +223,14 @@ def _post(payload, _tries=5):
         try:
             with urllib.request.urlopen(req, timeout=40) as r:
                 body = json.loads(r.read())
+            if isinstance(body, dict) and _is_rate_limited(body.get("error")):
+                RATE_LIMITED[0] += 1
             if isinstance(body, dict) and _is_rate_limited(body.get("error")) and a < _tries - 1:
                 _backoff(a); continue
             return body
         except urllib.error.HTTPError as e:
+            if e.code == 429:
+                RATE_LIMITED[0] += 1
             if e.code in (429, 502, 503) and a < _tries - 1:
                 _backoff(a); continue
             raise
@@ -258,6 +265,7 @@ def rpc_batch(calls, chunk=TX_BATCH, _tries=4):
                 k = r.get("id")
                 if "error" in r:
                     if _is_rate_limited(r["error"]):
+                        RATE_LIMITED[0] += 1
                         retry.append(k)
                 elif isinstance(k, int) and 0 <= k < len(calls):
                     out[k] = r.get("result")

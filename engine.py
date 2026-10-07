@@ -7,6 +7,7 @@
 import os, re, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _CFTimeout
 
+from chains import priority
 from chains import robinhood as ch
 from chains import solana as sol
 import detect as d
@@ -234,7 +235,9 @@ def scan(token, emit=lambda e: None):
     share = {a: s for a, _, s in holders}
     for w in hs:
         ev("spider_move", "to wallet", wallet=w, spider=spider[w])
-    ex = ThreadPoolExecutor(max_workers=WORKERS)
+    # пул перепроверки alerts — тоже фоновый (chains.priority: уступает живым сканам в лимитере RPS)
+    ex = ThreadPoolExecutor(max_workers=WORKERS,
+                            thread_name_prefix=f"{priority.BG}-pool" if priority.is_background() else "")
     futs = {ex.submit(_history, a, w, entries[w]["block"], token): w for w in hs if entries[w]["kind"] is not None}
 
     def flag(w):

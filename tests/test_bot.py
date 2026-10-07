@@ -4,7 +4,7 @@ import html, os, re, sys, tempfile, threading, time, unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bot import main as bm, text as T   # noqa: E402
-from bot.api import ApiError, Rejected  # noqa: E402
+from bot.api import AlertsOff, ApiError, Rejected  # noqa: E402
 from bot.tg import TelegramError        # noqa: E402
 
 RH = "0x19dCb63C4d2F29A6f077F094a4f858fC790145e1"
@@ -501,6 +501,389 @@ class TestResilience(unittest.TestCase):
         self.assertEqual(bm.parse_command("/scan@CrawlScanBot  0xab "), ("scan", "CrawlScanBot", "0xab"))
         self.assertEqual(bm.parse_command("/START"), ("start", None, ""))
         self.assertEqual(bm.parse_command("hi"), (None, None, "hi"))
+
+
+
+class AlertsAPI(FakeAPI):
+    """Сайт с алертами: /api/config → alerts, подписки в памяти (лимит 3, 7 дней) — как server.alerts_api."""
+    alerts_secret = "secret"
+
+    def __init__(self, on=True, site_off=False, **kw):
+        super().__init__(**kw)
+        self.on, self.site_off, self.watches, self.config_calls = on, site_off, {}, 0
+        self.established = set()
+
+    def config(self):
+        self.config_calls += 1
+        if self.down:
+            raise ApiError("connection refused")
+        return {"solana": True, "alerts": self.on, "trade": {}}
+
+    def _check(self, token=None):
+        if self.down:
+            raise ApiError("connection refused")
+        if self.site_off:
+            raise AlertsOff()
+        if token is not None and not T.chain_of(token):
+            raise Rejected("not a token address")
+
+    def _items(self, chat):
+        return [{"token": t, "chain": T.chain_of(t), "created_at": 0, "expires_at": exp}
+                for t, exp in self.watches.get(chat, {}).items()]
+
+    def watch(self, chat, token):
+        self._check(token)
+        token = token.lower() if token.startswith("0x") else token
+        if token in self.established:
+            return {"status": 422, "error": "too established", "token": token}
+        w = self.watches.setdefault(chat, {})
+        renewed = token in w
+        if not renewed and len(w) >= 3:
+            return {"status": 409, "error": "watch limit", "items": self._items(chat), "limit": 3, "days": 7}
+        w[token] = NOW + 7 * 86400
+        return {"ok": True, "renewed": renewed, "token": token, "chain": T.chain_of(token), "created_at": NOW,
+                "expires_at": w[token], "items": self._items(chat), "limit": 3, "days": 7}
+
+    def unwatch(self, chat, token):
+        self._check(token)
+        token = token.lower() if token.startswith("0x") else token
+        removed = self.watches.get(chat, {}).pop(token, None) is not None
+        return {"ok": True, "token": token, "removed": removed, "items": self._items(chat), "limit": 3, "days": 7}
+
+    def watch_list(self, chat):
+        self._check()
+        return {"chat_id": chat, "items": self._items(chat), "limit": 3, "days": 7}
+
+
+NOW = 1_800_000_000
+RH_B, RH_C, RH_D = ("0x" + c * 40 for c in "bcd")
+
+
+class TestAlerts(unittest.TestCase):
+
+    def make(self, **kw):
+        api = AlertsAPI(**kw)
+        bot, tg, clock = make(api)
+        real = bot.alerts_text
+        bot.alerts_text = lambda chat, cmd, arg, now=None: real(chat, cmd, arg, NOW + 3600)
+        self.clock = clock
+        return bot, tg, api
+
+    def tap(self, bot, data, chat=1, mid=500, kind="private"):
+        bot.handle_update({"callback_query": {"id": "cb", "data": data,
+                                              "message": {"message_id": mid, "chat": {"id": chat, "type": kind}}}})
+
+    def last(self, tg):
+        return tg.texts()[-1]
+
+    def keyboard(self, tg):
+        return tg.of("editMessageText")[-1]["reply_markup"]["inline_keyboard"]
+
+    def test_watch_button_in_private(self):
+        bot, tg, _ = self.make()
+        bot.handle_update(private(RH)); drain(bot)
+        rows = self.keyboard(tg)
+        self.assertEqual([b["text"] for b in rows[0]], ["Full report", "Trade on Axiom"])   # первый ряд как был
+        self.assertEqual(rows[1], [{"text": "🔔 Watch", "callback_data": f"watch:{RH.lower()}"}])
+        self.assertLessEqual(len(rows[1][0]["callback_data"].encode()), 64)
+        bot.handle_update(private(f"/scan {PUMP}", user=2)); drain(bot)
+        self.assertLessEqual(len(self.keyboard(tg)[1][0]["callback_data"].encode()), 64)
+
+    def test_no_watch_button_in_group(self):
+        bot, tg, _ = self.make()
+        bot.handle_update(group(f"/scan {RH}")); drain(bot)
+        self.assertEqual(len(self.keyboard(tg)), 1)
+
+    def test_no_watch_button_when_off(self):
+        bot, tg, _ = self.make(on=False)                    # сайт: alerts выключены
+        bot.handle_update(private(RH)); drain(bot)
+        self.assertEqual(len(self.keyboard(tg)), 1)
+        bot, tg, api = self.make()                          # у бота нет секрета
+        api.alerts_secret = ""
+        bot.handle_update(private(RH)); drain(bot)
+        self.assertEqual(len(self.keyboard(tg)), 1)
+        self.assertEqual(api.config_calls, 0)
+        bot, tg, _ = make()                                 # обычный сайт без алертов: клавиатура прежняя
+        bot.handle_update(private(RH)); drain(bot)
+        self.assertEqual(len(self.keyboard(tg)), 1)
+
+    def test_no_watch_button_too_established(self):
+        bot, tg, _ = self.make(res=result(band="TOO_ESTABLISHED", score=None))
+        bot.handle_update(private(RH)); drain(bot)
+        self.assertEqual(len(self.keyboard(tg)), 1)
+
+    def test_config_cached(self):
+        bot, tg, api = self.make()
+        for u in (1, 2, 3):
+            bot.handle_update(private(RH, user=u)); drain(bot)
+        self.assertEqual(api.config_calls, 1)
+
+    def test_watch_command(self):
+        bot, tg, api = self.make()
+        bot.handle_update(private(f"/watch {RH}"))
+        self.assertEqual(self.last(tg),
+                         f"🔔 Watching <code>{RH.lower()}</code> for 7 days.\n\n"
+                         "I'll message you when something important changes:\n\n"
+                         "- the verdict\n- a probably rug warning\n- the biggest operator selling\n- early buyers exiting\n\n"
+                         "Watching 1/3 tokens for now.")
+        self.assertEqual(list(api.watches[1]), [RH.lower()])
+        bot.handle_update(private(f"/watch {RH}"))
+        self.assertTrue(self.last(tg).startswith(f"🔔 Still watching <code>{RH.lower()}</code>, extended to 7 days."))
+
+    def test_watch_callback(self):
+        bot, tg, api = self.make()
+        bot.handle_update({"callback_query": {"id": "q", "data": f"watch:{RH.lower()}",
+                                              "message": {"chat": {"id": 1, "type": "private"}}}})
+        self.assertEqual(tg.of("answerCallbackQuery"), [{"callback_query_id": "q"}])
+        self.assertIn("for 7 days", self.last(tg))
+        self.assertIn(RH.lower(), api.watches[1])
+        bot.handle_update({"callback_query": {"id": "g", "data": f"watch:{RH_B}",          # не личка — игнор
+                                              "message": {"chat": {"id": -100, "type": "supergroup"}}}})
+        self.assertNotIn(-100, api.watches)
+
+    def test_unwatch_callback_from_notification(self):
+        """[Unwatch] под уведомлением сайта (callback_data из alerts.message)."""
+        import alerts
+        bot, tg, api = self.make()
+        bot.handle_update(private(f"/watch {RH}"))
+        _, markup = alerts.message({"token": RH.lower(), "chain": "robinhood", "band": "OK", "score": 70}, [])
+        data = markup["inline_keyboard"][1][0]["callback_data"]
+        bot.handle_update({"callback_query": {"id": "u", "data": data,
+                                              "message": {"chat": {"id": 1, "type": "private"}}}})
+        self.assertEqual(tg.of("answerCallbackQuery")[-1], {"callback_query_id": "u"})
+        self.assertEqual(self.last(tg), "🔕 Stopped watching 0x19dc…45e1.")
+        self.assertEqual(api.watches[1], {})
+        bot.handle_update({"callback_query": {"id": "v", "data": "unwatch:garbage",
+                                              "message": {"chat": {"id": 1, "type": "private"}}}})
+        self.assertEqual(self.last(tg), "🔕 Stopped watching 0x19dc…45e1.")   # мусор — без ответа
+
+    def test_limit(self):
+        bot, tg, _ = self.make()
+        for a in (RH, RH_B, RH_C):
+            bot.handle_update(private(f"/watch {a}"))
+        bot.handle_update(private(f"/watch {RH_D}"))
+        txt = self.last(tg)
+        self.assertTrue(txt.startswith("You're already watching 3 tokens, the maximum. /unwatch one first:"), txt)
+        self.assertIn(f"<code>{RH_B}</code>", txt)
+        self.assertIn("expires in 6d 23h", txt)
+
+    def test_too_established(self):
+        bot, tg, api = self.make()
+        api.established.add(RH.lower())
+        bot.handle_update(private(f"/watch {RH}"))
+        self.assertEqual(self.last(tg), "🏛 0x19dC…45e1 is too established for CrawlScan, so it can't be watched.")
+
+    def test_watchlist_and_unwatch(self):
+        bot, tg, _ = self.make()
+        bot.handle_update(private("/watchlist"))
+        self.assertEqual(self.last(tg), "You're not watching any tokens yet.")
+        bot.handle_update(private(f"/watch {RH}")); bot.handle_update(private(f"/watch {PUMP}"))
+        bot.handle_update(private("/watchlist"))
+        txt = self.last(tg)
+        self.assertIn("<b>Watching 2/3 tokens</b>", txt)
+        self.assertIn(f"2. <code>{PUMP}</code>\nSolana · 7 days left", txt)
+        bot.handle_update(private(f"/unwatch {RH}"))
+        self.assertEqual(self.last(tg), "🔕 Stopped watching 0x19dc…45e1.")
+        bot.handle_update(private(f"/unwatch {RH}"))
+        self.assertTrue(self.last(tg).startswith("You weren't watching 0x19dc…45e1."))
+
+    # --- Watchlist / Remove / New -------------------------------------------------------------------
+
+    def start_markup(self, tg):
+        return (tg.of("sendPhoto") or tg.of("sendMessage"))[-1]["reply_markup"]["inline_keyboard"]
+
+    def test_start_watchlist_button(self):
+        bot, tg, _ = self.make()
+        bot.handle_update(private("/start"))
+        first = self.start_markup(tg)[0]
+        self.assertEqual([b["text"] for b in first], ["Scan a token", "Help", "🔔 Watchlist"])
+        self.assertEqual(first[2]["callback_data"], "watchlist")
+        self.assertEqual(self.start_markup(tg)[1:], T.START_BUTTONS["inline_keyboard"][1:])
+        for kw in ({"on": False}, {"down": True}):                  # выключены / сайт недоступен — кнопки нет
+            bot, tg, _ = self.make(**kw)
+            bot.handle_update(private("/start"))
+            self.assertEqual(self.start_markup(tg), T.START_BUTTONS["inline_keyboard"], kw)
+        bot, tg, _ = make()                                          # бот без секрета
+        bot.handle_update(private("/start"))
+        self.assertEqual(self.start_markup(tg), T.START_BUTTONS["inline_keyboard"])
+
+    def test_watchlist_button_with_remove(self):
+        bot, tg, api = self.make()
+        bot.handle_update(private(RH)); drain(bot)                   # скан: бот запомнил тикер
+        for a in (RH, PUMP):
+            bot.handle_update(private(f"/watch {a}"))
+        self.tap(bot, "watchlist")
+        msg = tg.of("sendMessage")[-1]
+        self.assertEqual(msg["text"], "🔔 <b>Watching 2/3 tokens</b>\n\n"
+                                      f"1. <code>{RH.lower()}</code>\n$CRAWL · Robinhood Chain · 7 days left\n\n"
+                                      f"2. <code>{PUMP}</code>\nSolana · 7 days left")
+        rows = msg["reply_markup"]["inline_keyboard"]
+        self.assertEqual(rows, [[{"text": "🗑 Remove 1. $CRAWL", "callback_data": f"rm:{RH.lower()}"}],
+                                [{"text": "🗑 Remove 2. 9BB6NF…pump", "callback_data": f"rm:{PUMP}"}],
+                                [{"text": "➕ New", "callback_data": "new"}]])
+        self.assertTrue(all(len(b["callback_data"].encode()) <= 64 for r in rows for b in r))
+        n_sent = len(tg.of("sendMessage"))
+        self.tap(bot, f"rm:{RH.lower()}", mid=777)                   # Remove: то же сообщение обновляется
+        self.assertEqual(len(tg.of("sendMessage")), n_sent)
+        ed = tg.of("editMessageText")[-1]
+        self.assertEqual(ed["message_id"], 777)
+        self.assertNotIn(RH.lower(), ed["text"])
+        self.assertIn("<b>Watching 1/3 tokens</b>", ed["text"])
+        self.assertEqual(list(api.watches[1]), [PUMP])
+        self.tap(bot, f"rm:{PUMP}", mid=777)
+        ed = tg.of("editMessageText")[-1]
+        self.assertEqual(ed["text"], "You're not watching any tokens yet.")
+        self.assertEqual(ed["reply_markup"], {"inline_keyboard": [[{"text": "➕ New", "callback_data": "new"}]]})
+
+    def test_watchlist_ticker_from_site(self):
+        bot, tg, api = self.make()
+        bot.handle_update(private(f"/watch {RH_B}"))
+        real = api.watch_list
+        api.watch_list = lambda chat: real(chat) | {"items": [w | {"ticker": "SITE"} for w in real(chat)["items"]]}
+        self.tap(bot, "watchlist")
+        msg = tg.of("sendMessage")[-1]
+        self.assertIn("$SITE · Robinhood Chain · 7 days left", msg["text"])
+        self.assertEqual(msg["reply_markup"]["inline_keyboard"][0][0]["text"], "🗑 Remove 1. $SITE")
+
+    def test_new_then_address_watches_not_scans(self):
+        bot, tg, api = self.make()
+        self.tap(bot, "new")
+        self.assertEqual(self.last(tg), "Send me the token address to watch.")
+        bot.handle_update(private("hello"))                          # не адрес — подсказка, ждём дальше
+        self.assertEqual(self.last(tg), T.ASK_WATCH_AGAIN)
+        bot.handle_update(private(f"https://crawlscan.fun/?ca={RH}"))
+        self.assertTrue(self.last(tg).startswith(f"🔔 Watching <code>{RH.lower()}</code> for 7 days."))
+        self.assertEqual(api.scans, [])
+        self.assertTrue(bot.jobs.empty())
+        bot.handle_update(private(RH_B))                             # дальше — снова обычный скан
+        self.assertEqual(len(api.watches[1]), 1)
+        self.assertFalse(bot.jobs.empty())
+
+    def test_new_expires_after_5_minutes(self):
+        bot, tg, api = self.make()
+        self.tap(bot, "new")
+        self.clock.t += bm.AWAIT_WATCH - 1
+        bot.handle_update(private("nope"))
+        self.assertEqual(self.last(tg), T.ASK_WATCH_AGAIN)
+        self.clock.t += 1
+        bot.handle_update(private(RH))                               # окно кончилось — это скан
+        self.assertEqual(api.watches.get(1, {}), {})
+        self.assertFalse(bot.jobs.empty())
+        self.assertEqual(bot.awaiting, {})
+
+    def test_new_only_private_and_per_chat(self):
+        bot, tg, api = self.make()
+        self.tap(bot, "new", chat=-100, kind="supergroup")
+        self.assertEqual(tg.texts(), [])
+        self.tap(bot, "new", chat=1)
+        bot.handle_update(private(RH, user=2))                       # другой чат не ждёт — скан
+        self.assertNotIn(2, api.watches)
+        self.assertFalse(bot.jobs.empty())
+
+    def test_new_commands_still_work_while_waiting(self):
+        bot, tg, api = self.make()
+        self.tap(bot, "new")
+        bot.handle_update(private("/help"))
+        self.assertEqual(self.last(tg), T.HELP)
+        bot.handle_update(private(RH))
+        self.assertIn(RH.lower(), api.watches[1])
+
+    def test_new_at_limit(self):
+        bot, tg, api = self.make()
+        for a in (RH, RH_B, RH_C):
+            bot.handle_update(private(f"/watch {a}"))
+        self.tap(bot, "new")                                         # уже 3 — сразу сообщение и список
+        msg = tg.of("sendMessage")[-1]
+        self.assertTrue(msg["text"].startswith("You're already watching 3 tokens, the maximum. Remove one to add another:"))
+        self.assertEqual(len(msg["reply_markup"]["inline_keyboard"]), 4)     # 3 × Remove + New
+        self.assertEqual(bot.awaiting, {})
+        bot.handle_update(private(RH_D))                             # ожидания нет — скан
+        self.assertFalse(bot.jobs.empty())
+
+    def test_new_limit_reached_while_waiting(self):
+        bot, tg, api = self.make()
+        self.tap(bot, "new")
+        for a in (RH, RH_B, RH_C):                                   # за это время подписался командами
+            bot.handle_update(private(f"/watch {a}"))
+        bot.handle_update(private(RH_D))
+        msg = tg.of("sendMessage")[-1]
+        self.assertTrue(msg["text"].startswith("You're already watching 3 tokens, the maximum."))
+        self.assertEqual(msg["reply_markup"]["inline_keyboard"][0][0]["callback_data"], f"rm:{RH.lower()}")
+
+    def test_buttons_when_alerts_off(self):
+        bot, tg, api = self.make(on=False)
+        for data in ("watchlist", "new", f"rm:{RH.lower()}"):
+            self.tap(bot, data)
+            self.assertEqual(self.last(tg), T.ALERTS_SOON, data)
+        self.assertEqual(bot.awaiting, {})
+
+    def test_help_text(self):
+        bot, tg, _ = make()
+        bot.handle_update(private("/help"))
+        self.tap(bot, "help")
+        self.assertEqual(tg.texts(), [T.HELP, T.HELP])
+        self.assertTrue(T.HELP.startswith("<b>How to read a verdict?</b>\n\n<b>Score 0–100</b>: 100 = clean.\n\n"))
+        self.assertTrue(T.HELP.endswith("<b>Why</b>: rules that forced the verdict down.\n\nSend a token address to scan it."))
+        self.assertIn("⏳ <b>TOO EARLY OR LATE</b>: too few holders to judge.", T.HELP)
+        self.assertIn("🏛 <b>TOO ESTABLISHED</b>: a large, older token, not scanned.", T.HELP)
+
+    def test_days_left(self):
+        self.assertEqual(T.days_left(NOW + 7 * 86400, NOW), "7 days left")
+        self.assertEqual(T.days_left(NOW + 6 * 86400 + 1, NOW), "7 days left")
+        self.assertEqual(T.days_left(NOW + 86400, NOW), "1 day left")
+        self.assertEqual(T.days_left(NOW + 3599, NOW), "<1 hour left")
+
+    def test_usage_and_bad_address(self):
+        bot, tg, _ = self.make()
+        bot.handle_update(private("/watch"))
+        self.assertEqual(self.last(tg), T.WATCH_USAGE)
+        bot.handle_update(private("/unwatch hello"))
+        self.assertEqual(self.last(tg), T.UNWATCH_USAGE)
+
+    def test_coming_soon_when_off(self):
+        for kw in ({"on": False}, {"site_off": True}):
+            bot, tg, _ = self.make(**kw)
+            for cmd in (f"/watch {RH}", "/watchlist", f"/unwatch {RH}"):
+                bot.handle_update(private(cmd))
+                self.assertEqual(self.last(tg), "🔔 Alerts are coming soon.", (kw, cmd))
+        bot, tg, _ = make()                                  # бот без секрета
+        bot.handle_update(private(f"/watch {RH}"))
+        self.assertEqual(self.last(tg), T.ALERTS_SOON)
+
+    def test_site_down(self):
+        bot, tg, api = self.make()
+        bot.alerts_on()
+        api.down = True
+        bot.handle_update(private(f"/watch {RH}"))
+        self.assertEqual(self.last(tg), T.UNREACHABLE)
+
+    def test_groups_ignore_watch(self):
+        bot, tg, api = self.make()
+        for cmd in (f"/watch {RH}", "/watchlist", f"/unwatch@CrawlScanBot {RH}"):
+            bot.handle_update(group(cmd))
+        self.assertEqual(tg.texts(), [])
+        self.assertEqual(api.watches, {})
+
+    def test_menu_commands_with_alerts(self):
+        for on, expect in ((True, ["start", "scan", "help", "rewards", "watch", "watchlist", "unwatch"]),
+                           (False, ["start", "scan", "help", "rewards"])):
+            bot, tg, _ = self.make(on=on)
+
+            def call(method, **p):
+                if method == "getUpdates":
+                    raise KeyboardInterrupt
+                return FakeTG.call(tg, method, **p)
+
+            tg.call, bot.start_workers = call, lambda: None
+            with self.assertRaises(KeyboardInterrupt):
+                bot.run()
+            [cmds] = [p["commands"] for m, p in tg.calls if m == "setMyCommands"]
+            self.assertEqual([c["command"] for c in cmds], expect)
+
+    def test_expires_in(self):
+        self.assertEqual(T.expires_in(NOW + 7 * 86400, NOW), "7d")
+        self.assertEqual(T.expires_in(NOW + 5 * 3600 + 10, NOW), "5h")
+        self.assertEqual(T.expires_in(NOW + 59, NOW), "<1h")
 
 
 if __name__ == "__main__":
