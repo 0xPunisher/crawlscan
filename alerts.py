@@ -129,3 +129,25 @@ def message(snap, changes, trade_url=None, test=False):
     if trade_url:
         row.append({"text": "Trade on Axiom", "url": trade_url})
     return "\n".join(lines), {"inline_keyboard": [row, [{"text": "🔕 Unwatch", "callback_data": f"unwatch:{token}"}]]}
+
+
+def _name(token, ticker, chain):
+    e = lambda x: html.escape(str(x), quote=False)
+    who = f"<b>${e(ticker)}</b>" if ticker else f"<b>{e(_short(token))}</b>"
+    return f"{who} · {CHAIN_NAME.get(chain, e(chain or ''))}\n<code>{e(token)}</code>"
+
+
+ESTABLISHED_UNWATCH = "This token became too established for CrawlScan, stopped watching it."
+
+
+def established_message(token, ticker=None, chain=None):
+    """Авто-отписка: скан дал TOO_ESTABLISHED → (текст, кнопки)."""
+    return f"🏛 {_name(token, ticker, chain)}\n\n{ESTABLISHED_UNWATCH}", None
+
+
+def expired_message(token, ticker=None, chain=None, days=WATCH_DAYS):
+    """Подписка истекла → (текст, кнопка [🔔 Watch] — бот подпишет снова на days дней)."""
+    name = f"${ticker}" if ticker else _short(token)
+    return (f"🔕 Stopped watching {html.escape(name, quote=False)} after {days} days. Tap Watch to renew.\n"
+            f"<code>{html.escape(token, quote=False)}</code>",
+            {"inline_keyboard": [[{"text": "🔔 Watch", "callback_data": f"watch:{token}"}]]})

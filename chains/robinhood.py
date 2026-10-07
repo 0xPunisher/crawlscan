@@ -9,6 +9,7 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from env import load_dotenv
+from chains import priority
 load_dotenv()
 
 RPC = os.environ["CRAWLER_RPC"]  # Alchemy PAYG endpoint
@@ -72,6 +73,7 @@ _next_slot = [0.0]
 def _rate_limit(n=1):
     # разносит запросы во времени, чтобы не превышать лимит провайдера (QuickNode 15 rps и т.п.) и не ловить 429.
     # n — вес запроса: провайдеры считают каждый элемент батча отдельным вызовом.
+    priority.wait_turn()   # фоновая перепроверка alerts уступает живым сканам
     with _rl_lock:
         now = time.time()
         wait = _next_slot[0] - now
@@ -81,6 +83,7 @@ def _rate_limit(n=1):
 
 
 REQUESTS = [0]  # счётчик HTTP-запросов к RPC (включая ретраи)
+RATE_LIMITED = [0]  # сколько раз RPC ответил rate-limit / 429 (пауза перепроверок alerts)
 
 def _post(payload, _tries=5):
     """POST с ретраями и бэкоффом при rate-limit/сбое: один отбитый запрос
@@ -94,6 +97,8 @@ def _post(payload, _tries=5):
         try:
             with urllib.request.urlopen(req, timeout=40) as r:
                 body = json.loads(r.read())
+            if _is_rate_limited(body):
+                RATE_LIMITED[0] += 1
             if _is_rate_limited(body) and a < _tries - 1:
                 last = body; time.sleep(0.35 * (2 ** a) + random.random() * 0.3); continue
             return body
@@ -102,6 +107,8 @@ def _post(payload, _tries=5):
                 body = json.loads(e.read())
             except Exception:
                 body = None
+            if e.code == 429 or (body is not None and _is_rate_limited(body)):
+                RATE_LIMITED[0] += 1
             if (e.code == 429 or (body is not None and _is_rate_limited(body))) and a < _tries - 1:
                 last = body if body is not None else e
                 time.sleep(0.35 * (2 ** a) + random.random() * 0.3); continue

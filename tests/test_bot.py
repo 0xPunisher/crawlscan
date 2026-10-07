@@ -735,6 +735,16 @@ class TestAlerts(unittest.TestCase):
         self.assertEqual(ed["text"], "You're not watching any tokens yet.")
         self.assertEqual(ed["reply_markup"], {"inline_keyboard": [[{"text": "➕ New", "callback_data": "new"}]]})
 
+    def test_watchlist_ticker_from_site(self):
+        bot, tg, api = self.make()
+        bot.handle_update(private(f"/watch {RH_B}"))
+        real = api.watch_list
+        api.watch_list = lambda chat: real(chat) | {"items": [w | {"ticker": "SITE"} for w in real(chat)["items"]]}
+        self.tap(bot, "watchlist")
+        msg = tg.of("sendMessage")[-1]
+        self.assertIn("$SITE · Robinhood Chain · 7 days left", msg["text"])
+        self.assertEqual(msg["reply_markup"]["inline_keyboard"][0][0]["text"], "🗑 Remove 1. $SITE")
+
     def test_new_then_address_watches_not_scans(self):
         bot, tg, api = self.make()
         self.tap(bot, "new")

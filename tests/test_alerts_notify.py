@@ -188,6 +188,8 @@ class TestNotifier(unittest.TestCase):
         self.watch(2)
         self.event(snap("OK", 70), snap("DANGER", 20))
         self.assertEqual([m["chat"] for m in self.send.sent], [2])
+        expired = self.st.expire(now=self.clock())              # удаляет планировщик перепроверок (A4)
+        self.assertEqual([r["chat_id"] for r in expired], [1])
         rows = self.st.db.execute("SELECT chat_id FROM alert_watches").fetchall()
         self.assertEqual([r[0] for r in rows], [2])
 

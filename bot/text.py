@@ -382,14 +382,14 @@ def days_left(ts, now):
 
 def watchlist_view(r, now, tickers=None, head=None):
     """Список подписок с кнопками: [Remove …] на каждую (callback rm:<адрес>) и [➕ New] → (html, кнопки).
-    tickers — {адрес: тикер}, что бот видел в сканах (сайт тикеры подписок не хранит)."""
+    Тикер — из ответа /api/alerts/list (последний снимок токена), иначе из tickers — {адрес: тикер} сканов бота."""
     items, tickers = r.get("items") or [], tickers or {}
     if not items:
         return ((head + "\n\n" if head else "") + WATCHLIST_EMPTY), {"inline_keyboard": [[NEW_BUTTON]]}
     lines = [head or f"🔔 <b>Watching {len(items)}/{r['limit']} tokens</b>", ""]
     rows = []
     for i, w in enumerate(items, 1):
-        t = tickers.get(w["token"])
+        t = w.get("ticker") or tickers.get(w["token"])   # сайт: тикер из последнего снимка; иначе — из сканов бота
         meta = " · ".join(x for x in (f"${e(t)}" if t else None,
                                       CHAIN_NAME.get(w.get("chain"), e(w.get("chain", ""))),
                                       days_left(w["expires_at"], now)) if x)

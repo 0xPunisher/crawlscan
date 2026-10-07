@@ -184,6 +184,15 @@ class TestStore(unittest.TestCase):
         self.assertFalse(self.store.unwatch(1, tok[1]))
         self.assertEqual(self.store.watch(1, tok[3], "robinhood", now=self.NOW + 200)[0], "ok")
 
+    def test_watches_have_ticker_from_snapshot(self):
+        t = "0x" + "77" * 20
+        self.store.watch(1, t, "robinhood", now=self.NOW)
+        self.store.watch(1, T, "robinhood", now=self.NOW + 1)
+        self.store.record(alerts.snapshot(res(token=t), ts=1))             # тикер AAA из шапки скана
+        items = self.store.watches(1, now=self.NOW + 2)
+        self.assertEqual([(w["token"], w["chain"], w["ticker"]) for w in items],
+                         [(t, "robinhood", "AAA"), (T, "robinhood", None)])
+
     def test_watch_expires_after_7_days(self):
         t = "0x" + "77" * 20
         self.store.watch(1, t, "robinhood", now=self.NOW)

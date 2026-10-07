@@ -15,7 +15,6 @@ CREATE TABLE IF NOT EXISTS alert_watches (
   created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (chat_id, token));
 CREATE INDEX IF NOT EXISTS alert_watches_token ON alert_watches(token);
 """
-WATCH_COLS = "token, chain, created_at, expires_at"
 
 
 class AlertsStore:
@@ -63,8 +62,11 @@ class AlertsStore:
     # --- подписки -------------------------------------------------------------------------------------
 
     def _watches(self, chat_id, now):
-        rows = self.db.execute(f"SELECT {WATCH_COLS} FROM alert_watches WHERE chat_id = ? AND expires_at > ? "
-                               "ORDER BY created_at, rowid", (chat_id, now)).fetchall()
+        """Действующие подписки чата; ticker — из последнего снимка токена (нет снимка — None)."""
+        rows = self.db.execute(
+            "SELECT w.token, w.chain, w.created_at, w.expires_at, json_extract(s.cur, '$.ticker') AS ticker "
+            "FROM alert_watches w LEFT JOIN alert_snapshots s ON s.token = w.token "
+            "WHERE w.chat_id = ? AND w.expires_at > ? ORDER BY w.created_at, w.rowid", (chat_id, now)).fetchall()
         return [dict(r) for r in rows]
 
     def watch(self, chat_id, token, chain, now=None, limit=WATCH_LIMIT, days=WATCH_DAYS):
@@ -72,7 +74,6 @@ class AlertsStore:
         → ("ok" | "renewed", подписка, все подписки чата) или ("limit", None, все подписки чата)."""
         now = int(now if now is not None else time.time())
         with self._lock, self.db:
-            self.db.execute("DELETE FROM alert_watches WHERE expires_at <= ?", (now,))
             items = self._watches(chat_id, now)
             renewed = any(w["token"] == token for w in items)
             if not renewed and len(items) >= limit:
@@ -95,12 +96,44 @@ class AlertsStore:
             return self._watches(chat_id, int(now if now is not None else time.time()))
 
     def watchers(self, token, now=None):
-        """chat_id действующих подписчиков токена; истёкшие подписки удаляются."""
+        """chat_id действующих подписчиков токена (истёкшие не получают; удаляет их expire — с сообщением)."""
+        now = int(now if now is not None else time.time())
+        with self._lock:
+            return [r["chat_id"] for r in self.db.execute(
+                "SELECT chat_id FROM alert_watches WHERE token = ? AND expires_at > ? ORDER BY rowid",
+                (token, now)).fetchall()]
+
+    def expire(self, now=None):
+        """Удалить истёкшие подписки. → [{"chat_id", "token", "chain", "ticker"}] — кому написать."""
         now = int(now if now is not None else time.time())
         with self._lock, self.db:
+            rows = [dict(r) for r in self.db.execute(
+                "SELECT w.chat_id, w.token, w.chain, json_extract(s.cur, '$.ticker') AS ticker FROM alert_watches w "
+                "LEFT JOIN alert_snapshots s ON s.token = w.token WHERE w.expires_at <= ? ORDER BY w.rowid",
+                (now,)).fetchall()]
             self.db.execute("DELETE FROM alert_watches WHERE expires_at <= ?", (now,))
-            return [r["chat_id"] for r in self.db.execute(
-                "SELECT chat_id FROM alert_watches WHERE token = ? ORDER BY rowid", (token,)).fetchall()]
+        return rows
+
+    def unwatch_token(self, token):
+        """Отписать всех от токена (стал TOO_ESTABLISHED). → chat_id действовавших подписчиков."""
+        now = int(time.time())
+        with self._lock, self.db:
+            chats = [r["chat_id"] for r in self.db.execute(
+                "SELECT chat_id FROM alert_watches WHERE token = ? AND expires_at > ? ORDER BY rowid",
+                (token, now)).fetchall()]
+            self.db.execute("DELETE FROM alert_watches WHERE token = ?", (token,))
+        return chats
+
+    def recheck_queue(self, now=None):
+        """Токены с действующими подписками: [{"token", "chain", "ts"}], ts — время последнего снимка
+        (None — снимка нет); давно проверенные (и без снимка) первыми."""
+        now = int(now if now is not None else time.time())
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT w.token, MIN(w.chain) AS chain, s.ts FROM alert_watches w "
+                "LEFT JOIN alert_snapshots s ON s.token = w.token WHERE w.expires_at > ? "
+                "GROUP BY w.token ORDER BY s.ts IS NOT NULL, s.ts, w.token", (now,)).fetchall()
+        return [dict(r) for r in rows]
 
     def is_watching(self, chat_id, token, now=None):
         now = int(now if now is not None else time.time())

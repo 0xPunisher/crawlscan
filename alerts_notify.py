@@ -47,10 +47,17 @@ class Notifier:
 
     def push(self, prev, cur, changes):
         """Новый снимок с непустым diff. Не блокирует: очередь полна — событие теряется (в лог)."""
+        self._put(("diff", prev, cur, changes), cur.get("token"))
+
+    def push_message(self, chat_id, text, markup=None):
+        """Служебное сообщение одному чату (авто-отписка, истечение подписки): без cooldown, с лимитом RATE."""
+        self._put(("msg", chat_id, text, markup), chat_id)
+
+    def _put(self, ev, what):
         try:
-            self.events.put_nowait((prev, cur, changes))
+            self.events.put_nowait(ev)
         except queue.Full:
-            self.log(f"alerts: notify queue full, dropped {cur.get('token')}")
+            self.log(f"alerts: notify queue full, dropped {what}")
 
     def start(self):
         if self.thread is None:
@@ -70,7 +77,11 @@ class Notifier:
                 except queue.Empty:
                     ev = None
                 if ev is not None:
-                    self.process(*ev)
+                    kind, *args = ev
+                    if kind == "diff":
+                        self.process(*args)
+                    else:
+                        self.send_rated(*args)
                 self.flush()
             except Exception:
                 self.log("alerts: notify loop:\n" + traceback.format_exc())
@@ -103,6 +114,15 @@ class Notifier:
 
     def deliver(self, chat_id, cur, changes):
         text, markup = alerts.message(cur, changes, trade.url(cur.get("chain"), cur["token"]))
+        if not self.send_rated(chat_id, text, markup):
+            return False
+        self.last_sent[(chat_id, cur["token"])] = self.clock()
+        self.sent += 1
+        self.log(f"alerts: sent {cur['token']} to {chat_id}: {', '.join(c['kind'] for c in changes)}")
+        return True
+
+    def send_rated(self, chat_id, text, markup=None):
+        """Отправка с лимитом RATE, повторами на 429 / сбой сети; 403 — удалить подписки чата. → ушло ли."""
         for attempt in range(RETRIES + 1):
             wait = self.next_slot - self.clock()
             if wait > 0:
@@ -123,9 +143,6 @@ class Notifier:
             except Exception as e:   # не сеть Telegram, а наш сбой: остальные подписчики всё равно получат
                 self.log(f"alerts: send to {chat_id} failed: {type(e).__name__}: {e}")
                 return False
-            self.last_sent[(chat_id, cur["token"])] = self.clock()
-            self.sent += 1
-            self.log(f"alerts: sent {cur['token']} to {chat_id}: {', '.join(c['kind'] for c in changes)}")
             return True
         return False
 

@@ -46,7 +46,8 @@ Alerts, подписки для бота (только при ALERTS_ENABLED=tru
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
 Лента /api/recent кэшируется 20 секунд; запись — после завершения скана, сбой базы скан не ломает.
 При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан;
-изменился важный показатель — уведомление подписчикам в Telegram (alerts_notify.py, свой поток, TG_BOT_TOKEN).
+изменился важный показатель — уведомление подписчикам в Telegram (alerts_notify.py, свой поток, TG_BOT_TOKEN);
+плановые перепроверки отслеживаемых токенов — alerts_recheck.py (свой поток, уступает живым сканам).
 Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
 """
 import hashlib, hmac, json, os, re, threading, time, uuid
@@ -56,7 +57,9 @@ from urllib.parse import urlparse, parse_qs
 
 import alerts
 import alerts_notify
+import alerts_recheck
 import detect
+from chains import priority
 import early
 import engine
 import market
@@ -99,6 +102,11 @@ _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
 
 
 def _run(job_id, token):
+    with priority.live():   # живой скан: фоновые перепроверки alerts ждут и не стартуют
+        _run_job(job_id, token)
+
+
+def _run_job(job_id, token):
     job = JOBS[job_id]
 
     def emit(e):
@@ -294,10 +302,18 @@ def notifier():
         return _notifier["obj"]
 
 
+def notify_message(chat_id, text, markup=None):
+    """Служебное сообщение подписчику через очередь отправщика; без TG_BOT_TOKEN — не пишем."""
+    n = notifier()
+    if n:
+        n.push_message(chat_id, text, markup)
+
+
 def record_snapshot(result):
-    """Снимок завершённого скана для alerts (только при ALERTS_ENABLED). Вызывается после done, как лента:
-    клиент уже получил вердикт; сбой базы только логируется. diff со старым снимком не пуст — событие в очередь
-    уведомлений (подписчиков ищет и шлёт фоновый поток; здесь — без сети и ожидания)."""
+    """Снимок завершённого скана для alerts (только при ALERTS_ENABLED) — у живого скана и у перепроверки.
+    Вызывается после done, как лента: клиент уже получил вердикт; сбой базы только логируется.
+    diff со старым снимком не пуст — событие в очередь уведомлений (подписчиков ищет и шлёт фоновый поток;
+    здесь — без сети и ожидания). TOO_ESTABLISHED — авто-отписка всех подписчиков токена с одним сообщением."""
     if not alerts.enabled():
         return
     try:
@@ -305,6 +321,13 @@ def record_snapshot(result):
         if not snap:
             return
         prev, cur = alerts_store().record(snap)
+        if cur["band"] == detect.TOO_ESTABLISHED:
+            chats = alerts_store().unwatch_token(cur["token"])
+            if chats:
+                print(f"alerts: {cur['token']} became too established, unwatched {len(chats)} chats", flush=True)
+            for chat_id in chats:
+                notify_message(chat_id, *alerts.established_message(cur["token"], cur.get("ticker"), cur.get("chain")))
+            return
         changes = alerts.diff(prev, cur)
         if changes:
             n = notifier()
@@ -653,7 +676,8 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/early":
             try:
                 token = (q.get("token") or [""])[0]
-                body = early.get(token, scan_flags(engine.chain_of(token)[1]))
+                with priority.live():
+                    body = early.get(token, scan_flags(engine.chain_of(token)[1]))
             except engine.ScanError as e:
                 return self._send(400, {"error": str(e)})
             self._send(200, body)
@@ -722,9 +746,26 @@ def start_rewards_scheduler():
     return sch
 
 
+def recheck_scan(token):
+    """Перепроверка: обычный скан движка без задачи, ленты и событий."""
+    return engine.scan(token)
+
+
+def start_alerts_rechecker():
+    """Плановые перепроверки отслеживаемых токенов — только при ALERTS_ENABLED=true."""
+    if not alerts.enabled():
+        return None
+    cfg = alerts_recheck.config()
+    print(f"alerts: rechecks every {cfg['recheck_min']} min, max {cfg['max_per_hour']}/hour", flush=True)
+    return alerts_recheck.Rechecker(
+        alerts_store, recheck_scan, record_snapshot, notify_message,
+        rate_limited=lambda: sum(a.RATE_LIMITED[0] for a in engine.CHAINS.values()), cfg=cfg).start()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"rh-crawler on http://0.0.0.0:{port}", flush=True)
     start_draw_scheduler()
     start_rewards_scheduler()
+    start_alerts_rechecker()
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
