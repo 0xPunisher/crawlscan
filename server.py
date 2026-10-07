@@ -4,7 +4,7 @@ Read-only: скан идёт в фоне, браузер опрашивает с
   POST /api/scan {"token": "0x..."}      -> {"job": id}
   GET  /api/events?job=ID&after=N        -> {"events": [...], "done": bool}  (события с i >= N)
   GET  /api/result?job=ID                -> {"done", "result" | "error"}
-  GET  /api/chart?token=CA               -> {"token", "chain", "pool", "dex", "timeframe", "candles", "price_usd"}
+  GET  /api/chart?token=CA               -> {"token", "chain", "pool", "dex", "timeframe", "candles", "price_usd"[, "stale_at" | "unavailable"]}
                                             свечи GeckoTerminal [[ts, o, h, l, c, v]] от старых к новым; в скан не входит
   GET  /api/recent?limit=12              -> {"items": [{"token", "chain", "ticker", "name", "score", "band", "rug", "ts"}]}
                                             лента «Recently scanned»: последние уникальные токены, новые сверху
@@ -62,12 +62,13 @@ ICON_CACHE = "public, max-age=86400"
 
 CHART_TTL = 600            # секунд: кэш чарта по токену
 CHART_EMPTY_TTL = 60       # секунд: кэш чарта без свечей (GT не ответил или токен слишком свежий)
+CHART_STALE_TTL = 6 * 3600 # секунд: последний удачный чарт отдаётся (со stale_at), пока GT не отвечает
 CHART_MAX = 500            # чартов в памяти, старые вытесняются
 RECENT_TTL = 20            # секунд: кэш ленты /api/recent
 RECENT_DEFAULT = 12        # записей в ленте по умолчанию
 
 JOBS = {}                  # job_id -> {"token", "chain", "events", "done", "result", "error", "ts"}
-CHARTS = {}                # token -> (ts, ответ /api/chart)
+CHARTS = {}                # token -> {"ok": (ts, удачный ответ) | None, "miss": (ts, пустой ответ) | None}
 RECENT = {}                # limit -> (ts, ответ /api/recent)
 BY_TOKEN = {}              # token -> job_id последнего скана
 _lock = threading.Lock()
@@ -126,25 +127,50 @@ def start_scan(token):
 
 def get_chart(token):
     """Ответ /api/chart: адрес через engine.chain_of (ScanError — плохой адрес / Solana выключена),
-    свечи из market.fetch_chart с кэшем. Любой сбой GT — пустой чарт, не исключение."""
+    свечи из market.fetch_chart с кэшем. Любой сбой GT — не исключение: unavailable = True (свечей нет из-за
+    сбоя, а не потому, что сделок мало) или последний удачный чарт моложе
+    CHART_STALE_TTL с полем stale_at (unix-время, когда он получен), иначе пустой. Пустой ответ удачный
+    кэш не перезаписывает."""
     chain, token = engine.chain_of(token)
     now = time.time()
+
+    def fallback(e):
+        ok = e.get("ok")
+        if ok and now - ok[0] < CHART_STALE_TTL:
+            return ok[1] | {"stale_at": int(ok[0])}
+        return e["miss"][1]
+
     with _lock:
-        hit = CHARTS.get(token)
-        if hit and now - hit[0] < (CHART_TTL if hit[1]["candles"] else CHART_EMPTY_TTL):
-            return hit[1]
+        e = CHARTS.get(token) or {"ok": None, "miss": None}
+        if e["ok"] and now - e["ok"][0] < CHART_TTL:
+            return e["ok"][1]
+        if e["miss"] and now - e["miss"][0] < CHART_EMPTY_TTL:
+            return fallback(e)
     try:
         c = market.fetch_chart(token, engine.GT_NETWORK[chain])
     except Exception:
-        c = {}
+        c = {"failed": True}
     out = {"token": token, "chain": chain, "pool": c.get("pool"), "dex": c.get("dex"),
            "timeframe": c.get("timeframe"), "candles": c.get("candles") or [], "price_usd": c.get("price_usd")}
+    if c.get("failed") and not out["candles"]:
+        out["unavailable"] = True
     with _lock:
-        CHARTS[token] = (now, out)
+        e = CHARTS.get(token) or {"ok": None, "miss": None}
+        res = out
+        if out["candles"]:
+            e = {"ok": (now, out), "miss": None}
+        else:
+            e = e | {"miss": (now, out)}
+            res = fallback(e)
+            print(f"chart: {token} no candles from gt -> "
+                  + (f"stale cache from {time.strftime('%H:%M', time.gmtime(res['stale_at']))} UTC"
+                     if "stale_at" in res else "empty"), flush=True)
+        CHARTS[token] = e
         if len(CHARTS) > CHART_MAX:
-            for t, _ in sorted(CHARTS.items(), key=lambda kv: kv[1][0])[:len(CHARTS) - CHART_MAX]:
+            last = lambda kv: max(x[0] for x in (kv[1]["ok"], kv[1]["miss"]) if x)
+            for t, _ in sorted(CHARTS.items(), key=last)[:len(CHARTS) - CHART_MAX]:
                 del CHARTS[t]
-    return out
+    return res
 
 
 DRAW_PATH = re.compile(r"^/api/draw/(\d{4}-\d{2}-\d{2})/(participants|verify|payout)$")

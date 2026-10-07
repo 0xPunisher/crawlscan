@@ -106,12 +106,15 @@ class TestFetchChart(unittest.TestCase):
 
     def test_gt_errors(self):
         c, _ = self.chart({f"/robinhood/tokens/{self.T}/pools": RuntimeError("down")})
-        self.assertEqual(c, {})
+        self.assertEqual(c, {"failed": True})                                     # GT не ответил
         c, _ = self.chart({f"/robinhood/tokens/{self.T}/pools": {"data": []}})
-        self.assertEqual(c, {})
+        self.assertEqual(c, {})                                                   # GT ответил: пулов нет
         c, _ = self.chart({f"/robinhood/tokens/{self.T}/pools": {"data": [pool("0xp", "x", 1, 20, self.T)]},
                            "/robinhood/pools/0xp/": RuntimeError("429")})
-        self.assertEqual((c["pool"], c["candles"]), ("0xp", []))                   # пул и цена есть, свечей нет
+        self.assertEqual((c["pool"], c["candles"], c["failed"]), ("0xp", [], True))  # пул и цена есть, свечей нет
+        c, _ = self.chart({f"/robinhood/tokens/{self.T}/pools": {"data": [pool("0xp", "x", 1, 20, self.T)]},
+                           "/robinhood/pools/0xp/": ohlcv(NOW)})
+        self.assertFalse(c["failed"])                                             # свечей мало, но GT ответил
 
     def test_budget_on_429(self):
         def rate_limited(req, timeout):
@@ -119,7 +122,7 @@ class TestFetchChart(unittest.TestCase):
         with mock.patch.object(market.urllib.request, "urlopen", side_effect=rate_limited), \
                 mock.patch.object(market, "CHART_BUDGET", 0.6):
             t0 = time.time()
-            self.assertEqual(market.fetch_chart(self.T), {})
+            self.assertEqual(market.fetch_chart(self.T), {"failed": True})
             self.assertLess(time.time() - t0, 1.0)
 
 
@@ -174,6 +177,23 @@ class TestChartApi(unittest.TestCase):
             self.assertEqual(self.get(f"/api/chart?token={fakes.TOKEN}"), (200, body))
             self.assertEqual(fc.call_count, 1)                                     # второй раз — из кэша
 
+    def test_unavailable_only_on_gt_failure(self):
+        few = {"pool": "0xp", "dex": "x", "timeframe": "1m", "candles": [[1, 1, 1, 1, 1, 1]], "price_usd": 0.1,
+               "failed": False}
+        cases = [({"failed": True}, True), ({"pool": "0xp", "candles": [], "failed": True}, True),
+                 ({}, False), (few, False), (few | {"candles": []}, False)]
+        for c, unavailable in cases:
+            with server._lock:
+                server.CHARTS.clear()
+            with mock.patch.object(market, "fetch_chart", return_value=c), mock.patch("builtins.print"):
+                body = self.get(f"/api/chart?token={fakes.TOKEN}")[1]
+            self.assertEqual(body.get("unavailable", False), unavailable, c)
+            self.assertNotIn("failed", body)
+        with mock.patch.object(market, "fetch_chart", side_effect=RuntimeError("boom")), mock.patch("builtins.print"):
+            with server._lock:
+                server.CHARTS.clear()
+            self.assertTrue(self.get(f"/api/chart?token={fakes.TOKEN}")[1]["unavailable"])
+
     def test_gt_failure_not_fatal(self):
         with mock.patch.object(market, "fetch_chart", side_effect=RuntimeError("boom")) as fc:
             code, body = self.get(f"/api/chart?token={fakes.TOKEN}")
@@ -183,13 +203,64 @@ class TestChartApi(unittest.TestCase):
             self.get(f"/api/chart?token={fakes.TOKEN}")
             self.assertEqual(fc.call_count, 1)                                     # пустой чарт тоже в кэше (минуту)
         with server._lock:                                                        # кэш пустого чарта истёк
-            ts, data = server.CHARTS[fakes.TOKEN]
-            server.CHARTS[fakes.TOKEN] = (ts - server.CHART_EMPTY_TTL - 1, data)
+            ts, data = server.CHARTS[fakes.TOKEN]["miss"]
+            server.CHARTS[fakes.TOKEN]["miss"] = (ts - server.CHART_EMPTY_TTL - 1, data)
         with mock.patch.object(market, "fetch_chart", return_value={"candles": [[1, 1, 1, 1, 1, 1]]}) as fc:
             code, body = self.get(f"/api/chart?token={fakes.TOKEN}")
             self.assertEqual(len(body["candles"]), 1)
             self.assertEqual(fc.call_count, 1)
         self.assertEqual(self.get("/health"), (200, {"ok": True}))
+
+    def age(self, slot, seconds):
+        """Сдвинуть запись кэша чарта в прошлое."""
+        with server._lock:
+            ts, data = server.CHARTS[fakes.TOKEN][slot]
+            server.CHARTS[fakes.TOKEN][slot] = (ts - seconds, data)
+
+    def test_stale_chart_on_gt_failure(self):
+        good = {"pool": "0xp", "dex": "pons-v2-dex", "timeframe": "15m", "candles": [[1, 1, 2, 0.5, 1.5, 3]],
+                "price_usd": 0.1}
+        with mock.patch.object(market, "fetch_chart", return_value=good):
+            _, fresh = self.get(f"/api/chart?token={fakes.TOKEN}")
+        self.assertNotIn("stale_at", fresh)
+        self.age("ok", server.CHART_TTL + 1)                                       # удачный кэш устарел (10 мин)
+        ok_ts = int(server.CHARTS[fakes.TOKEN]["ok"][0])
+        for fail in ({}, {"pool": "0xp", "candles": []}, RuntimeError("429")):   # GT: сбой, пул без свечей, исключение
+            with server._lock:
+                server.CHARTS[fakes.TOKEN]["miss"] = None
+            kw = {"side_effect": fail} if isinstance(fail, Exception) else {"return_value": fail}
+            with mock.patch.object(market, "fetch_chart", **kw), mock.patch("builtins.print") as pr:
+                code, body = self.get(f"/api/chart?token={fakes.TOKEN}")
+            self.assertEqual(code, 200)
+            self.assertEqual(body, fresh | {"stale_at": ok_ts}, fail)              # последний удачный, со stale_at
+            self.assertIn("stale cache", " ".join(str(a) for c in pr.call_args_list for a in c.args))
+            self.assertEqual(server.CHARTS[fakes.TOKEN]["ok"][1], fresh)          # пустой не перезаписал удачный
+        with mock.patch.object(market, "fetch_chart", return_value={}) as fc:
+            self.assertEqual(self.get(f"/api/chart?token={fakes.TOKEN}")[1]["stale_at"], ok_ts)
+            self.assertFalse(fc.called)                                            # минуту после сбоя GT не трогаем
+        self.age("ok", server.CHART_STALE_TTL)                                     # 6 часов прошло — пустой
+        self.age("miss", server.CHART_EMPTY_TTL + 1)
+        with mock.patch.object(market, "fetch_chart", return_value={}):
+            body = self.get(f"/api/chart?token={fakes.TOKEN}")[1]
+        self.assertEqual((body["candles"], "stale_at" in body), ([], False))
+        self.age("miss", server.CHART_EMPTY_TTL + 1)
+        with mock.patch.object(market, "fetch_chart", return_value=good):         # GT ожил — свежий чарт
+            self.assertEqual(self.get(f"/api/chart?token={fakes.TOKEN}")[1], fresh)
+        self.assertIsNone(server.CHARTS[fakes.TOKEN]["miss"])
+
+    def test_force_fail_chart_uses_stale(self):
+        """GT_FORCE_FAIL=1: настоящий fetch_chart отвечает пустым, сервер отдаёт последний удачный чарт."""
+        good = {"pool": "0xp", "dex": "x", "timeframe": "15m", "candles": [[1, 1, 2, 0.5, 1.5, 3]], "price_usd": 0.1}
+        with mock.patch.object(market, "fetch_chart", return_value=good):
+            self.get(f"/api/chart?token={fakes.TOKEN}")
+        self.age("ok", server.CHART_TTL + 1)
+        market.clear_cache()
+        with mock.patch.dict(os.environ, {"GT_FORCE_FAIL": "1"}), mock.patch.object(market, "CHART_BUDGET", 0.5), \
+                mock.patch.object(market, "_get", side_effect=AssertionError("GT вызван")) as uo:
+            body = self.get(f"/api/chart?token={fakes.TOKEN}")[1]
+        self.assertFalse(uo.called)
+        self.assertIn("stale_at", body)
+        self.assertEqual(body["candles"], good["candles"])
 
 
 if __name__ == "__main__":

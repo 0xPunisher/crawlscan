@@ -534,6 +534,14 @@ rep('<sc-if value="{{inputError}}" hint-placeholder-val="{{false}}"><span style=
     '<sc-if value="{{inputNotice}}" hint-placeholder-val="{{false}}"><span data-notice="1" style="display:inline-flex;align-items:center;gap:8px;color:#9fd9ff">'
     '<span style="width:6px;height:6px;border-radius:50%;background:#9fd9ff;box-shadow:0 0 6px #9fd9ff"></span>{{inputNotice}}</span></sc-if>')
 
+# шапка токена на узком экране: строка «имя · тикер · сеть» переносится, колонка не шире экрана (адрес
+# с word-break иначе растягивает её, и у страницы появляется горизонтальный скролл)
+rep('          <div style="display:flex;flex-direction:column;gap:10px">\n'
+    '            <div style="display:flex;align-items:baseline;gap:14px">\n'
+    '              <span data-grip="1" style="font-size:42px;',
+    '          <div data-token-head="1" style="display:flex;flex-direction:column;gap:10px;min-width:0;max-width:100%">\n'
+    '            <div style="display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px;min-width:0">\n'
+    '              <span data-grip="1" style="font-size:42px;overflow-wrap:anywhere;min-width:0;')
 # бейдж сети у тикера; адрес токена — копируется кликом (ссылки на эксплорер у токена нет, у кошельков — есть)
 TICKER = "<span data-grip=\"1\" style=\"font-family:'JetBrains Mono',monospace;font-size:14px;color:#9fd9ff\">${{hTicker}}</span>"
 rep(TICKER, TICKER + f'<span data-chain="1" style="align-self:center;{MONO};font-size:10.5px;padding:2px 8px;border-radius:999px;color:#c9d1d6;'
@@ -1063,6 +1071,9 @@ rep("@media (max-width:640px){\n",
 # чарт цены и «probably rug» на странице результата: блок между фактами и таблицей холдеров.
 # Свечи — GET /api/chart?token= отдельным запросом после вердикта (handleResult), пока грузится — skeleton.
 # SVG собирается строкой (chartHtml) в div с ref и перерисовывается при смене ширины.
+# stale_at (GT не ответил, отдан последний удачный чарт) — подпись «chart as of HH:MM UTC» в шапке блока.
+# Виджет GeckoTerminal (iframe) вместо SVG: TOO ESTABLISHED — всегда, обычный скан — когда свечей нет; без стрелки
+# rug, причины остаются. Нет ни пула, ни пары — карточка «chart temporarily unavailable».
 # rug из результата: красная пунктирная стрелка от now до now × level_factor, подпись и причины (parts).
 # ---------------------------------------------------------------------------
 CHART_JS = r"""// ---- price chart + probably rug (GET /api/chart after the verdict) ----
@@ -1091,15 +1102,35 @@ function rugReasons(rug){
     +rows
     +`<p style="margin:2px 0 0;font-size:14px;line-height:1.5;color:#8a959c;text-wrap:pretty">If these wallets sell into the current liquidity, the price could fall about ${dropPct(rug)}%.</p></div>`;
 }
-function chartHtml(st,rug,hdrPrice,W){
+const SRC_LABEL={gt:'GeckoTerminal',dexscreener:'DexScreener'};
+const srcLabel=s=>SRC_LABEL[s]||'GeckoTerminal';
+function chartFail(){   // чарт не отрисовался (ошибка в рендере): карточка вместо блока, страница живёт дальше
+  return `<div data-chart-empty="1" style="padding:26px 20px 24px;font-family:${MONO_F};font-size:13px;color:#8a959c">chart temporarily unavailable</div>`;
+}
+// виджет GeckoTerminal (грузится в браузере пользователя, лимиты GT нашего сервера его не касаются):
+// у TOO ESTABLISHED — всегда, у обычного скана — когда /api/chart не дал свечей. Адрес пула — из /api/chart
+// или market_pool результата (у DexScreener адрес пары = адрес пула GT). Сеть GT = сеть токена.
+function widgetUrl(ca,pool){
+  return pool?`https://www.geckoterminal.com/${chainOf(ca)}/pools/${encodeURIComponent(pool)}?embed=1&info=0&swaps=0&grayscale=0&light_chart=0`:null;
+}
+function chartWidget(url,rug,W){
+  const H=W<640?230:300;
+  return `<div style="display:flex;justify-content:space-between;gap:12px;padding:14px 20px 0;font-family:${MONO_F};font-size:11px;color:#5f6b72"><span>price</span><span data-chart-src="1">GeckoTerminal</span></div>`
+    +`<div style="padding:8px 12px 10px"><iframe data-chart-widget="1" src="${escH(url)}" title="price chart" loading="lazy" frameborder="0" `
+    +`sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox" referrerpolicy="strict-origin-when-cross-origin" `
+    +`style="display:block;width:100%;height:${H}px;border:0;border-radius:8px;background:#090c0f"></iframe></div>`+rugReasons(rug);
+}
+function chartHtml(st,rug,hdrPrice,W,src){
   const mob=W<640, H=mob?230:300, sw=W-24;
-  const head=tf=>`<div style="display:flex;justify-content:space-between;gap:12px;padding:14px 20px 0;font-family:${MONO_F};font-size:11px;color:#5f6b72"><span>price${tf?' · '+escH(tf):''}</span><span>GeckoTerminal</span></div>`;
+  const head=(tf,stale,lab)=>`<div style="display:flex;justify-content:space-between;gap:12px;padding:14px 20px 0;font-family:${MONO_F};font-size:11px;color:#5f6b72"><span>price${tf?' · '+escH(tf):''}</span><span>${stale>0?`<span data-chart-stale="1" style="color:#8a959c">chart as of ${new Date(stale*1000).toISOString().slice(11,16)} UTC</span> · `:''}<span data-chart-src="1">${lab||srcLabel(src)}</span></span></div>`;
   if(!st||st.status==='loading') return head('')+`<div style="padding:14px 20px 20px"><div class="cs-skel" data-chart-loading="1" style="height:${H-40}px;border-radius:8px"></div></div>`;
   const d=st.data||{}, cs=(d.candles||[]).filter(c=>c&&c.length>=5&&c[4]>0);
+  const down=st.status!=='ok'||!!d.unavailable;   // GT не ответил (или /api/chart упал): свечей нет не потому, что мало сделок
+  const lab=cs.length?'GeckoTerminal':srcLabel(src);   // свечи — всегда GT; без свечей цена — из шапки (market_source)
   const now=d.price_usd>0?d.price_usd:cs.length?cs[cs.length-1][4]:(hdrPrice>0?hdrPrice:null);
-  if(!now){   // нет данных GeckoTerminal: текстовая карточка, rug строкой
-    return head('')+`<div data-chart-empty="1" style="display:flex;flex-direction:column;gap:10px;padding:26px 20px 24px;font-family:${MONO_F}">`
-      +`<span style="font-size:13px;color:#8a959c">no price data from GeckoTerminal for this token yet</span>`
+  if(!now){   // нет цены: текстовая карточка, rug строкой
+    return head('',0,lab)+`<div data-chart-empty="1" style="display:flex;flex-direction:column;gap:10px;padding:26px 20px 24px;font-family:${MONO_F}">`
+      +`<span style="font-size:13px;color:#8a959c">${down?'chart temporarily unavailable':'no price data from '+lab+' for this token yet'}</span>`
       +(rug?`<span style="font-size:15px;color:#ff4d4d">probably rug −${dropPct(rug)}% if suspicious holders sell</span>`:'')+`</div>`+rugReasons(rug);
   }
   const few=cs.length<5;
@@ -1135,7 +1166,7 @@ function chartHtml(st,rug,hdrPrice,W){
     g+=`<path d="${line}" fill="none" stroke="#00c805" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>`;
   } else {   // меньше 5 свечей: линия now и подпись
     g+=`<line x1="${pl}" x2="${xEnd}" y1="${yn.toFixed(1)}" y2="${yn.toFixed(1)}" stroke="#00c805" stroke-width="1.4" stroke-dasharray="4 4" opacity="0.8"/>`;
-    g+=`<text data-chart-few="1" x="${(pl+(xEnd-pl)/2).toFixed(1)}" y="${(yn>pt+ph/2?yn-14:yn+24).toFixed(1)}" fill="#8a959c" font-size="12" text-anchor="middle">not enough trades to chart yet</text>`;
+    g+=`<text data-chart-few="1" x="${(pl+(xEnd-pl)/2).toFixed(1)}" y="${(yn>pt+ph/2?yn-14:yn+24).toFixed(1)}" fill="#8a959c" font-size="12" text-anchor="middle">${down?'chart temporarily unavailable':'not enough trades to chart yet'}</text>`;
   }
   if(rug){   // probably rug: стрелка от now до уровня
     const dx=xArrow-xEnd, dy=yl-yn, len=Math.hypot(dx,dy)||1, ux=dx/len, uy=dy/len, ah=10;
@@ -1153,7 +1184,7 @@ function chartHtml(st,rug,hdrPrice,W){
   const below=!few&&!rug&&rec.filter(v=>v<yn-3).length>rec.filter(v=>v>yn+3).length&&yn+20<=pt+ph-4;
   g+=rug?`<text x="${(xEnd+10).toFixed(1)}" y="${(yn-8).toFixed(1)}" fill="#00c805" font-size="10.5">now</text>`   // справа над стрелкой — свободно
        :`<text x="${(xEnd-6).toFixed(1)}" y="${(below?yn+20:yn-12).toFixed(1)}" fill="#00c805" font-size="10.5" text-anchor="end">now</text>`;
-  return head(d.timeframe)+`<div style="padding:8px 12px 10px"><svg data-chart="1" width="${sw}" height="${H}" viewBox="0 0 ${sw} ${H}" style="display:block;max-width:100%" font-family="${MONO_F}" role="img" aria-label="price chart${rug?', probably rug −'+dropPct(rug)+'%':''}">${g}</svg></div>`+rugReasons(rug);
+  return head(d.timeframe,d.stale_at,lab)+`<div style="padding:8px 12px 10px"><svg data-chart="1" width="${sw}" height="${H}" viewBox="0 0 ${sw} ${H}" style="display:block;max-width:100%" font-family="${MONO_F}" role="img" aria-label="price chart${rug?', probably rug −'+dropPct(rug)+'%':''}">${g}</svg></div>`+rugReasons(rug);
 }
 
 """
@@ -1164,6 +1195,14 @@ rep('        <div style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:
     CHART_BOX + '        <div style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:28px;padding-top:32px">')
 rep("canvasRef=React.createRef(); logRef=React.createRef();",
     "canvasRef=React.createRef(); logRef=React.createRef(); chartRef=React.createRef();")
+# пауки после скана: цель — строка кошелька или таблица; нет кошельков (TOO ESTABLISHED, таблица скрыта) —
+# видимый элемент страницы (pickWander), иначе цель нулевого размера и паук стоит на месте
+rep("      if(c&&w) c.goal={sel:`[data-row=\"${w.addr}\"]`,fx:.2+Math.random()*.6,fy:.5};",
+    "      if(c&&w) c.goal={sel:`[data-row=\"${w.addr}\"]`,fx:.2+Math.random()*.6,fy:.5}; else if(c) this.pickWander(c,now);")
+rep("    this.crawlers.forEach(c=>{const w=this.lastWallet[c.id]; c.goal=w?{sel:`[data-row=\"${w}\"]`,fx:.25+Math.random()*.5,fy:.5}:{sel:'[data-table]',fx:.25+Math.random()*.5,fy:.1+Math.random()*.3};});",
+    "    const tb=document.querySelector('[data-table]'), tbOn=!!tb&&tb.getClientRects().length>0;\n"
+    "    this.crawlers.forEach(c=>{const w=this.lastWallet[c.id]; if(!w&&!tbOn){this.rc=new Map(); this.pickWander(c,performance.now()); return;}\n"
+    "      c.goal=w?{sel:`[data-row=\"${w}\"]`,fx:.25+Math.random()*.5,fy:.5}:{sel:'[data-table]',fx:.25+Math.random()*.5,fy:.1+Math.random()*.3};});")
 rep("  handleResult(r){this.m.result=r; this.bump();}",
     "  handleResult(r){this.m.result=r; this.loadChart(); this.bump();}\n"
     "  loadChart(){   // чарт — отдельным запросом, вердикт его не ждёт\n"
@@ -1171,11 +1210,19 @@ rep("  handleResult(r){this.m.result=r; this.bump();}",
     "    fetch('/api/chart?token='+encodeURIComponent(m.ca)).then(r=>r.ok?r.json():null).catch(()=>null)\n"
     "      .then(d=>{if(this.m!==m) return; m.chart={status:d?'ok':'none',data:d||{}}; this.bump();});\n"
     "  }\n"
-    "  paintChart(){\n"
+    "  paintChart(){   // ошибка в чарте не ломает рендер страницы и анимацию пауков\n"
     "    const el=this.chartRef.current, m=this.m; if(!el||!m.chart||!el.clientWidth) return;\n"
-    "    const raw=(m.result&&m.result.raw)||{}, rug=raw.rug||null, W=el.clientWidth;\n"
-    "    const key=[m.ca,m.chart.status,W,rug?rug.drop:0].join('|'); if(el.dataset.k===key) return;\n"
-    "    el.dataset.k=key; el.innerHTML=chartHtml(m.chart,rug,(raw.header||{}).price_usd,W);\n"
+    "    const raw=(m.result&&m.result.raw)||{}, rug=raw.rug||null, W=el.clientWidth, src=raw.market_source||'';\n"
+    "    try{\n"
+    "      // виджет: TOO ESTABLISHED — всегда; иначе — /api/chart ответил без свечей (сбой GT или пусто)\n"
+    "      const est=raw.band==='TOO_ESTABLISHED', d=m.chart.data||{};\n"
+    "      const noCandles=m.chart.status!=='loading'&&!(Array.isArray(d.candles)&&d.candles.length);\n"
+    "      const url=(est||noCandles)?widgetUrl(m.ca,d.pool||raw.market_pool):null;\n"
+    "      // ключ виджета без точной ширины: иначе iframe перезагружается при каждом resize\n"
+    "      const key=url?[m.ca,'w',url,W<640,rug?rug.drop:0].join('|'):[m.ca,m.chart.status,W,rug?rug.drop:0,src].join('|');\n"
+    "      if(el.dataset.k===key) return; el.dataset.k=key;\n"
+    "      el.innerHTML=url?chartWidget(url,rug,W):(est||noCandles)&&m.chart.status!=='loading'&&(d.unavailable||m.chart.status!=='ok'||est)?chartFail()+rugReasons(rug):chartHtml(m.chart,rug,(raw.header||{}).price_usd,W,src);\n"
+    "    }catch(err){el.dataset.k=''; el.innerHTML=chartFail(); console.warn('chart render failed',err);}\n"
     "  }")
 rep("  componentDidUpdate(){const el=this.logRef.current;",
     "  componentDidUpdate(){this.paintChart(); const el=this.logRef.current;")
@@ -1305,7 +1352,8 @@ rep("  blank(ca){return {", """  estVals(){   // too established: полный �
     const stats=[['age',num(age)?Math.floor(age).toLocaleString('en-US')+(Math.floor(age)===1?' day':' days'):null],
       ['market cap',num(mcap)?fmtUsd(mcap):null],['liquidity · all pools',num(liq)?fmtUsd(liq):null],
       ['24h volume',num(h.vol24h_usd)?fmtUsd(h.vol24h_usd):null]].filter(x=>x[1]).map(([label,value])=>({label,value}));
-    return {estFlag:on?'1':'0', estStatsOn:on&&!!this.m.result&&stats.length>0, estStats:stats};
+    return {estFlag:on?'1':'0', estStatsOn:on&&!!this.m.result&&stats.length>0, estStats:stats,
+      estSrc:raw.market_source==='dexscreener'?'DexScreener':'GeckoTerminal'};
   }
   blank(ca){return {""")
 rep("      ...this.tradeVals(),", "      ...this.tradeVals(),\n      ...this.estVals(),")
@@ -1313,7 +1361,7 @@ rep("      ...this.tradeVals(),", "      ...this.tradeVals(),\n      ...this.est
 STATS_CARD = (f'          <sc-if value="{{{{estStatsOn}}}}" hint-placeholder-val="{{{{false}}}}"><div class="cs-est-stats" style="min-width:0;display:flex;flex-direction:column">'
               '<div data-est-stats="1" style="flex:1;border:1px solid #141b20;border-radius:14px;background:#090c0f;padding:26px 26px 24px;'
               'display:flex;flex-direction:column;gap:18px;box-sizing:border-box">\n'
-              f'            <div style="display:flex;justify-content:space-between;align-items:center;{MONO};font-size:11px;color:#5f6b72"><span>token stats</span><span>GeckoTerminal</span></div>\n'
+              f'            <div style="display:flex;justify-content:space-between;align-items:center;{MONO};font-size:11px;color:#5f6b72"><span>token stats</span><span data-est-src="1">{{{{estSrc}}}}</span></div>\n'
               f'            <sc-for list="{{{{estStats}}}}" as="x" hint-placeholder-count="4"><div style="display:flex;justify-content:space-between;align-items:baseline;gap:16px;padding:14px 0;border-top:1px solid #141b20">'
               f'<span style="{MONO};font-size:12px;color:#8a959c">{{{{x.label}}}}</span>'
               f'<span style="{MONO};font-size:22px;color:#eef1f3;font-variant-numeric:tabular-nums;white-space:nowrap">{{{{x.value}}}}</span></div></sc-for>\n'

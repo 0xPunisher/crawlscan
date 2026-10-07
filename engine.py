@@ -86,7 +86,8 @@ def _header(gt, meta=None, age_h=None):
 
 def established_result(token, chain, gt, limits, ev, t0, rpc_requests=0):
     """Результат без полного скана: токен старый и большой (detect.too_established). Без скора.
-    rpc_requests > 0 — вердикт по позднему ответу GT, скан уже шёл."""
+    rpc_requests > 0 — вердикт по позднему ответу GT, скан уже шёл. market_source — откуда данные рынка
+    ("gt" | "dexscreener", market.fetch_market), market_pool — пул для виджета чарта."""
     ev("done", d.ESTABLISHED_TEXT, score=None, band=d.TOO_ESTABLISHED, headline=d.ESTABLISHED_HEADLINE, rug=None)
     age = gt.get("age_days")
     return {"token": token, "chain": chain, "header": _header(gt, age_h=None if age is None else round(age * 24, 1)),
@@ -95,6 +96,7 @@ def established_result(token, chain, gt, limits, ev, t0, rpc_requests=0):
             "holders": [], "holders_total": None, "operators": [], "links": [], "packs": [], "unread": [],
             "established": {"liquidity_usd": gt.get("liquidity_usd"), "mcap_usd": gt.get("mcap_usd"),
                             "age_days": age, "limits": limits},
+            "market_source": gt.get("source"), "market_pool": gt.get("pool"),
             "elapsed_s": round(time.time() - t0, 1), "rpc_requests": rpc_requests}
 
 
@@ -166,9 +168,10 @@ def scan(token, emit=lambda e: None):
         seq[0] += 1
         emit(e)
 
-    # GeckoTerminal — до первого RPC: шапка и проверка «too established». Вердикт too established
-    # в кэше (market.ESTABLISHED_TTL) — сразу он, без GT. Не ответил за MARKET_WAIT — скан идёт, запрос GT
-    # продолжается в фоне; поздний ответ проверяем между этапами и перед вердиктом. GT недоступен — обычный скан.
+    # Рынок (GeckoTerminal, не ответил — DexScreener: market.fetch_market) — до первого RPC: шапка и проверка
+    # «too established». Вердикт too established в кэше (market.ESTABLISHED_TTL) — сразу он, без запросов.
+    # Не ответил за MARKET_WAIT — скан идёт, запрос продолжается в фоне; поздний ответ проверяем между этапами
+    # и перед вердиктом. Рынок недоступен — обычный скан (старый токен — limited).
     network = GT_NETWORK[chain]
     limits = established_limits()
     cached = market.established_get(token, network)
@@ -320,7 +323,8 @@ def scan(token, emit=lambda e: None):
         "links": links, "packs": packs, "operators": ops,
         "score": sc["score"], "band": sc["band"], "parts": sc["parts"], "gates": sc["gates"],
         "metrics": sc["metrics"], "headline": sc["headline"], "reason": reason, "reserve": facts["reserve"],
-        "reserve_ok": reserve_ok, "limited": limited,
+        "reserve_ok": reserve_ok, "limited": limited, "market_source": gt.get("source"),
+        "market_pool": gt.get("pool"),
         "rug": rug,
         "unread": unread, "use_funding": USE_FUNDING,
         "elapsed_s": elapsed, "rpc_requests": a.REQUESTS[0] - r0,
