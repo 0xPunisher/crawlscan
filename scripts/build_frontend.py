@@ -15,7 +15,7 @@
   - ссылки X и GitHub -> реальные адреса, в новой вкладке (target="_blank" rel="noopener");
     иконка Telegram-бота (t.me/CrawlScanBot) сразу после X в шапке и футере;
   - роадмап: «Solana support (pump.fun)», «Telegram bot», «Burns & holder rewards»,
-    «Price chart and probably rug projection» — в SHIPPED; в NEXT первым «Early buyers crawl», за ним
+    «Price chart and probably rug projection», «Recently scanned feed», «Too established state» — в SHIPPED; в NEXT первым «Early buyers crawl», за ним
     «All-chain support» (больше EVM-сетей и не только); Launch radar — в конец LATER;
   - герой: обе сети — бейдж «memecoin holder scanner · Robinhood and Solana», заголовок «for Robinhood and
     Solana memecoins», подпись под полем «… · Robinhood and Solana»; Solana — цветом Solana (#9945FF);
@@ -266,7 +266,12 @@ rep(browser, browser + radar)
 # v1.4.0: Price chart and probably rug projection — в конец SHIPPED
 chart_card = (ITEM + TITLE + 'Price chart and probably rug projection</span>' + DESC
               + 'A price chart on every scan; on DANGER, how far the price could fall if suspicious holders sell.</span></div>\n')
-rep(operator_card, operator_card + solana_card + telegram_card + rewards_card + chart_card)
+# v1.5.0: Recently scanned feed и Too established state — в конец SHIPPED
+recent_card = (ITEM + TITLE + 'Recently scanned feed</span>' + DESC
+               + 'The latest verdicts on the homepage, one click to open a result.</span></div>\n')
+established_card = (ITEM + TITLE + 'Too established state</span>' + DESC
+                    + 'Tokens older than 30 days with high liquidity and market cap get token stats instead of a full scan.</span></div>\n')
+rep(operator_card, operator_card + solana_card + telegram_card + rewards_card + chart_card + recent_card + established_card)
 
 # герой: «for Robinhood and Solana memecoins», «and» — цветом заголовка, Solana — фиолетовым Solana
 rep('<span data-grip="1" style="color:#00c805">Robinhood</span><span data-grip="1" style="color:#00c805">memecoins</span>',

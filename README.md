@@ -301,6 +301,8 @@ Only one copy of the bot can poll Telegram at a time.
 * [x] **Dump-impact scoring** and liquidity guard
 * [x] **Telegram bot**: send a token address and get the verdict, score and key holder signals
 * [x] **Price chart and probably rug projection**
+* [x] **Recently scanned feed** on the homepage
+* [x] **Too established state**: tokens older than 30 days with high liquidity and market cap get an explanation and token stats instead of a full scan
 
 ### 🟢 In progress
 

@@ -9,6 +9,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Early buyers crawl: see how much supply was bundled at launch, even after bundlers exit.
 
+## [1.5.0] - 2026-10-07
+
+### Added
+
+- Recently scanned feed on the homepage: the latest verdicts, click a token to open its result, copy its address.
+- `/rewards` command in the Telegram bot: next burn and draw, the last winner and payout, total burned.
+- Trade on Axiom button on scan results and in the Telegram bot.
+- Copy the token address with one click in the result header.
+- Too established state for large, older tokens (30+ days, high liquidity and market cap). These tokens skip the full scan: the result explains why holder signals don't apply, shows a token stats card and a live chart.
+- Market data fallback to DexScreener when GeckoTerminal rate-limits or does not answer, with a shared market data cache. Older tokens never get a verdict worse than `RISKY` when no market data is available.
+- Chart fallbacks: the last good chart is shown (with its time) while GeckoTerminal is unavailable, and an embedded live chart is used when there are no candles at all.
+
+### Changed
+
+- Reserve safeguard: when the liquidity reserve can't be measured, the result says "liquidity not measured" instead of showing a dump projection.
+
+### Fixed
+
+- Liquidity reserve for pump.fun tokens migrated to Raydium and Meteora pools: these tokens no longer get a false `DANGER` and a "-100%" projection.
+- Chart errors no longer break the result page or the crawler animation.
+- The token chart widget on the homepage points to the migrated pool.
+- Mobile result header: long names and addresses wrap instead of scrolling sideways.
+
 ## [1.4.0] - 2026-10-06
 
 ### Added
@@ -69,6 +92,10 @@ First public release.
 - Token header from GeckoTerminal: name, ticker, price, market cap, liquidity, volume, age.
 - Python standard library only, read-only, no keys.
 
-[Unreleased]: https://github.com/0xPunisher/crawlscan/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/0xPunisher/crawlscan/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/0xPunisher/crawlscan/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/0xPunisher/crawlscan/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/0xPunisher/crawlscan/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/0xPunisher/crawlscan/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/0xPunisher/crawlscan/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/0xPunisher/crawlscan/releases/tag/v1.0.0
