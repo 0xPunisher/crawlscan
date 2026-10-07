@@ -65,6 +65,8 @@ def patched(history_fn=history, launch=True):
     stack = ExitStack()
     engine._HIST.clear()
     market.clear_cache()
+    stack.enter_context(mock.patch.dict(ch._SCAN, clear=True))     # история переводов скана (early buyers)
+    stack.enter_context(mock.patch.dict(ch._LAUNCH, clear=True))
     launch_info = {"block": LAUNCH_BLOCK, "curve": CURVE, "deployer": DEPLOYER, "tx": "0xlaunch"}
     p = lambda name, **kw: stack.enter_context(mock.patch.object(ch, name, **kw))
     p("_post", side_effect=_no_network)

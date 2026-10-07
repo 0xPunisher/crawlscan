@@ -5,6 +5,7 @@ eth_getLogs с адаптивным окном (при отказе или уп�
 Read-only: ни ключей, ни подписи, ни отправки транзакций.
 """
 import os, re, sys, time, json, random, threading, urllib.request
+from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from env import load_dotenv
@@ -274,6 +275,9 @@ def excluded_addresses(curve):
     return INFRA | market_addresses(curve)
 
 
+_LAUNCH = {}  # token -> результат get_launch (не меняется)
+
+
 def get_launch(token):
     """{"block", "curve", "deployer", "tx"} или None.
     Событие запуска ищем на фабрике назад окнами по LAUNCH_SEARCH_SPAN.
@@ -281,6 +285,8 @@ def get_launch(token):
     (дев-бай). Нет дев-бая — creator из topic[3] события фабрики (это msg.sender
     фабрики: при запуске через сторонний контракт там стоит контракт)."""
     token = token.lower()
+    if token in _LAUNCH:   # запуск не меняется
+        return dict(_LAUNCH[token])
     hi = block_number()
     launch = None
     while hi >= 0 and launch is None:
@@ -301,8 +307,10 @@ def get_launch(token):
         if p and p["token"] == token and p["frm"] == curve and p["to"] not in market and p["to"] not in INFRA:
             deployer = p["to"]
             break
-    return {"block": int(launch["blockNumber"], 16), "curve": curve,
-            "deployer": deployer, "tx": launch["transactionHash"]}
+    res = {"block": int(launch["blockNumber"], 16), "curve": curve,
+           "deployer": deployer, "tx": launch["transactionHash"]}
+    _LAUNCH[token] = res
+    return dict(res)
 
 
 def token_facts(token, launch):
@@ -316,6 +324,7 @@ def token_facts(token, launch):
     reserve_ok = False, если ни кривая, ни pool manager не держат токен (0): резерв не измерен, а не «ликвидности нет»."""
     transfers = get_token_transfers(token, launch["block"])
     supply = token_supply(token)
+    remember_scan(token, launch, transfers, supply)
     pools = {launch["curve"].lower(), V4_POOL_MGR}
     reserve = sum(t["amount"] * ((t["to"] in pools) - (t["frm"] in pools)) for t in transfers)
     return {"supply": supply, "transfers": transfers, "excluded": excluded_addresses(launch["curve"]),
@@ -348,15 +357,22 @@ def get_token_transfers(token, from_block, to_block=None, frm=None, to=None):
     return out
 
 
+_BLOCK_TS = {}  # block -> unix_time (не меняется), общий для скана и early buyers
+
+
 def block_timestamps(blocks, chunk=100):
-    """{block: unix_time} батчем eth_getBlockByNumber(..., false)."""
+    """{block: unix_time} батчем eth_getBlockByNumber(..., false); уже известные — из кэша процесса."""
     blocks = sorted(set(blocks))
-    out = {}
-    for i in range(0, len(blocks), chunk):
-        part = blocks[i:i + chunk]
+    out = {b: _BLOCK_TS[b] for b in blocks if b in _BLOCK_TS}
+    need = [b for b in blocks if b not in out]
+    for i in range(0, len(need), chunk):
+        part = need[i:i + chunk]
         for b, blk in zip(part, rpc_batch([("eth_getBlockByNumber", [hex(b), False]) for b in part])):
             if blk:
                 out[b] = int(blk["timestamp"], 16)
+    if len(_BLOCK_TS) > CACHE_MAX:
+        _BLOCK_TS.clear()
+    _BLOCK_TS.update(out)
     return out
 
 
@@ -562,6 +578,26 @@ def launched_pair(token):
     return _PAIR[token]
 
 
+CACHE_MAX = 50_000  # записей в кэшах процесса (время блоков, чеки)
+_RECEIPTS = {}      # tx -> логи чека (не меняются), общий для скана и early buyers
+
+
+def receipt_logs(txs, chunk=50):
+    """{tx: логи чека} батчами eth_getTransactionReceipt; уже прочитанные — из кэша процесса.
+    Чек не получен — пустой список (и не кэшируется)."""
+    out = {h: _RECEIPTS[h] for h in txs if h in _RECEIPTS}
+    need = [h for h in txs if h not in out]
+    for i in range(0, len(need), chunk):
+        part = need[i:i + chunk]
+        for h, rc in zip(part, rpc_batch([("eth_getTransactionReceipt", [h]) for h in part])):
+            out[h] = (rc or {}).get("logs", [])
+            if rc:
+                if len(_RECEIPTS) > CACHE_MAX:
+                    _RECEIPTS.clear()
+                _RECEIPTS[h] = out[h]
+    return out
+
+
 def classify_entries(token, transfers, wallets, chunk=50):
     """Первое получение токена каждым кошельком из wallets, по транзакции:
     {wallet: {"kind": "buy"|"transfer", "tx", "block", "via", "eth_in"}}.
@@ -580,12 +616,7 @@ def classify_entries(token, transfers, wallets, chunk=50):
     for t in transfers:
         if t["to"] in want and t["to"] not in first:
             first[t["to"]] = t
-    txs = sorted({t["tx"] for t in first.values()})
-    receipts = {}
-    for i in range(0, len(txs), chunk):
-        part = txs[i:i + chunk]
-        for h, rc in zip(part, rpc_batch([("eth_getTransactionReceipt", [h]) for h in part])):
-            receipts[h] = (rc or {}).get("logs", [])
+    receipts = receipt_logs(sorted({t["tx"] for t in first.values()}), chunk)
     pair = launched_pair(token)
     eth_pair = pair in ("0x" + "0" * 40, WETH_ADDR)
 
@@ -663,3 +694,166 @@ def token_meta(token):
     name, sym = rpc_batch([("eth_call", [{"to": t, "data": "0x06fdde03"}, "latest"]),
                            ("eth_call", [{"to": t, "data": "0x95d89b41"}, "latest"])])
     return {"name": _abi_string(name), "symbol": _abi_string(sym)}
+
+
+# ---------------------------------------------------------------------------
+# early buyers: первые покупатели после запуска и что они сделали с токеном
+# ---------------------------------------------------------------------------
+EARLY_WINDOW = 2000      # блоков после запуска в первом окне; покупателей не хватило — окно удваивается
+EARLY_CANDIDATES = 25    # получателей за раз (не больше): контракт или нет, покупка или перевод
+EARLY_OUT_CAP = 20       # выходов кошелька не на рынок (самые новые) на проверку чеком
+BURN_ADDRS = {"0x000000000000000000000000000000000000dead", "0x" + "0" * 40}
+SCAN_TTL = 600           # секунд: история переводов из скана (= кэш результата скана в server.py)
+SCAN_MAX = 20            # токенов в памяти (у старых токенов история — десятки тысяч переводов)
+_SCAN = {}               # token -> (ts, launch, transfers, supply)
+_SCAN_LOCK = threading.Lock()
+
+
+def remember_scan(token, launch, transfers, supply):
+    """Полная история переводов с запуска, которую прочитал скан (token_facts): early buyers берёт
+    покупателей, балансы и выходы из неё и дочитывает только хвост после неё."""
+    with _SCAN_LOCK:
+        _SCAN[token.lower()] = (time.time(), dict(launch), transfers, supply)
+        if len(_SCAN) > SCAN_MAX:
+            for k, _ in sorted(_SCAN.items(), key=lambda kv: kv[1][0])[:len(_SCAN) - SCAN_MAX]:
+                del _SCAN[k]
+
+
+def scan_history(token):
+    """(launch, transfers, supply) из последнего скана моложе SCAN_TTL или None."""
+    with _SCAN_LOCK:
+        hit = _SCAN.get(token.lower())
+    return hit[1:] if hit and time.time() - hit[0] < SCAN_TTL else None
+
+
+def _with_tail(token, transfers):
+    """История скана + переводы после неё (getLogs с последнего блока истории, дубли по (tx, log_index) — вон)."""
+    last = max((t["block"] for t in transfers), default=0)
+    seen = {(t["tx"], t["log_index"]) for t in transfers if t["block"] == last}
+    tail = [t for t in get_token_transfers(token, last) if (t["tx"], t["log_index"]) not in seen]
+    return transfers + tail
+
+
+def early_buyers(token, n=20, deadline=None):
+    """Первые n уникальных покупателей: {"launch": {"block", "ts", "deployer", "curve"}, "buyers": [{"wallet", "block",
+    "ts", "tx", "bought"}], "txs_read"} или None (не Pons V2). Не меняется со временем.
+    Был скан моложе SCAN_TTL — переводы из его истории (remember_scan), без запросов; иначе окном после запуска
+    (EARLY_WINDOW, удваивается, пока покупателей мало) — цена не зависит от длины истории токена. Кандидаты — первые получатели вне инфраструктуры и не контракты. Покупка: токен
+    пришёл прямо с рынка (кривая, роутеры, pool manager) — без чека; иначе по чеку входа (classify_entries:
+    CurveBuy / V4 Swap через сторонний бот-роутер). bought — сколько
+    кошелёк получил в транзакции первой покупки."""
+    token = token.lower()
+    hist = scan_history(token)
+    launch = hist[0] if hist else get_launch(token)
+    if launch is None:
+        return None
+    excluded, market = excluded_addresses(launch["curve"]), market_addresses(launch["curve"])
+    head = None if hist else block_number()
+    lo, span, trs = launch["block"], EARLY_WINDOW, list(hist[1]) if hist else []
+    buyers, checked = [], set()
+    while True:
+        if hist:   # вся история уже есть — окна не читаем
+            hi = head = 0
+        else:
+            hi = min(head, launch["block"] + span)
+            trs += get_token_transfers(token, lo, hi)
+            lo = hi + 1
+        order = list(dict.fromkeys(t["to"] for t in trs if t["to"] not in excluded))   # первые получатели по порядку
+        fresh = [a for a in order if a not in checked]
+        while fresh and len(buyers) < n and not (deadline and time.time() > deadline):
+            k = min(EARLY_CANDIDATES, n - len(buyers) + 3)   # вызовы делят лимитер со сканами: только нужное
+            part, fresh = fresh[:k], fresh[k:]
+            checked |= set(part)
+            code = is_contract(part)
+            wallets = [a for a in part if not code.get(a)]
+            src = {}
+            for t in trs:
+                if t["to"] in wallets and t["to"] not in src:
+                    src[t["to"]] = t["frm"]
+            # токен пришёл прямо с кривой, роутера Pons или pool manager — покупка без чека;
+            # иначе (сторонний бот-роутер, другой кошелёк) — по чеку входа
+            unsure = [a for a in wallets if src.get(a) not in market]
+            ent = classify_entries(token, trs, unsure) if unsure else {}
+            buyers += [a for a in wallets if a not in ent or ent[a]["kind"] == "buy"]
+        if len(buyers) >= n or hi >= head or (deadline and time.time() > deadline):
+            break
+        span *= 2
+    rank = {a: i for i, a in enumerate(order)}
+    buyers = sorted(buyers, key=rank.get)[:n]
+    first = {}
+    for t in trs:
+        if t["to"] in buyers and t["to"] not in first:
+            first[t["to"]] = t
+    blocks = sorted({launch["block"]} | {t["block"] for t in first.values() if "ts" not in t})
+    ts = block_timestamps(blocks) if blocks else {}
+    out = []
+    for a in buyers:
+        t = first[a]
+        out.append({"wallet": a, "block": t["block"], "ts": t.get("ts", ts.get(t["block"])), "tx": t["tx"],
+                    "bought": sum(x["amount"] for x in trs if x["to"] == a and x["tx"] == t["tx"])})
+    return {"launch": {"block": launch["block"], "ts": ts.get(launch["block"]), "deployer": launch["deployer"],
+                       "curve": launch["curve"]}, "buyers": out, "txs_read": len(trs)}
+
+
+def early_status(token, buyers, deadline=None, launch=None, out_cap=EARLY_OUT_CAP):
+    """Что покупатели сделали с токеном: {"supply", "wallets": {wallet: {"now", "sold", "moved": {куда: сколько},
+    "burned", "partial"}}}. Все входы и выходы кошельков — из истории скана + хвост после неё (scan_history),
+    иначе двумя getLogs по топикам (to / from); баланс — из них.
+    Выход на рынок (кривая, роутеры, pool manager) — продажа; на другой адрес — по чеку (CurveSell или токен
+    в pool manager в той же транзакции — продажа через сторонний роутер), иначе перевод; на burn / 0x0 — сожжено.
+    partial — выходов не на рынок больше out_cap или не успели до deadline."""
+    token = token.lower()
+    hist = scan_history(token)
+    supply = hist[2] if hist else token_supply(token)
+    ws = [b["wallet"] for b in buyers]
+    out = {w: {"now": 0, "sold": 0, "moved": {}, "burned": 0, "partial": False} for w in ws}
+    if not ws:
+        return {"supply": supply, "wallets": out}
+    if hist:   # история скана + хвост после неё: один getLogs вместо двух по всей истории
+        want = set(ws)
+        trs = _with_tail(token, hist[1])
+        ins = [t for t in trs if t["to"] in want]
+        outs = [t for t in trs if t["frm"] in want]
+    else:
+        start = min(b["block"] for b in buyers)
+        ins = get_token_transfers(token, start, to=ws)
+        outs = get_token_transfers(token, start, frm=ws)
+    for t in ins:
+        out[t["to"]]["now"] += t["amount"]
+    for t in outs:
+        out[t["frm"]]["now"] -= t["amount"]
+    market = market_addresses(launch["curve"]) if launch and launch.get("curve") else ROUTERS | {V4_POOL_MGR}
+    check = defaultdict(list)
+    for t in outs:
+        o = out[t["frm"]]
+        if t["to"] in market:
+            o["sold"] += t["amount"]
+        elif t["to"] in BURN_ADDRS:
+            o["burned"] += t["amount"]
+        else:
+            check[t["frm"]].append(t)
+    pick = []
+    for w, ts_ in check.items():
+        if len(ts_) > out_cap:
+            out[w]["partial"] = True
+        pick += ts_[-out_cap:]
+    txs = sorted({t["tx"] for t in pick})
+    sells, checked = set(), set()
+    for i in range(0, len(txs), 50):
+        if deadline and time.time() > deadline:
+            break
+        part = txs[i:i + 50]
+        for h, logs in receipt_logs(part).items():
+            if any((l.get("topics") or [""])[0].lower() == CURVE_SELL for l in logs) or any(
+                    (p := parse_transfer(l)) and p["token"] == token and p["to"] == V4_POOL_MGR for l in logs):
+                sells.add(h)
+        checked |= set(part)
+    for t in pick:
+        o = out[t["frm"]]
+        if t["tx"] not in checked:   # не успели проверить чек
+            o["partial"] = True
+        elif t["tx"] in sells:
+            o["sold"] += t["amount"]
+        else:
+            o["moved"][t["to"]] = o["moved"].get(t["to"], 0) + t["amount"]
+    return {"supply": supply, "wallets": out}
