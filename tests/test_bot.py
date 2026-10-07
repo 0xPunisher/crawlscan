@@ -440,7 +440,7 @@ class TestRewards(unittest.TestCase):
         d = dict(rewards_status()["last_draw"], payout_status="paid", payout_currency="ETH", payout_eth=0.0523,
                  payout_tokens=None, payout_tx="0xfeed")
         txt = self.reply(FakeAPI(rewards=rewards_status(last_draw=d)))[0]["text"]
-        self.assertIn('✅ Reward sent: 0.0523 ETH · <a href="https://robinhoodchain.blockscout.com/tx/0xfeed">tx</a>', txt)
+        self.assertIn('✅ Paid: 0.0523 ETH · <a href="https://robinhoodchain.blockscout.com/tx/0xfeed">tx</a>', txt)
         self.assertNotIn("$CrawlScan · <a", txt.split("Last winner")[1].split("🔥")[0])
         self.assertNotIn("pending", txt)
 

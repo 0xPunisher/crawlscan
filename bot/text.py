@@ -301,10 +301,10 @@ def rewards(st):
         pct = "—" if chance is None else f"{chance * 100:.2f}%" if chance >= 0.0001 else "<0.01%"
         lines.append(f"<b>Last winner</b> · draw of {e(d.get('day', ''))}")
         lines.append(f"<code>{e(short(d['winner']))}</code> · chance {pct}")
-        if d.get("payout_tx") and d.get("payout_currency") == "ETH":
+        if d.get("payout_tx") and d.get("payout_currency") == "ETH":   # единый формат: Paid: <сумма> <валюта>
             amt = f"{eth(d['payout_eth'])} ETH · " if d.get("payout_eth") is not None else ""
-            lines.append(f"✅ Reward sent: {amt}{tx_link(d['payout_tx'])}")
-        elif d.get("payout_tx"):   # выплаты токеном (до перехода на ETH) — как раньше
+            lines.append(f"✅ Paid: {amt}{tx_link(d['payout_tx'])}")
+        elif d.get("payout_tx"):   # выплаты токеном (до перехода на ETH)
             amt = f"{tokens(d.get('payout_tokens'))} $CrawlScan · " if d.get("payout_tokens") is not None else ""
             lines.append(f"✅ Paid: {amt}{tx_link(d['payout_tx'])}")
         else:

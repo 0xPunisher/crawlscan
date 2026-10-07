@@ -965,7 +965,7 @@ rep("  blank(ca){return {", r"""  loadRewards(){   // статус Rewards & Bur
       rwWinner:won?rwShort(L.winner):'', rwWinnerFull:won?L.winner:'', rwWinnerUrl:won?RH_ADDR(L.winner):'#',
       copyRwWinner:()=>this.copyText('winner',won?L.winner:''), rwWinDone:cp==='winner', rwWinIdle:cp!=='winner',
       rwChance:won?fmtChance(L.weight,L.total_weight)+' chance':'', rwDayLabel:L?'draw of '+L.day:'',
-      rwPaid:won&&paid, rwPending:won&&!paid, rwPrize:!paid?'':L.payout_currency==='ETH'?fmtEth(L.payout_amount)+' ETH':fmtUnits(L.payout_amount,dec)+' tokens',
+      rwPaid:won&&paid, rwPending:won&&!paid, rwPrize:!paid?'':L.payout_currency==='ETH'?fmtEth(L.payout_amount)+' ETH':fmtUnits(L.payout_amount,dec)+' $CrawlScan',
       rwTxUrl:paid?RH_TX(L.payout_tx):'#', rwTxShort:paid?rwShort(L.payout_tx):'',
       rwCanVerify:!!L, onRwVerify:()=>this.runRwVerify(), rwVerifyShow:!!vf, rwVerifyText:vf?vf.text:'',
       rwVerifyColor:{ok:G,bad:RD}[vf&&vf.s]||'#8a959c', rwVerifyDetail:vf&&vf.detail?vf.detail:''};
@@ -1073,7 +1073,7 @@ REWARDS_SECTION = f'''      <sc-if value="{{{{rwOn}}}}" hint-placeholder-val="{{
               {sif("rwWonNew", winner_line("cs-rw-win cs-rw-reveal"))}
               {sif("rwWon", f'<span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwChance}}}} · {{{{rwDayLabel}}}}</span>')}
               {sif("rwWonNew", f'<span style="{MONO};font-size:12px;color:#5f6b72">{{{{rwChance}}}} · {{{{rwDayLabel}}}}</span>')}
-              {sif("rwPaid", f'<span data-rw-payout="1" style="{MONO};font-size:13px;color:#00c805;overflow-wrap:anywhere">reward sent: {{{{rwPrize}}}} · <a href="{{{{rwTxUrl}}}}" target="_blank" rel="noopener" style="color:#9fd9ff" style-hover="color:#ffffff">{{{{rwTxShort}}}} ↗</a></span>')}
+              {sif("rwPaid", f'<span data-rw-payout="1" style="{MONO};font-size:13px;color:#00c805;overflow-wrap:anywhere">Paid: {{{{rwPrize}}}} · <a href="{{{{rwTxUrl}}}}" target="_blank" rel="noopener" style="color:#9fd9ff" style-hover="color:#ffffff">{{{{rwTxShort}}}} ↗</a></span>')}
               {sif("rwPending", f'<span data-rw-payout="1" style="{MONO};font-size:13px;color:#8a959c">payout pending</span>')}
             </div>
           </div>
