@@ -38,6 +38,9 @@ Alerts, подписки для бота (только при ALERTS_ENABLED=tru
                                                    422 — токен too established, 400 — плохой адрес
   POST /api/alerts/unwatch {"chat_id", "token"} -> {"ok", "removed"}
   GET  /api/alerts/list?chat_id=N               -> {"items": [{"token", "chain", "created_at", "expires_at"}], ...}
+  POST /api/alerts/test {"chat_id", "token"}    -> пробное уведомление в chat_id сразу (без cooldown и подписки) по
+                                                   последнему снимку токена, нет снимка — по свежему скану;
+                                                   {"ok", "source": "snapshot" | "scan"}; 502 — Telegram отказал
 
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
@@ -64,6 +67,7 @@ from draw_store import Store
 from rewards_store import RewardsStore
 from recent_store import RecentStore
 from alerts_store import AlertsStore
+from bot.tg import TelegramError
 
 CACHE_TTL = 600            # секунд: кэш результата по токену
 MAX_CONCURRENT = 3         # одновременных сканов
@@ -366,6 +370,48 @@ def _chat_id(v):
     return v
 
 
+TEST_SCAN_WAIT = 60   # секунд: ждать скан для пробного уведомления, если снимка токена нет
+
+
+def test_snapshot(chain, token):
+    """(снимок, diff, источник) для пробного уведомления: последний снимок токена; нет — готовый результат скана
+    из памяти или новый скан (ждём до TEST_SCAN_WAIT). → (None, None, текст ошибки), если результата нет."""
+    prev, cur = alerts_store().get(token)
+    if cur:
+        return cur, alerts.diff(prev, cur), "snapshot"
+    jid = start_scan(token)
+    t0 = time.time()
+    while time.time() - t0 < TEST_SCAN_WAIT:
+        with _lock:
+            job = JOBS.get(jid)
+            done, res, err = job["done"], job["result"], job["error"]
+        if done:
+            if err or not res:
+                return None, None, err or "scan failed"
+            return alerts.snapshot(res), [], "scan"
+        time.sleep(0.2)
+    return None, None, "scan timed out"
+
+
+def alerts_test(body):
+    """POST /api/alerts/test → (код, тело). Шлёт сразу, в этом потоке: без очереди, cooldown и проверки подписки;
+    403 Telegram подписки не трогает."""
+    token_env = os.environ.get("TG_BOT_TOKEN", "").strip()
+    if not token_env:
+        return 503, {"error": "TG_BOT_TOKEN is not set"}
+    snap, changes, source = test_snapshot(*engine.chain_of(body.get("token")))
+    if snap is None:
+        return 409, {"error": f"no result for this token: {source}"}
+    text, markup = alerts.message(snap, changes, trade.url(snap.get("chain"), snap["token"]), test=True)
+    try:
+        alerts_notify.telegram(token_env)(body["chat_id"], text, markup)
+    except TelegramError as e:
+        return 502, {"error": f"telegram: {e.description}", "code": e.code}
+    print(f"alerts: test alert {snap['token']} to {body['chat_id']} ({source})", flush=True)
+    return 200, {"ok": True, "token": snap["token"], "source": source, "band": snap.get("band"),
+                 "changes": [c["kind"] for c in changes]}
+
+
 def alerts_api(method, path, body, q):
     """/api/alerts/* → (код, тело). Выключатель и секрет проверяет вызывающий."""
     try:
@@ -376,12 +422,14 @@ def alerts_api(method, path, body, q):
     meta = {"limit": alerts.WATCH_LIMIT, "days": alerts.WATCH_DAYS}
     if method == "GET" and path == "/api/alerts/list":
         return 200, {"chat_id": chat_id, "items": store.watches(chat_id, now)} | meta
-    if method != "POST" or path not in ("/api/alerts/watch", "/api/alerts/unwatch"):
+    if method != "POST" or path not in ("/api/alerts/watch", "/api/alerts/unwatch", "/api/alerts/test"):
         return 404, {"error": "not found"}
     try:
         chain, token = engine.chain_of(body.get("token"))
     except engine.ScanError as e:
         return 400, {"error": str(e)}
+    if path == "/api/alerts/test":
+        return alerts_test(body | {"chat_id": chat_id})
     if path == "/api/alerts/unwatch":
         removed = store.unwatch(chat_id, token)
         return 200, {"ok": True, "token": token, "removed": removed, "items": store.watches(chat_id, now)} | meta

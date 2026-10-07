@@ -104,13 +104,18 @@ def _short(addr):
     return f"{addr[:6]}…{addr[-4:]}" if len(addr) > 12 else addr
 
 
-def message(snap, changes, trade_url=None):
-    """Уведомление подписчику (HTML parse mode) → (текст, кнопки). snap — текущий снимок, changes — diff."""
+TEST_LINE = "This is a test. Real alerts list here what changed since the last scan."
+
+
+def message(snap, changes, trade_url=None, test=False):
+    """Уведомление подписчику (HTML parse mode) → (текст, кнопки). snap — текущий снимок, changes — diff.
+    test — пробное (POST /api/alerts/test): «(test alert)» в первой строке; без изменений — строка TEST_LINE."""
     e = lambda x: html.escape(str(x), quote=False)
     token = snap["token"]
     name = f"${e(snap['ticker'])}" if snap.get("ticker") else e(_short(token))
-    lines = [f"🔔 <b>{name}</b> · {CHAIN_NAME.get(snap.get('chain'), e(snap.get('chain') or ''))}", ""]
-    lines += [f"• {e(c['text'])}" for c in changes]
+    lines = [f"🔔 <b>{name}</b> · {CHAIN_NAME.get(snap.get('chain'), e(snap.get('chain') or ''))}"
+             + (" (test alert)" if test else ""), ""]
+    lines += [f"• {e(c['text'])}" for c in changes] or ([f"• {TEST_LINE}"] if test else [])
     band = snap.get("band") or ""
     lines.append("")
     if snap.get("score") is not None:

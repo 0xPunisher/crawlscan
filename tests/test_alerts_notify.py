@@ -1,5 +1,5 @@
 """Тесты alerts A3: уведомления подписчикам после живого скана (alerts_notify, server.record_snapshot). Без сети."""
-import contextlib, io, json, os, tempfile, threading, time, unittest, urllib.request
+import contextlib, io, json, os, tempfile, threading, time, unittest, urllib.error, urllib.request
 from unittest import mock
 from http.server import ThreadingHTTPServer
 
@@ -372,6 +372,71 @@ class TestLiveScans(unittest.TestCase):
             d, _ = self.scan()
             self.assertIn("result", d)
             self.assertNotIn("error", d)
+
+
+    # --- POST /api/alerts/test ------------------------------------------------------------------------
+
+    def post_test(self, body, secret="sec"):
+        req = urllib.request.Request(self.base + "/api/alerts/test", data=json.dumps(body).encode(), method="POST",
+                                     headers={"content-type": "application/json", "X-Alerts-Secret": secret})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_test_alert_secret_and_switch(self):
+        with mock.patch.dict(os.environ, {"ALERTS_API_SECRET": "sec"}):
+            self.assertEqual(self.post_test({"chat_id": 5, "token": fakes.TOKEN}, secret="nope")[0], 403)
+            with mock.patch.dict(os.environ, {"ALERTS_ENABLED": "false"}):
+                self.assertEqual(self.post_test({"chat_id": 5, "token": fakes.TOKEN})[0], 404)
+        self.assertEqual(self.post_test({"chat_id": 5, "token": fakes.TOKEN}, secret="")[0], 403)   # секрет не задан
+        self.assertEqual(self.send.sent, [])
+
+    def test_test_alert_from_snapshot_no_cooldown(self):
+        self.scan()
+        with mock.patch.dict(os.environ, {"ALERTS_API_SECRET": "sec"}):
+            for _ in range(2):                                # cooldown не применяется
+                code, d = self.post_test({"chat_id": 5, "token": fakes.TOKEN})
+                self.assertEqual((code, d["ok"], d["source"]), (200, True, "snapshot"))
+        self.assertEqual([m["chat"] for m in self.send.sent], [5, 5])   # подписка не нужна
+        text = self.send.sent[0]["text"]
+        first = text.split("\n")[0]
+        self.assertTrue(first.startswith("🔔 <b>") and first.endswith(" (test alert)"), first)
+        self.assertIn("• This is a test.", text)
+        self.assertIn("Now: ", text)
+        self.assertEqual(self.send.sent[0]["markup"]["inline_keyboard"][1][0]["callback_data"], f"unwatch:{fakes.TOKEN}")
+
+    def test_test_alert_shows_real_changes(self):
+        self.scan()
+        self.make_prev_differ()
+        self.scan()
+        with mock.patch.dict(os.environ, {"ALERTS_API_SECRET": "sec"}):
+            code, d = self.post_test({"chat_id": 5, "token": fakes.TOKEN})
+        self.assertEqual(d["changes"], ["operator_sold"])
+        self.assertIn("Biggest operator sold", self.send.sent[-1]["text"])
+        self.assertNotIn("This is a test", self.send.sent[-1]["text"])
+
+    def test_test_alert_scans_if_no_snapshot(self):
+        with mock.patch.dict(os.environ, {"ALERTS_API_SECRET": "sec"}):
+            code, d = self.post_test({"chat_id": 5, "token": fakes.TOKEN})
+            self.assertEqual((code, d["source"]), (200, "scan"))
+            self.assertEqual(self.post_test({"chat_id": 5, "token": fakes.OTHER})[0], 409)   # скан с ошибкой
+            self.assertEqual(self.post_test({"chat_id": 5, "token": "nope"})[0], 400)
+            self.assertEqual(self.post_test({"chat_id": "x", "token": fakes.TOKEN})[0], 400)
+        self.assertIn("(test alert)", self.send.sent[0]["text"])
+
+    def test_test_alert_telegram_errors(self):
+        self.scan()
+        server.alerts_store().watch(5, fakes.TOKEN, "robinhood")
+        self.send.fail[5] = TelegramError(403, "Forbidden: bot was blocked by the user")
+        with mock.patch.dict(os.environ, {"ALERTS_API_SECRET": "sec"}):
+            code, d = self.post_test({"chat_id": 5, "token": fakes.TOKEN})
+            self.assertEqual((code, d["code"]), (502, 403))
+            self.assertEqual(len(server.alerts_store().watches(5)), 1)   # тест подписки не трогает
+            with mock.patch.dict(os.environ, {"TG_BOT_TOKEN": ""}):
+                self.assertEqual(self.post_test({"chat_id": 5, "token": fakes.TOKEN})[0], 503)
 
 
 if __name__ == "__main__":
