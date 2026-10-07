@@ -19,7 +19,7 @@
     «All-chain support» (больше EVM-сетей и не только); Launch radar — в конец LATER;
   - герой: обе сети — бейдж «memecoin holder scanner · Robinhood and Solana», заголовок «for Robinhood and
     Solana memecoins», подпись под полем «… · Robinhood and Solana»; Solana — цветом Solana (#9945FF);
-  - токен проекта: PONS -> страница токена, секция «the token» (чарт, live rewards, Trade $CrawlScan, тексты наград
+  - токен проекта: PONS -> страница токена, секция «the token» (чарт, Trade $CrawlScan, тексты наград
     и сжиганий — «tracked live on this site» ведёт на #rewards, когда секция наград показана; CA с copy)
     между «crawlers at work» и «how it works», строка CA с copy в герое;
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
@@ -348,10 +348,6 @@ else:
              f'<a href="{PONS_URL}" target="_blank" rel="noopener" style="{MONO};font-size:13px;color:#04140a;background:#00c805;'
              f'padding:10px 18px;border-radius:8px" style-hover="background:#19dd1f">open on Pons ↗</a></div>')
 
-badge_live = ('<span style="display:inline-flex;align-items:center;gap:6px;' + MONO + ';font-size:10.5px;padding:3px 8px;'
-              'border-radius:999px;color:#00c805;border:1px solid rgba(0,200,5,0.45);background:rgba(0,200,5,0.08)">'
-              '<span style="width:5px;height:5px;border-radius:50%;background:#00c805;box-shadow:0 0 6px #00c805"></span>live rewards</span>')
-
 # «Trade $CrawlScan ↗» справа от заголовка карточки — в стиле «Trade on Axiom» на странице результата;
 # на телефоне — под заголовком на всю ширину (.cs-tok-head / .cs-tok-trade в @media ниже)
 TOKEN_TRADE_URL = "https://axiom.trade/t/0x19dcb63c4d2f29a6f077f094a4f858fc790145e1/@crawlscan?chain=robinhood"
@@ -368,12 +364,11 @@ tracked = ('<sc-if value="{{rwOn}}" hint-placeholder-val="{{false}}"><a href="#r
 TOKEN_P = 'style="margin:0;font-size:15px;line-height:1.6;color:#8a959c"'
 token_text = "\n".join(f"              <p {TOKEN_P}>{x}</p>" for x in (
     f"Holders of ${TOKEN_TICKER} get rewarded every day. An automatic draw picks one holder, who receives 10% of the "
-    f"day's creator fees in ${TOKEN_TICKER}. Every token is a ticket, and your chance is your average balance over the day.",
-    "Twice a day the dev burns tokens from his own supply, so the supply keeps shrinking and each token left is "
-    "a bigger share of a smaller supply.",
+    f"day's creator fees in ${TOKEN_TICKER}.",
+    "Twice a day the dev burns tokens from his own supply, so the supply keeps shrinking and each token becomes "
+    "more valuable.",
     f"Every draw, payout and burn is {tracked} and verifiable onchain.",
-    "Next for holders: premium features and priority crawling, coming soon. "
-    "The scanner stays free and read-only for everyone."))
+    "Next for holders: premium features and priority crawling."))
 
 links = ext_link(PONS_URL, "Pons") + (ext_link(DEX_URL, "Dexscreener") if DEX_URL else "")
 TOKEN_SECTION = f'''      <section id="token" style="max-width:1280px;margin:0 auto;padding:40px 32px 120px;box-sizing:border-box">
@@ -383,8 +378,7 @@ TOKEN_SECTION = f'''      <section id="token" style="max-width:1280px;margin:0 a
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:24px;align-items:stretch">
           {chart}
-          <div data-grip="1" style="flex:1 1 320px;min-width:0;display:flex;flex-direction:column;gap:18px;padding:28px 26px;border:1px solid #141b20;border-radius:14px;background:linear-gradient(180deg,#0c1114,#090c0f);box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);box-sizing:border-box">
-            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;{MONO};font-size:13px"><span style="color:#00c805">${TOKEN_TICKER}</span>{badge_live}</div>
+          <div data-grip="1" style="flex:1 1 320px;min-width:0;display:flex;flex-direction:column;gap:14px;padding:28px 26px;border:1px solid #141b20;border-radius:14px;background:linear-gradient(180deg,#0c1114,#090c0f);box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);box-sizing:border-box">
             <div class="cs-tok-head" style="display:flex;align-items:center;justify-content:space-between;gap:16px">
               <h3 style="margin:0;min-width:0;font-size:28px;font-weight:500;letter-spacing:-0.02em;color:#eef1f3">CRAWLSCAN has a token</h3>
               {token_trade}
