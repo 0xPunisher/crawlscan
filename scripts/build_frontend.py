@@ -1063,6 +1063,7 @@ rep("@media (max-width:640px){\n",
 # чарт цены и «probably rug» на странице результата: блок между фактами и таблицей холдеров.
 # Свечи — GET /api/chart?token= отдельным запросом после вердикта (handleResult), пока грузится — skeleton.
 # SVG собирается строкой (chartHtml) в div с ref и перерисовывается при смене ширины.
+# stale_at (GT не ответил, отдан последний удачный чарт) — подпись «chart as of HH:MM UTC» в шапке блока.
 # rug из результата: красная пунктирная стрелка от now до now × level_factor, подпись и причины (parts).
 # ---------------------------------------------------------------------------
 CHART_JS = r"""// ---- price chart + probably rug (GET /api/chart after the verdict) ----
@@ -1093,7 +1094,7 @@ function rugReasons(rug){
 }
 function chartHtml(st,rug,hdrPrice,W){
   const mob=W<640, H=mob?230:300, sw=W-24;
-  const head=tf=>`<div style="display:flex;justify-content:space-between;gap:12px;padding:14px 20px 0;font-family:${MONO_F};font-size:11px;color:#5f6b72"><span>price${tf?' · '+escH(tf):''}</span><span>GeckoTerminal</span></div>`;
+  const head=(tf,stale)=>`<div style="display:flex;justify-content:space-between;gap:12px;padding:14px 20px 0;font-family:${MONO_F};font-size:11px;color:#5f6b72"><span>price${tf?' · '+escH(tf):''}</span><span>${stale>0?`<span data-chart-stale="1" style="color:#8a959c">chart as of ${new Date(stale*1000).toISOString().slice(11,16)} UTC</span> · `:''}GeckoTerminal</span></div>`;
   if(!st||st.status==='loading') return head('')+`<div style="padding:14px 20px 20px"><div class="cs-skel" data-chart-loading="1" style="height:${H-40}px;border-radius:8px"></div></div>`;
   const d=st.data||{}, cs=(d.candles||[]).filter(c=>c&&c.length>=5&&c[4]>0);
   const now=d.price_usd>0?d.price_usd:cs.length?cs[cs.length-1][4]:(hdrPrice>0?hdrPrice:null);
@@ -1153,7 +1154,7 @@ function chartHtml(st,rug,hdrPrice,W){
   const below=!few&&!rug&&rec.filter(v=>v<yn-3).length>rec.filter(v=>v>yn+3).length&&yn+20<=pt+ph-4;
   g+=rug?`<text x="${(xEnd+10).toFixed(1)}" y="${(yn-8).toFixed(1)}" fill="#00c805" font-size="10.5">now</text>`   // справа над стрелкой — свободно
        :`<text x="${(xEnd-6).toFixed(1)}" y="${(below?yn+20:yn-12).toFixed(1)}" fill="#00c805" font-size="10.5" text-anchor="end">now</text>`;
-  return head(d.timeframe)+`<div style="padding:8px 12px 10px"><svg data-chart="1" width="${sw}" height="${H}" viewBox="0 0 ${sw} ${H}" style="display:block;max-width:100%" font-family="${MONO_F}" role="img" aria-label="price chart${rug?', probably rug −'+dropPct(rug)+'%':''}">${g}</svg></div>`+rugReasons(rug);
+  return head(d.timeframe,d.stale_at)+`<div style="padding:8px 12px 10px"><svg data-chart="1" width="${sw}" height="${H}" viewBox="0 0 ${sw} ${H}" style="display:block;max-width:100%" font-family="${MONO_F}" role="img" aria-label="price chart${rug?', probably rug −'+dropPct(rug)+'%':''}">${g}</svg></div>`+rugReasons(rug);
 }
 
 """

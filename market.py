@@ -5,12 +5,19 @@
 Чарт (fetch_chart) в скан не входит: его отдаёт отдельный /api/chart.
 Удачные ответы GT кэшируются по пути запроса на GT_CACHE_TTL (общий кэш для проверки перед сканом,
 шапки и чарта); вердикт «too established» — на ESTABLISHED_TTL (established_get / established_put).
-Каждый сбой GT пишется в лог одной строкой: путь, исход попыток (http-код / timeout), время."""
-import json, socket, threading, time, urllib.request, urllib.error
+Каждый сбой GT пишется в лог одной строкой: путь, исход попыток (http-код / timeout), время.
+Запасной источник рынка — DexScreener (публичный API, без ключа): если GT не ответил (429, ошибка, таймаут),
+fetch_market берёт цену, ликвидность, капу, возраст и объём оттуда (поле source: "gt" | "dexscreener").
+Свечей у DexScreener нет — чарт только из GT. GT_FORCE_FAIL=1 — каждый запрос к GT ведёт себя как 429."""
+import json, os, socket, threading, time, urllib.request, urllib.error
 from datetime import datetime
 
 GT = "https://api.geckoterminal.com/api/v2/networks"
 GT_BUDGET = 3.0   # секунд на шапку целиком (все попытки): дольше скан не ждёт
+GT_FIRST = 1.5    # секунд на GT в fetch_market до перехода на DexScreener (успевает 2 попытки на 429)
+DS = "https://api.dexscreener.com/tokens/v1"
+DS_BUDGET = 3.0   # секунд на DexScreener (все попытки)
+DS_CHAIN = {"robinhood": "robinhood", "solana": "solana"}  # сеть GT -> chainId DexScreener
 CHART_BUDGET = 4.0  # секунд на чарт целиком (пулы + свечи + история кривой)
 CHART_LIMIT = 1000  # свечей за запрос (максимум GT)
 CURVE_DEX = "pump-fun"  # пул бондинг-кривой pump.fun: после миграции его свечи — начало истории
@@ -58,20 +65,45 @@ def _why(e):
     return type(e).__name__
 
 
+def gt_force_fail():
+    """GT_FORCE_FAIL=1: все запросы к GT ведут себя как 429 (проверка запасного пути на staging)."""
+    return os.environ.get("GT_FORCE_FAIL", "").strip() == "1"
+
+
+def _get(url, timeout):
+    req = urllib.request.Request(url, headers={"accept": "application/json", "user-agent": "rh-crawler/0.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _cache_put(key, data):
+    with _lock:
+        _CACHE[key] = (time.time(), data)
+        if len(_CACHE) > GT_CACHE_MAX:
+            for k, _ in sorted(_CACHE.items(), key=lambda kv: kv[1][0])[:len(_CACHE) - GT_CACHE_MAX]:
+                del _CACHE[k]
+
+
+def _cache_get(key):
+    with _lock:
+        hit = _CACHE.get(key)
+    return hit[1] if hit and time.time() - hit[0] < GT_CACHE_TTL else None
+
+
 def _gt(path, budget=GT_BUDGET):
     """GET к GeckoTerminal. На все попытки (включая паузы после 429) не больше budget секунд:
     шапка не должна задерживать скан. Удачный ответ кэшируется на GT_CACHE_TTL. Неудачные попытки
     пишутся в лог одной строкой (и при итоговом сбое, и при успехе после повторов)."""
-    with _lock:
-        hit = _CACHE.get(path)
-    if hit and time.time() - hit[0] < GT_CACHE_TTL:
-        return hit[1]
+    forced = gt_force_fail()
+    if not forced and (hit := _cache_get(path)) is not None:
+        return hit
     t0 = time.time()
     end = t0 + budget
     last, fails = None, []
 
     def log(outcome):
-        print(f"gt: {outcome} {path} [{', '.join(fails)}] {time.time() - t0:.1f}s", flush=True)
+        print(f"gt: {outcome} {path} [{', '.join(fails)}] {time.time() - t0:.1f}s"
+              + (" (GT_FORCE_FAIL)" if forced else ""), flush=True)
 
     while True:
         left = end - time.time()
@@ -79,17 +111,13 @@ def _gt(path, budget=GT_BUDGET):
             fails.append("no time left")
             log("fail")
             raise last or TimeoutError("geckoterminal: no time left")
-        req = urllib.request.Request(GT + path, headers={"accept": "application/json", "user-agent": "rh-crawler/0.1"})
         try:
-            with urllib.request.urlopen(req, timeout=left) as r:
-                data = json.loads(r.read())
+            if forced:
+                raise urllib.error.HTTPError(GT + path, 429, "GT_FORCE_FAIL", {}, None)
+            data = _get(GT + path, left)
             if fails:
                 log("ok after")
-            with _lock:
-                _CACHE[path] = (time.time(), data)
-                if len(_CACHE) > GT_CACHE_MAX:
-                    for k, _ in sorted(_CACHE.items(), key=lambda kv: kv[1][0])[:len(_CACHE) - GT_CACHE_MAX]:
-                        del _CACHE[k]
+            _cache_put(path, data)
             return data
         except urllib.error.HTTPError as e:
             last = e
@@ -105,17 +133,44 @@ def _gt(path, budget=GT_BUDGET):
 
 
 def fetch_market(token, network="robinhood", now=None, budget=GT_BUDGET):
-    """{"name", "ticker", "price_usd", "mcap_usd", "fdv_usd", "liquidity_usd", "vol24h_usd", "age_days"}
-    или {} при ошибке. Один запрос /tokens/{token}?include=top_pools.
-    mcap — market_cap_usd, если GT его знает, иначе fdv; liquidity — сумма пулов (total_reserve_in_usd);
-    age_days — от создания самого раннего из топ-пулов (None, если GT не дал дат).
+    """{"name", "ticker", "price_usd", "mcap_usd", "fdv_usd", "liquidity_usd", "vol24h_usd", "age_days", "source"}
+    или {} при ошибке. Сначала GT (один запрос /tokens/{token}?include=top_pools, до GT_FIRST секунд),
+    не ответил (429, ошибка, таймаут) — DexScreener (_ds_market); нет и его — GT ещё раз на остаток бюджета.
+    mcap — market cap, иначе fdv; liquidity — сумма пулов; age_days — от самого раннего пула (None без дат).
+    source — "gt" | "dexscreener". Удачный итог кэшируется по токену на GT_CACHE_TTL (общий для обоих источников).
     network — сеть GT: "robinhood" | "solana" (адреса Solana регистрозависимы, их не приводим к нижнему регистру).
     budget — секунд на все попытки (движок ждёт ответ в фоне дольше, чем шапку)."""
     tok = token.lower() if network == "robinhood" else token
+    key = ("market", network, tok)
+    hit = _cache_get(key)
+    if hit is not None and not (hit["source"] == "gt" and gt_force_fail()):
+        return dict(hit)
+    end = time.time() + budget
+    path = f"/{network}/tokens/{tok}?include=top_pools"
+    out, why = {}, None
     try:
-        d = _gt(f"/{network}/tokens/{tok}?include=top_pools", budget=budget)
-    except Exception:
-        return {}
+        out = _gt_market(_gt(path, budget=min(budget, GT_FIRST)), now)
+        print(f"market: {tok} gt", flush=True)
+    except Exception as e:
+        why = _why(e)
+    if not out and DS_CHAIN.get(network):
+        try:
+            out = _ds_market(tok, network, now, min(DS_BUDGET, end - time.time()))
+            print(f"market: {tok} gt {why} -> dexscreener", flush=True)
+        except Exception as e:
+            print(f"market: {tok} gt {why} -> dexscreener failed ({_why(e)})", flush=True)
+    if not out and end - time.time() > 0.5:   # оба не ответили — GT ещё раз на остаток (прежнее поведение)
+        try:
+            out = _gt_market(_gt(path, budget=end - time.time()), now)
+            print(f"market: {tok} gt ok on retry", flush=True)
+        except Exception as e:
+            print(f"market: {tok} no market data (gt {_why(e)})", flush=True)
+    if out:
+        _cache_put(key, dict(out))
+    return out
+
+
+def _gt_market(d, now=None):
     a = (d.get("data") or {}).get("attributes") or {}
     f = lambda v: float(v) if v not in (None, "") else None
     born = [_ts((p.get("attributes") or {}).get("pool_created_at")) for p in d.get("included") or []
@@ -125,7 +180,55 @@ def fetch_market(token, network="robinhood", now=None, budget=GT_BUDGET):
             "mcap_usd": f(a.get("market_cap_usd")) or f(a.get("fdv_usd")), "fdv_usd": f(a.get("fdv_usd")),
             "liquidity_usd": f(a.get("total_reserve_in_usd")),
             "vol24h_usd": f((a.get("volume_usd") or {}).get("h24")),
-            "age_days": round(((now or time.time()) - min(born)) / 86400, 1) if born else None}
+            "age_days": round(((now or time.time()) - min(born)) / 86400, 1) if born else None, "source": "gt"}
+
+
+def _ds(url, budget):
+    """GET к DexScreener: повтор на 429 и сетевые ошибки в пределах budget секунд, паузы 0.5 → 1 с."""
+    end, last, n = time.time() + budget, None, 0
+    while True:
+        left = end - time.time()
+        if left <= 0.2:
+            raise last or TimeoutError("dexscreener: no time left")
+        try:
+            return _get(url, left)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code != 429:
+                raise
+        except Exception as e:
+            last = e
+        n += 1
+        time.sleep(min(0.5 * n, max(0.0, end - time.time() - 0.2)))
+
+
+def _ds_market(tok, network, now=None, budget=DS_BUDGET):
+    """Рынок токена по DexScreener /tokens/v1/{chain}/{token} (до 30 пар): та же форма, что у GT.
+    liquidity и объём 24h — сумма по всем парам; цена и капа (marketCap, иначе fdv) — из самой ликвидной пары,
+    где токен — base (цена пары — цена base); возраст — от самой ранней pairCreatedAt. Нет пар — LookupError."""
+    chain = DS_CHAIN[network]
+    pairs = [p for p in _ds(f"{DS}/{chain}/{tok}", budget) or [] if p.get("chainId") == chain]
+    if not pairs:
+        raise LookupError("no pairs")
+    same = (lambda x: (x or "").lower() == tok.lower()) if network == "robinhood" else (lambda x: x == tok)
+    f = lambda v: float(v) if v not in (None, "") else None
+    liq = lambda p: f((p.get("liquidity") or {}).get("usd")) or 0.0
+    base = [p for p in pairs if same((p.get("baseToken") or {}).get("address"))]
+    best = max(base, key=liq) if base else None
+    me = (best or pairs[0]).get("baseToken" if best else "quoteToken") or {}
+    if not best and not same(me.get("address")):
+        me = {}
+    born = [p["pairCreatedAt"] / 1000 for p in pairs if isinstance(p.get("pairCreatedAt"), (int, float))]
+    vols = [f((p.get("volume") or {}).get("h24")) for p in pairs]
+    txt = lambda v: (v or "").strip() or None
+    return {"name": txt(me.get("name")), "ticker": txt(me.get("symbol")),
+            "price_usd": f(best.get("priceUsd")) if best else None,
+            "mcap_usd": (f(best.get("marketCap")) or f(best.get("fdv"))) if best else None,
+            "fdv_usd": f(best.get("fdv")) if best else None,
+            "liquidity_usd": sum(liq(p) for p in pairs) or None,
+            "vol24h_usd": sum(v for v in vols if v) if any(v is not None for v in vols) else None,
+            "age_days": round(((now or time.time()) - min(born)) / 86400, 1) if born else None,
+            "source": "dexscreener"}
 
 
 def _ts(iso):

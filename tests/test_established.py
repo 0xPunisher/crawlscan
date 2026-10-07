@@ -315,6 +315,163 @@ class TestLateAndLimited(unittest.TestCase):
         self.assertEqual(lim["band"], "RISKY")
 
 
+def ds_response(age_days=550.0, liq=7.6e6, mcap=168e6, token=fakes.TOKEN, chain="robinhood"):
+    """Ответ DexScreener /tokens/v1/{chain}/{token}: пары токена (base), пара, где он quote, и чужая сеть."""
+    born = int((time.time() - age_days * 86400) * 1000)
+    pair = lambda liq_, created, base=True, chain_=chain: {
+        "chainId": chain_, "dexId": "x", "pairAddress": f"p{created}",
+        "baseToken": {"address": token if base else "other", "name": "Zerebro", "symbol": "ZEREBRO"},
+        "quoteToken": {"address": "other" if base else token, "name": "Zerebro", "symbol": "ZEREBRO"},
+        "priceUsd": "0.02" if base else "150", "liquidity": {"usd": liq_}, "marketCap": mcap, "fdv": mcap * 1.1,
+        "pairCreatedAt": created, "volume": {"h24": 1000.0}}
+    return [pair(liq * 0.6, born + 86400_000), pair(liq * 0.3, born), pair(liq * 0.1, born + 5, base=False),
+            pair(1e12, born - 10 ** 12, chain_="ethereum")]
+
+
+class Net:
+    """Подставной urlopen: GT и DexScreener по префиксу URL; значение — тело ответа, исключение или код HTTP."""
+
+    def __init__(self, gt=429, ds=None):
+        self.routes, self.calls = {market.GT: gt, market.DS: ds}, []
+
+    def __call__(self, req, timeout):
+        self.calls.append(req.full_url)
+        for prefix, resp in self.routes.items():
+            if req.full_url.startswith(prefix):
+                break
+        else:
+            raise AssertionError(req.full_url)
+        if isinstance(resp, int):
+            raise market.urllib.error.HTTPError(req.full_url, resp, "x", {}, None)
+        if isinstance(resp, Exception):
+            raise resp
+        body = __import__("json").dumps(resp).encode()
+
+        class R:
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+            def read(s): return body
+        return R()
+
+    def n(self, prefix):
+        return len([c for c in self.calls if c.startswith(prefix)])
+
+
+class TestDexScreenerFallback(unittest.TestCase):
+    """GT не отвечает (429 / ошибка / GT_FORCE_FAIL) — рынок с DexScreener. Без сети."""
+
+    def setUp(self):
+        market.clear_cache()
+        st = ExitStack()
+        self.addCleanup(st.close)
+        self.addCleanup(market.clear_cache)
+        st.enter_context(mock.patch.object(market, "GT_FIRST", 0.3))   # быстрее переходим на DexScreener
+        st.enter_context(mock.patch.object(market, "DS_BUDGET", 0.4))
+        self.print = st.enter_context(mock.patch("builtins.print"))
+
+    def logs(self):
+        return " ".join(str(a) for c in self.print.call_args_list for a in c.args)
+
+    def scan(self, net, age_days=1 / 24, env=None, gated=False):
+        ts0 = time.time() - age_days * 86400
+        with ExitStack() as st:
+            st.enter_context(fakes.patched())
+            st.enter_context(mock.patch.object(market, "fetch_market", REAL_FETCH))
+            st.enter_context(mock.patch.object(market.urllib.request, "urlopen", side_effect=net))
+            st.enter_context(mock.patch.object(engine, "MARKET_LATE", 1.5))
+            st.enter_context(mock.patch.dict(os.environ, env or {}))
+            st.enter_context(mock.patch.object(ch, "block_timestamps", side_effect=lambda bl: {
+                b: int(ts0) + (b - fakes.LAUNCH_BLOCK) for b in bl}))
+            if gated:
+                facts, classify = TestLateAndLimited.gated(self)
+                st.enter_context(mock.patch.object(ch, "classify_entries", side_effect=classify))
+                st.enter_context(mock.patch.object(ch, "token_facts", side_effect=facts, create=True))
+            res = engine.scan(fakes.TOKEN)
+            return res, ch.get_launch.called
+
+    def test_gt_429_dexscreener_too_established(self):
+        net = Net(gt=429, ds=ds_response())
+        res, launched = self.scan(net, age_days=550)
+        self.assertFalse(launched)                                    # вердикт до первого RPC
+        self.assertEqual((res["band"], res["market_source"], res["rpc_requests"]), ("TOO_ESTABLISHED", "dexscreener", 0))
+        self.assertEqual(res["established"]["liquidity_usd"], 7.6e6)  # сумма пар токена, чужая сеть не входит
+        self.assertEqual(res["established"]["mcap_usd"], 168e6)       # marketCap самой ликвидной base-пары
+        self.assertAlmostEqual(res["established"]["age_days"], 550.0, places=0)  # по самой ранней паре
+        self.assertEqual((res["header"]["ticker"], res["header"]["price_usd"], res["header"]["vol24h_usd"]),
+                         ("ZEREBRO", 0.02, 3000.0))
+        self.assertIn("gt http 429 -> dexscreener", self.logs())
+        self.assertEqual(market.established_get(fakes.TOKEN)["source"], "dexscreener")   # вердикт в кэше на сутки
+
+    def test_gt_429_dexscreener_down_limited(self):
+        for ds in (503, OSError("down"), []):                        # DexScreener: ошибка, сеть, токена не знает
+            market.clear_cache()
+            net = Net(gt=429, ds=ds)
+            res, launched = self.scan(net, age_days=400, gated=True)
+            self.assertTrue(launched, ds)
+            self.assertTrue(res["limited"], ds)                       # прежняя подстраховка
+            self.assertIsNone(res["market_source"])
+            self.assertIsNone(res["rug"])
+            self.assertIn(res["band"], ("CLEAN", "OK", "RISKY"))
+            self.assertGreater(net.n(market.GT), 1)                    # GT ещё раз на остаток бюджета
+        self.assertIn("-> dexscreener failed", self.logs())
+
+    def test_young_token_via_dexscreener_scans(self):
+        net = Net(gt=OSError("gt down"), ds=ds_response(age_days=0.5, liq=40_000.0, mcap=200_000.0))
+        res, launched = self.scan(net, age_days=0.5)
+        self.assertTrue(launched)
+        self.assertIn(res["band"], ("CLEAN", "OK", "RISKY", "DANGER"))
+        self.assertEqual(res["market_source"], "dexscreener")
+        self.assertFalse(res["limited"])
+        self.assertEqual(res["header"]["liquidity_usd"], 40_000.0)    # шапка и правила — по DexScreener
+        self.assertIn("gt OSError -> dexscreener", self.logs())
+
+    def test_gt_ok_no_dexscreener(self):
+        net = Net(gt=gt_response(), ds=AssertionError("DexScreener не нужен"))
+        res, _ = self.scan(net)
+        self.assertEqual((res["band"], res["market_source"]), ("TOO_ESTABLISHED", "gt"))
+        self.assertEqual(net.n(market.DS), 0)
+
+    def test_force_fail(self):
+        net = Net(gt=gt_response(), ds=ds_response())
+        with mock.patch.object(market.urllib.request, "urlopen", side_effect=net):
+            self.assertEqual(market.fetch_market(fakes.TOKEN)["source"], "gt")      # по умолчанию выключено
+            with mock.patch.dict(os.environ, {"GT_FORCE_FAIL": "1"}):
+                m = market.fetch_market(fakes.TOKEN)                              # кэш GT не мешает
+                self.assertRaises(market.urllib.error.HTTPError, market._gt, "/robinhood/x", 0.3)
+        self.assertEqual(m["source"], "dexscreener")
+        self.assertEqual(net.n(market.GT), 1)                          # при GT_FORCE_FAIL в GT не ходили
+        self.assertIn("http 429", self.logs())
+        self.assertIn("(GT_FORCE_FAIL)", self.logs())
+        res, launched = self.scan(Net(gt=gt_response(), ds=ds_response()), age_days=550, env={"GT_FORCE_FAIL": "1"})
+        self.assertEqual((res["band"], res["market_source"]), ("TOO_ESTABLISHED", "dexscreener"))
+
+    def test_market_cache_shared(self):
+        net = Net(gt=429, ds=ds_response())
+        with mock.patch.object(market.urllib.request, "urlopen", side_effect=net):
+            a = market.fetch_market(fakes.TOKEN)
+            n = len(net.calls)
+            b = market.fetch_market(fakes.TOKEN)
+        self.assertEqual(a, b)
+        self.assertEqual(len(net.calls), n)                            # повтор — из кэша, ни GT, ни DexScreener
+
+    def test_parse_dexscreener(self):
+        sol = ts.SOL_TOKEN
+        with mock.patch.object(market, "_ds", return_value=ds_response(token=sol, chain="solana")) as ds:
+            m = market._ds_market(sol, "solana")
+        self.assertEqual(ds.call_args.args[0], f"{market.DS}/solana/{sol}")
+        self.assertEqual((m["price_usd"], m["mcap_usd"], m["liquidity_usd"]), (0.02, 168e6, 7.6e6))
+        quote_only = [p for p in ds_response() if p["quoteToken"]["address"] == fakes.TOKEN]
+        quote_only[0] = quote_only[0] | {"marketCap": None}
+        with mock.patch.object(market, "_ds", return_value=quote_only):
+            m = market._ds_market(fakes.TOKEN, "robinhood")
+        self.assertEqual((m["price_usd"], m["mcap_usd"], m["ticker"]), (None, None, "ZEREBRO"))  # цена пары — не наша
+        no_mcap = [p | {"marketCap": None} for p in ds_response()]
+        with mock.patch.object(market, "_ds", return_value=no_mcap):
+            self.assertAlmostEqual(market._ds_market(fakes.TOKEN, "robinhood")["mcap_usd"], 168e6 * 1.1)  # иначе FDV
+        with mock.patch.object(market, "_ds", return_value=[]):
+            self.assertRaises(LookupError, market._ds_market, fakes.TOKEN, "robinhood")
+
+
 class TestReserveOk(unittest.TestCase):
 
     def test_score_without_reserve(self):
