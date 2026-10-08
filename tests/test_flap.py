@@ -352,6 +352,21 @@ class TestDex(unittest.TestCase):
         sig = {h["wallet"]: h["signals"] for h in r["holders"]}
         self.assertEqual(sig[W[5]]["eth_in"], E18 // 10)   # получено amt × (1 − 3%): в допуске
 
+    def test_sell_via_relay_routers_counts_as_sold(self):
+        # роутеры, замеченные на RELAY: продажа через них (кошелёк -> роутер) — продажа, роутер — не холдер
+        routers = ("0xca980f000771f70b15647069e9e541ef73f71f2f", "0xb477751b76cf82d00a686a1232f5fcd772414af3")
+        self.c = Chain(status=flap.STATUS_DEX, buy_tax=300, sell_tax=300, circ=flap.SUPPLY)
+        for w, rt in zip((W[3], W[4]), routers):
+            self.assertIn(rt, flap.ROUTERS)
+            self.c.tr(w, rt, 1_000_000 * E18, f"0xsell{rt[2:6]}")
+        with self.c.patched():
+            r = engine.scan(FTOKEN)
+        sig = {h["wallet"]: h["signals"] for h in r["holders"]}
+        self.assertTrue(sig[W[3]]["sold"])
+        self.assertTrue(sig[W[4]]["sold"])
+        self.assertFalse({h["wallet"] for h in r["holders"]} & set(routers))
+        self.assertEqual({W[3], W[4]} & d.sellers(self.c.trs, flap.ROUTERS), {W[3], W[4]})
+
 
 WHALE = fakes.wallet(220)
 X_DIST = fakes.wallet(200)                 # не холдер: раздал токены двум холдерам в середине истории
