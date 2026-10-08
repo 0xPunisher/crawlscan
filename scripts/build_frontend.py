@@ -120,6 +120,7 @@ const CHAIN_NAME={robinhood:'Robinhood',solana:'Solana'};
 const SAMPLES=__SAMPLES__;
 const PLACEHOLDER={robinhood:'0x… token contract address',solana:'token mint address (base58)'};
 const SOON='Solana support is coming soon';
+const BUSY_TEXT='Scanner is busy, try again in a few seconds';   // = server.BUSY.message
 const EXPLORER={solana:{account:a=>'https://solscan.io/account/'+a,token:a=>'https://solscan.io/token/'+a}};   // Robinhood: ссылок нет
 const FULL={};   // короткий адрес -> полный (ссылки на эксплорер)
 const shortAddr=a=>{const c=chainOf(a); if(!c) return a; const s=a.slice(0,c==='robinhood'?6:4)+'…'+a.slice(-4); FULL[s]=a; return s;};
@@ -234,6 +235,8 @@ rep('''  // Fake player. To go live: replace with e.g. new EventSource('/crawl?c
         const d=await r.json().catch(()=>({}));
         if(!alive()) return;
         if(!r.ok&&d.error===SOON){this.soon(ca); return;}   // Solana выключена: сообщение под полем, не поломка
+        // перегрузка (503 busy) или шлюз не дождался сервера (502/504) — «занято, повторите», а не поломка
+        if(!r.ok&&(d.error==='busy'||[502,503,504].includes(r.status))){fail(d.message||BUSY_TEXT); step(); return;}
         if(!r.ok||!d.job){fail(d.error||('http '+r.status)); step(); return;}
         feed.job=d.job; poll(); step();
       }catch(err){fail('server unreachable'); step();}

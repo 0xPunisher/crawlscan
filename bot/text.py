@@ -120,6 +120,7 @@ HINT = "Send me a token address from Robinhood Chain (0x…) or Solana. /help ex
 SCAN_USAGE = "Usage: /scan &lt;token address&gt;"
 BUSY = "🕷 Too many scans right now, try again in a minute."
 TIMEOUT = "⌛ The scan took too long. Try again in a minute."
+SITE_BUSY = "🕷 Scanner is busy, try again in a few seconds."   # сайт ответил 503 busy (server.BUSY)
 UNREACHABLE = "⚠️ CrawlScan is not reachable right now. Try again in a minute."
 FAILED = "⚠️ The scan failed. Try again in a minute."
 

@@ -50,7 +50,10 @@ Alerts, подписки для бота (только при ALERTS_ENABLED=tru
 При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан;
 изменился важный показатель — уведомление подписчикам в Telegram (alerts_notify.py, свой поток, TG_BOT_TOKEN);
 плановые перепроверки отслеживаемых токенов — alerts_recheck.py (свой поток, уступает живым сканам).
-Не больше 3 сканов одновременно (остальные ждут слота). PORT из env, по умолчанию 8000.
+Не больше 3 сканов одновременно (остальные ждут слота), в очереди — не больше SCAN_QUEUE_MAX; сверх очереди или
+при памяти процесса выше MEMORY_SOFT_LIMIT_MB (memguard.py) новый скан — 503 busy с Retry-After (кэш и уже идущий
+скан того же токена отдаются как раньше). Сбой базы в /api/rewards/* и /api/draw/* — 503, процесс и сканы живут.
+PORT из env, по умолчанию 8000.
 """
 import hashlib, hmac, json, os, re, threading, time, uuid
 from datetime import datetime, timezone
@@ -66,6 +69,7 @@ from chains import flap, priority
 import early
 import engine
 import market
+import memguard
 import trade
 import draw_service as ds
 import rewards_service as rs
@@ -113,11 +117,28 @@ def _env_int(name, default):
 
 MAX_CONCURRENT = _env_int("MAX_CONCURRENT", MAX_CONCURRENT)
 _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
+SCAN_QUEUE_MAX = 6         # новых сканов ждут слота сверх MAX_CONCURRENT (env SCAN_QUEUE_MAX); дальше — 503 busy
+SCAN_QUEUE_MAX = _env_int("SCAN_QUEUE_MAX", SCAN_QUEUE_MAX)
+_ACTIVE = [0]              # сканов идёт или ждёт слота (под _lock)
+RETRY_AFTER = 5            # секунд: заголовок Retry-After у 503 busy
+BUSY = {"error": "busy", "message": "Scanner is busy, try again in a few seconds"}
+
+for _a in engine.CHAINS.values():       # выше порога памяти memguard сбрасывает историю сканов и кэш переводов
+    if hasattr(_a, "drop_caches"):
+        memguard.on_relieve(_a.drop_caches)
+
+
+class Busy(Exception):
+    """Новый скан не принят: очередь полна или память выше MEMORY_SOFT_LIMIT_MB."""
 
 
 def _run(job_id, token):
-    with priority.live():   # живой скан: фоновые перепроверки alerts ждут и не стартуют
-        _run_job(job_id, token)
+    try:
+        with priority.live():   # живой скан: фоновые перепроверки alerts ждут и не стартуют
+            _run_job(job_id, token)
+    finally:
+        with _lock:
+            _ACTIVE[0] -= 1
 
 
 def _run_job(job_id, token):
@@ -150,8 +171,18 @@ def _run_job(job_id, token):
         record_snapshot(res)
 
 
+def _reuse(token, now):
+    """job_id свежего кэша или идущего скана токена, иначе None (под _lock)."""
+    jid = BY_TOKEN.get(token)
+    job = JOBS.get(jid)
+    if job and (not job["done"] or (job["result"] and now - job["ts"] < CACHE_TTL)):
+        return jid
+    return None
+
+
 def start_scan(token):
-    """job_id: свежий кэш по токену или уже идущий скан того же токена, иначе новый."""
+    """job_id: свежий кэш по токену или уже идущий скан того же токена, иначе новый.
+    Новый — только если в очереди есть место и память ниже порога, иначе Busy."""
     chain, token = engine.chain_of(token)
     now = time.time()
     with _lock:
@@ -159,15 +190,35 @@ def start_scan(token):
             if BY_TOKEN.get(JOBS[jid]["token"]) == jid:
                 del BY_TOKEN[JOBS[jid]["token"]]
             del JOBS[jid]
-        jid = BY_TOKEN.get(token)
-        job = JOBS.get(jid)
-        if job and (not job["done"] or (job["result"] and now - job["ts"] < CACHE_TTL)):
+        jid = _reuse(token, now)
+        if jid:
             return jid
+        active = _ACTIVE[0]
+    if active >= MAX_CONCURRENT + SCAN_QUEUE_MAX:
+        print(f"scan: busy, {active} scans running or queued", flush=True)
+        raise Busy("queue")
+    if memguard.over(live=active):   # вне _lock: сброс кэшей и gc не держат остальные запросы
+        raise Busy("memory")
+    with _lock:
+        jid = _reuse(token, now)
+        if jid:
+            return jid
+        if _ACTIVE[0] >= MAX_CONCURRENT + SCAN_QUEUE_MAX:
+            raise Busy("queue")
+        _ACTIVE[0] += 1
         jid = uuid.uuid4().hex[:12]
         JOBS[jid] = {"token": token, "chain": chain, "events": [], "done": False, "result": None, "error": None,
                      "ts": now}
         BY_TOKEN[token] = jid
-    threading.Thread(target=_run, args=(jid, token), daemon=True).start()
+    try:
+        threading.Thread(target=_run, args=(jid, token), daemon=True).start()
+    except RuntimeError:   # can't start new thread: как полная очередь
+        with _lock:
+            _ACTIVE[0] -= 1
+            JOBS.pop(jid, None)
+            if BY_TOKEN.get(token) == jid:
+                del BY_TOKEN[token]
+        raise Busy("thread") from None
     return jid
 
 
@@ -440,7 +491,10 @@ def test_snapshot(chain, token):
     prev, cur = alerts_store().get(token)
     if cur:
         return cur, alerts.diff(prev, cur), "snapshot"
-    jid = start_scan(token)
+    try:
+        jid = start_scan(token)
+    except Busy:
+        return None, None, BUSY["message"]
     t0 = time.time()
     while time.time() - t0 < TEST_SCAN_WAIT:
         with _lock:
@@ -526,12 +580,14 @@ def admin_ok(header):
 
 
 class H(BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype="application/json", cache="no-store"):
+    def _send(self, code, body, ctype="application/json", cache="no-store", headers=None):
         b = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("content-type", ctype)
         self.send_header("content-length", str(len(b)))
         self.send_header("cache-control", cache)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(b)
@@ -655,6 +711,14 @@ class H(BaseHTTPRequestHandler):
         body = rs.participants_json(store, day) if what == "participants" else rs.verify_json(store, day)
         return self._send(200, body) if body else self._send(404, {"error": "no draw for this day"})
 
+    def _db_guard(self, path, fn, *args):
+        """/api/draw/*, /api/rewards/*: сбой базы (database is locked и т.п.) — 503, процесс и сканы живут."""
+        try:
+            return fn(*args)
+        except Exception as e:
+            print(f"db: {path} failed: {type(e).__name__}: {e}", flush=True)
+            return self._send(503, {"error": "temporarily unavailable"}, headers={"retry-after": str(RETRY_AFTER)})
+
     def _alerts(self, method, path, q):
         if not alerts.enabled():
             return self._send(404, {"error": "alerts are disabled"})
@@ -681,13 +745,15 @@ class H(BaseHTTPRequestHandler):
             return self._alerts("POST", u.path, parse_qs(u.query))
         m = DRAW_PATH.match(urlparse(self.path).path)
         if m and m.group(2) == "payout":
-            return self._draw_payout(m.group(1))
+            return self._db_guard(u.path, self._draw_payout, m.group(1))
         if urlparse(self.path).path != "/api/scan":
             return self._send(404, {"error": "not found"})
         try:
             n = int(self.headers.get("content-length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
             return self._send(200, {"job": start_scan(body.get("token"))})
+        except Busy:
+            return self._send(503, BUSY, headers={"retry-after": str(RETRY_AFTER)})
         except engine.ScanError as e:
             return self._send(400, {"error": str(e)})
         except (ValueError, AttributeError):
@@ -703,9 +769,9 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/health":
             return self._send(200, {"ok": True})
         if u.path.startswith("/api/draw/"):
-            return self._draw_get(u.path, q)
+            return self._db_guard(u.path, self._draw_get, u.path, q)
         if u.path.startswith("/api/rewards/"):
-            return self._rewards_get(u.path, q)
+            return self._db_guard(u.path, self._rewards_get, u.path, q)
         if u.path.startswith("/api/alerts/"):
             return self._alerts("GET", u.path, q)
         if u.path == "/api/config":  # фронт и бот: какие сети включены (SOLANA_ENABLED), алерты (ALERTS_ENABLED), Trade on Axiom
@@ -805,7 +871,8 @@ def start_alerts_rechecker():
     print(f"alerts: rechecks every {cfg['recheck_min']} min, max {cfg['max_per_hour']}/hour", flush=True)
     return alerts_recheck.Rechecker(
         alerts_store, recheck_scan, record_snapshot, notify_message,
-        rate_limited=lambda: sum(a.RATE_LIMITED[0] for a in engine.CHAINS.values()), cfg=cfg).start()
+        rate_limited=lambda: sum(a.RATE_LIMITED[0] for a in engine.CHAINS.values()), cfg=cfg,
+        memory_high=lambda: memguard.over(live=1)).start()
 
 
 if __name__ == "__main__":

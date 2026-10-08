@@ -11,6 +11,10 @@ class ApiError(Exception):
     """Сбой сети или неожиданный ответ сайта (не показываем пользователю как есть)."""
 
 
+class Busy(ApiError):
+    """Сайт перегружен (503 busy): новый скан не принят, повторить через несколько секунд."""
+
+
 class Rejected(Exception):
     """Сайт отклонил адрес (400): текст для пользователя — "not a token address" и т.п."""
 
@@ -42,6 +46,8 @@ class CrawlScan:
                 payload, err = None, None
             if e.code == 400 and err:
                 raise Rejected(err) from None
+            if e.code == 503 and err == "busy":
+                raise Busy(payload.get("message") or err) from None
             if e.code in ok and isinstance(payload, dict):
                 return {"status": e.code} | payload
             if e.code == 404 and path.startswith("/api/alerts/"):

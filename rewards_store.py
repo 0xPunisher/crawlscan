@@ -8,7 +8,9 @@
 Всё идемпотентно: повторная запись тех же суток или той же транзакции ничего не дублирует.
 Базы нет — розыгрыши пересчитываются из блокчейна детерминированно (rewards_service.compute_day).
 """
-import json, os, sqlite3, threading, time
+import json, os, time
+
+import db
 
 from draw_store import DEFAULT_PATH
 
@@ -39,9 +41,8 @@ class RewardsStore:
     def __init__(self, path=None):
         self.path = path or os.environ.get("DRAW_DB_PATH") or DEFAULT_PATH
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-        self._lock = threading.Lock()
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
+        self._lock = db.lock_for(self.path)   # один замок на файл для всех хранилищ
+        self.db = db.connect(self.path)
         with self._lock, self.db:
             self.db.executescript(SCHEMA)
             # база до выплат в ETH: колонки валюты нет; старые выплаты (NULL) — токеном
