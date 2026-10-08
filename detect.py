@@ -293,7 +293,13 @@ def _impact_phrase(impact, ops):
     return f", could move price −{impact * 100:.0f}% if sold"
 
 
-def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True, limited=False):
+def _sold_into_pool(q, q_factor):
+    """Сколько из q токенов дойдёт до ликвидности: q × q_factor (налог на продажу токенами, Flap после выпуска).
+    q_factor = 1 — q без изменений (тот же int: результат Pons бит в бит прежний)."""
+    return q if q_factor == 1 else q * q_factor
+
+
+def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True, limited=False, q_factor=1):
     """Скор 0–100 (100 = чисто): {"score", "band", "parts", "gates", "metrics", "headline"}.
     reserve — резерв токенов ликвидности (сырые единицы): баланс пула после миграции или кривой до.
     Часть "operator" и её стоп-правило — от dump_impact крупнейшего оператора (q = взвешенная доля
@@ -307,10 +313,11 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     (стая или доказанный оператор из ≥ 3 кошельков → score не выше 59, band не лучше RISKY).
     limited=True — данных рынка нет (GT не ответил), а токен старый (сигналы холдеров ограничены):
     жёсткие правила по impact и transfer не применяются, band не ниже RISKY, к headline добавляется LIMITED_NOTE.
-    Меньше MIN_HOLDERS холдеров (base["holders_total"]) → score None, band TOO_EARLY_OR_LATE."""
+    Меньше MIN_HOLDERS холдеров (base["holders_total"]) → score None, band TOO_EARLY_OR_LATE.
+    q_factor — доля продажи, которая дойдёт до ликвидности (1 − налог на продажу, если налог берётся токенами)."""
     n = len(holders)
     big = ops[0] if ops else {"share": 0.0, "share_supply": 0.0, "weighted": 0.0, "wallets": []}
-    impact = dump_impact(big["weighted"] * base["circulating"], reserve) if reserve_ok else None
+    impact = dump_impact(_sold_into_pool(big["weighted"] * base["circulating"], q_factor), reserve) if reserve_ok else None
     headline = (f"{n} wallets → {len(ops)} operators, biggest holds "
                 f"{big['share'] * 100:.1f}% of float ({big['share_supply'] * 100:.1f}% of supply)"
                 + _impact_phrase(impact, ops) + (LIMITED_NOTE if limited else ""))
@@ -357,7 +364,7 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline}
 
 
-def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, reserve_ok=True):
+def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, reserve_ok=True, q_factor=1):
     """Проекция «probably rug»: куда упадёт цена, если весь подозрительный запас продадут в ликвидность.
     Только при band DANGER (скор и вердикт не меняет); иначе, без запаса или при падении
     < RUG_MIN_DROP — None.
@@ -370,7 +377,8 @@ def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, res
     складываются в share. drop = dump_impact(q, reserve), q — все токены запаса без весов.
     {"drop", "level_factor" (= 1 − drop), "share", "share_supply", "parts": [{"kind", "wallets",
     "share", "share_supply"}], "wallets"}; доли — от оборота, share_supply — от сапплая.
-    reserve_ok=False (резерв не измерен надёжно) — None: падение без ликвидности не считаем."""
+    reserve_ok=False (резерв не измерен надёжно) — None: падение без ликвидности не считаем.
+    q_factor — как в score: до ликвидности доходит q × q_factor."""
     if band != "DANGER" or not reserve_ok:
         return None
     linked = {w for o in ops if len(o["wallets"]) > 1 for w in o["wallets"]}
@@ -392,7 +400,7 @@ def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, res
         q += sum(r[1] for r in rows)
     if not taken:
         return None
-    drop = dump_impact(q, reserve)
+    drop = dump_impact(_sold_into_pool(q, q_factor), reserve)
     if drop < RUG_MIN_DROP:
         return None
     share = sum(p["share"] for p in parts)

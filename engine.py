@@ -7,6 +7,7 @@
 import os, re, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _CFTimeout
 
+from chains import flap
 from chains import priority
 from chains import robinhood as ch
 from chains import solana as sol
@@ -31,6 +32,7 @@ ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 CHAINS = {"robinhood": ch, "solana": sol}
 NATIVE = {"robinhood": ("ETH", 10 ** 18), "solana": ("SOL", 10 ** 9)}   # единица eth_in
 NOT_LAUNCHPAD = {"robinhood": "not a Pons V2 token", "solana": "not a pump.fun token"}
+NOT_LAUNCHPAD_FLAP = "not a Pons V2 or Flap token"   # Robinhood при FLAP_ENABLED
 GT_NETWORK = {"robinhood": "robinhood", "solana": "solana"}
 
 
@@ -201,9 +203,16 @@ def scan(token, emit=lambda e: None):
         return established_result(token, chain, dict(mkt_box), limits, ev, t0, a.REQUESTS[0] - r0)
 
     ev("stage", "launch")
-    launch = a.get_launch(token)
+    # лаунчпад Robinhood: Flap — только при FLAP_ENABLED, суффикс 8888/7777 (без RPC) и подтверждение Portal
+    # (один HTTP); остальные — Pons прежним путём, без дополнительных запросов
+    flap_state = flap.detect(token) if chain == "robinhood" else None
+    if flap_state is not None:
+        a = flap
+        launch = flap.get_launch(token, flap_state)
+    else:
+        launch = a.get_launch(token)
     if launch is None:
-        raise ScanError(NOT_LAUNCHPAD[chain])
+        raise ScanError(NOT_LAUNCHPAD_FLAP if chain == "robinhood" and flap.enabled() else NOT_LAUNCHPAD[chain])
     if est := late_established():
         return est
 
@@ -302,12 +311,13 @@ def scan(token, emit=lambda e: None):
     limited = not gt and time.time() - ts[launch["block"]] > limits["min_age_days"] * 86400
     # резерв надёжен: адаптер нашёл пул (на кривой — всегда) и он согласуется с ликвидностью GT
     reserve_ok = facts.get("reserve_ok", True) and reserve_seen(facts["reserve"], supply, gt)
+    q_factor = facts.get("q_factor", 1)   # Flap после выпуска: налог на продажу токенами (1 − sellTax)
     sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"), reserve_ok=reserve_ok,
-                 limited=limited)
+                 limited=limited, q_factor=q_factor)
     reason = _reason(sc, base)
     # probably rug: только вычисления на уже собранных данных, без запросов в сеть
     rug = None if limited else d.rug_projection(holders, sig, ops, base, facts["reserve"], sc["band"],
-                                                snipers=a.RUG_SNIPERS, reserve_ok=reserve_ok)
+                                                snipers=a.RUG_SNIPERS, reserve_ok=reserve_ok, q_factor=q_factor)
     if rug:
         rug["level_usd"] = gt["price_usd"] * rug["level_factor"] if gt.get("price_usd") else None
     meta = {}
@@ -317,7 +327,8 @@ def scan(token, emit=lambda e: None):
     elapsed = round(time.time() - t0, 1)
     ev("done", reason, score=sc["score"], band=sc["band"], headline=sc["headline"], rug=rug)
 
-    return {
+    extra = {"launchpad": "flap", "flap": facts["flap"]} if "flap" in facts else {}
+    return extra | {
         "token": token, "chain": chain, "header": header,
         "launch": launch | {"ts": ts[launch["block"]]},
         "supply": supply, "circulating": base["circulating"], "holders_total": base["holders_total"],
