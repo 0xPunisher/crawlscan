@@ -67,6 +67,10 @@ def patched(history_fn=history, launch=True):
     market.clear_cache()
     stack.enter_context(mock.patch.dict(ch._SCAN, clear=True))     # история переводов скана (early buyers)
     stack.enter_context(mock.patch.dict(ch._LAUNCH, clear=True))
+    srv = sys.modules.get("server")
+    if srv is not None:   # сервер: лимит сканов по IP и кэш статусов — с чистого листа в каждом тесте
+        stack.enter_context(mock.patch.dict(srv._RATE, clear=True))
+        stack.enter_context(mock.patch.dict(srv._RESP, clear=True))
     launch_info = {"block": LAUNCH_BLOCK, "curve": CURVE, "deployer": DEPLOYER, "tx": "0xlaunch"}
     p = lambda name, **kw: stack.enter_context(mock.patch.object(ch, name, **kw))
     p("_post", side_effect=_no_network)

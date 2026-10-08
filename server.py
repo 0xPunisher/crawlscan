@@ -46,7 +46,11 @@ Alerts, подписки для бота (только при ALERTS_ENABLED=tru
 
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
-Лента /api/recent кэшируется 20 секунд; запись — после завершения скана, сбой базы скан не ломает.
+/api/rewards/status, /api/draw/status и /api/config кэшируются в памяти 30 секунд (Cache-Control: public, max-age=30 —
+для Cloudflare; у статуса наград поле now всегда текущее); сбой не кэшируется.
+Новых сканов с одного IP (CF-Connecting-IP) — не больше SCAN_RATE_PER_MIN в минуту, иначе 429 rate_limited с Retry-After;
+user agent crawlscan-bot — SCAN_RATE_BOT_PER_MIN, верный X-Alerts-Secret (наш бот) — без лимита.
+Лента /api/recent кэшируется 15 секунд; запись — после завершения скана, сбой базы скан не ломает.
 При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан;
 изменился важный показатель — уведомление подписчикам в Telegram (alerts_notify.py, свой поток, TG_BOT_TOKEN);
 плановые перепроверки отслеживаемых токенов — alerts_recheck.py (свой поток, уступает живым сканам).
@@ -97,7 +101,9 @@ CHART_TTL = 600            # секунд: кэш чарта по токену
 CHART_EMPTY_TTL = 60       # секунд: кэш чарта без свечей (GT не ответил или токен слишком свежий)
 CHART_STALE_TTL = 6 * 3600 # секунд: последний удачный чарт отдаётся (со stale_at), пока GT не отвечает
 CHART_MAX = 500            # чартов в памяти, старые вытесняются
-RECENT_TTL = 20            # секунд: кэш ленты /api/recent
+RECENT_TTL = 15            # секунд: кэш ленты /api/recent (и max-age для Cloudflare)
+STATUS_TTL = 30            # секунд: кэш /api/rewards/status, /api/draw/status, /api/config (и max-age)
+STATUS_CACHE = f"public, max-age={STATUS_TTL}"
 RECENT_DEFAULT = 12        # записей в ленте по умолчанию
 
 JOBS = {}                  # job_id -> {"token", "chain", "events", "done", "result", "error", "ts"}
@@ -122,6 +128,14 @@ SCAN_QUEUE_MAX = _env_int("SCAN_QUEUE_MAX", SCAN_QUEUE_MAX)
 _ACTIVE = [0]              # сканов идёт или ждёт слота (под _lock)
 RETRY_AFTER = 5            # секунд: заголовок Retry-After у 503 busy
 BUSY = {"error": "busy", "message": "Scanner is busy, try again in a few seconds"}
+# частота новых сканов с одного IP (CF-Connecting-IP): обычный клиент / бот CrawlScan по user agent;
+# запрос с верным X-Alerts-Secret (наш бот) — без лимита
+SCAN_RATE_PER_MIN = _env_int("SCAN_RATE_PER_MIN", 10)
+SCAN_RATE_BOT_PER_MIN = _env_int("SCAN_RATE_BOT_PER_MIN", 120)
+RATE_WINDOW = 60           # секунд
+RATE_MAX_CLIENTS = 20_000  # IP в памяти; больше — забываем всех (лимит мягкий)
+RATE_LIMITED = {"error": "rate_limited", "message": "Too many scans from your address, try again in a minute"}
+_RATE = {}                 # client -> [время новых сканов за RATE_WINDOW]
 
 for _a in engine.CHAINS.values():       # выше порога памяти memguard сбрасывает историю сканов и кэш переводов
     if hasattr(_a, "drop_caches"):
@@ -130,6 +144,26 @@ for _a in engine.CHAINS.values():       # выше порога памяти mem
 
 class Busy(Exception):
     """Новый скан не принят: очередь полна или память выше MEMORY_SOFT_LIMIT_MB."""
+
+
+class RateLimited(Exception):
+    """Слишком много новых сканов с одного IP; args[0] — через сколько секунд можно снова."""
+
+
+def _rate_take(client, now):
+    """Учесть новый скан клиента (client = (ключ, лимит в минуту) или None — без лимита). Под _lock.
+    Лимит исчерпан — RateLimited(секунд до освобождения)."""
+    if client is None:
+        return
+    key, limit = client
+    hits = [t for t in _RATE.get(key, ()) if now - t < RATE_WINDOW]
+    if len(hits) >= limit:
+        _RATE[key] = hits
+        raise RateLimited(max(1, int(RATE_WINDOW - (now - hits[0])) + 1))
+    if key not in _RATE and len(_RATE) >= RATE_MAX_CLIENTS:
+        _RATE.clear()
+    hits.append(now)
+    _RATE[key] = hits
 
 
 def _run(job_id, token):
@@ -180,9 +214,10 @@ def _reuse(token, now):
     return None
 
 
-def start_scan(token):
+def start_scan(token, client=None):
     """job_id: свежий кэш по токену или уже идущий скан того же токена, иначе новый.
-    Новый — только если в очереди есть место и память ниже порога, иначе Busy."""
+    Новый — только если в очереди есть место и память ниже порога, иначе Busy; и если client (ключ, лимит в минуту)
+    не исчерпал лимит новых сканов, иначе RateLimited. Кэш и подключение к идущему скану лимит не тратят."""
     chain, token = engine.chain_of(token)
     now = time.time()
     with _lock:
@@ -205,6 +240,7 @@ def start_scan(token):
             return jid
         if _ACTIVE[0] >= MAX_CONCURRENT + SCAN_QUEUE_MAX:
             raise Busy("queue")
+        _rate_take(client, now)
         _ACTIVE[0] += 1
         jid = uuid.uuid4().hex[:12]
         JOBS[jid] = {"token": token, "chain": chain, "events": [], "done": False, "result": None, "error": None,
@@ -556,6 +592,39 @@ def alerts_api(method, path, body, q):
     return 200, {"ok": True, "renewed": status == "renewed", **w, "items": items} | meta
 
 
+_RESP = {}                 # ключ -> (ts, тело): статусы и конфиг для опросов страницы
+
+
+def cached_response(key, ttl, fn):
+    """Тело ответа из кэша процесса моложе ttl, иначе fn() (исключение не кэшируется — его ловит вызывающий)."""
+    now = time.time()
+    with _lock:
+        hit = _RESP.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    body = fn()
+    with _lock:
+        _RESP[key] = (now, body)
+    return body
+
+
+def _fresh_now(body):
+    """У кэшированного статуса поле now — текущее (бот считает «через 5h 12m» от него)."""
+    return body | {"now": rs._iso(time.time())} if isinstance(body, dict) and "now" in body else body
+
+
+def scan_client(headers, addr):
+    """(ключ, лимит в минуту) для лимита новых сканов или None (без лимита). IP — CF-Connecting-IP (сайт за
+    Cloudflare), иначе адрес соединения. Верный X-Alerts-Secret — наш бот, без лимита; user agent crawlscan-bot —
+    высокий лимит."""
+    if alerts_secret_ok(headers.get("X-Alerts-Secret")):
+        return None
+    ip = (headers.get("CF-Connecting-IP") or "").strip() or addr
+    if (headers.get("User-Agent") or "").startswith("crawlscan-bot"):
+        return ("bot:" + ip, SCAN_RATE_BOT_PER_MIN)
+    return (ip, SCAN_RATE_PER_MIN)
+
+
 def get_recent(limit):
     """Ответ /api/recent с кэшем RECENT_TTL. Сбой базы — пустая лента, не ошибка."""
     now = time.time()
@@ -660,7 +729,9 @@ class H(BaseHTTPRequestHandler):
 
     def _draw_get(self, path, q):
         if path == "/api/draw/status":
-            return self._send(200, ds.status_json(draw_store(), ds.config()))
+            body = cached_response(("draw", os.environ.get("DRAW_DB_PATH")), STATUS_TTL,
+                                   lambda: ds.status_json(draw_store(), ds.config()))
+            return self._send(200, _fresh_now(body), cache=STATUS_CACHE)
         store = draw_store()
         if store is None:
             return self._send(404, {"error": "draw is disabled"})
@@ -689,7 +760,9 @@ class H(BaseHTTPRequestHandler):
     def _rewards_get(self, path, q):
         cfg = rs.config()
         if path == "/api/rewards/status":
-            return self._send(200, rs.status_json(rewards_store(), cfg))
+            body = cached_response(("rewards", os.environ.get("DRAW_DB_PATH"), cfg["enabled"], cfg["token"]), STATUS_TTL,
+                                   lambda: rs.status_json(rewards_store(), cfg))
+            return self._send(200, _fresh_now(body), cache=STATUS_CACHE)
         store = rewards_store()
         if store is None:
             return self._send(404, {"error": "rewards are disabled"})
@@ -751,9 +824,12 @@ class H(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("content-length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
-            return self._send(200, {"job": start_scan(body.get("token"))})
+            return self._send(200, {"job": start_scan(body.get("token"),
+                                                      scan_client(self.headers, self.client_address[0]))})
         except Busy:
             return self._send(503, BUSY, headers={"retry-after": str(RETRY_AFTER)})
+        except RateLimited as e:
+            return self._send(429, RATE_LIMITED, headers={"retry-after": str(e.args[0])})
         except engine.ScanError as e:
             return self._send(400, {"error": str(e)})
         except (ValueError, AttributeError):
@@ -775,8 +851,12 @@ class H(BaseHTTPRequestHandler):
         if u.path.startswith("/api/alerts/"):
             return self._alerts("GET", u.path, q)
         if u.path == "/api/config":  # фронт и бот: какие сети включены (SOLANA_ENABLED), алерты (ALERTS_ENABLED), Trade on Axiom
-            return self._send(200, {"solana": engine.solana_enabled(), "alerts": alerts.enabled(),
-                                    "flap": flap.enabled(), "trade": trade.templates()})
+            env = tuple(os.environ.get(k) for k in ("SOLANA_ENABLED", "ALERTS_ENABLED", "FLAP_ENABLED",
+                                                    "TRADE_URL_ROBINHOOD", "TRADE_URL_SOLANA"))
+            body = cached_response(("config",) + env, STATUS_TTL, lambda: {
+                "solana": engine.solana_enabled(), "alerts": alerts.enabled(), "flap": flap.enabled(),
+                "trade": trade.templates()})
+            return self._send(200, body, cache=STATUS_CACHE)
         if u.path == "/api/chart":
             try:
                 return self._send(200, get_chart((q.get("token") or [""])[0]))

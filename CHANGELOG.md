@@ -23,6 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Stability under heavy traffic. When the scanner is overloaded, new scans get `503` with `Retry-After` and `{"error": "busy"}` instead of piling up, and the site and the bot say "Scanner is busy, try again in a few seconds". Cached results and joining a scan of the same token that is already running work as before. Settings: `SCAN_QUEUE_MAX` (scans waiting for a slot) and `MEMORY_SOFT_LIMIT_MB` (process memory above which new scans wait and in-memory caches are dropped).
 - Lower peak memory per scan: transfer history is read and parsed page by page, and the in-memory history kept for early buyers is capped by total transfers (`SCAN_CACHE_MAX_TRANSFERS`).
 - Pons tokens with a very long history get a clear "token history too large" error (`SCAN_MAX_LOGS`) instead of exhausting memory.
+- Less load from page polling: `/api/rewards/status`, `/api/draw/status`, `/api/config` and `/api/recent` are served from memory for a short time and sent with `Cache-Control: public` so Cloudflare can cache them. The page polls the reward and draw status and the recently scanned feed less often and not at all while the tab is hidden.
+- Per-IP limit on new scans (`SCAN_RATE_PER_MIN`, IP from `CF-Connecting-IP`): above it `/api/scan` returns `429` with `Retry-After` and "Too many scans from your address, try again in a minute". Cached results and joining a running scan don't count. The CrawlScan bot is not limited.
 - SQLite "database is locked": the database uses WAL with a busy timeout and one write lock per file. A database error in the rewards or draw API returns `503` and no longer affects scans or the process.
 
 ## [1.6.0] - 2026-10-08

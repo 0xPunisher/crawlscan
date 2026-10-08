@@ -12,7 +12,7 @@ class ApiError(Exception):
 
 
 class Busy(ApiError):
-    """Сайт перегружен (503 busy): новый скан не принят, повторить через несколько секунд."""
+    """Сайт перегружен (503 busy) или лимит частоты (429): новый скан не принят, повторить позже."""
 
 
 class Rejected(Exception):
@@ -46,7 +46,7 @@ class CrawlScan:
                 payload, err = None, None
             if e.code == 400 and err:
                 raise Rejected(err) from None
-            if e.code == 503 and err == "busy":
+            if (e.code == 503 and err == "busy") or e.code == 429:
                 raise Busy(payload.get("message") or err) from None
             if e.code in ok and isinstance(payload, dict):
                 return {"status": e.code} | payload
@@ -57,8 +57,10 @@ class CrawlScan:
             raise ApiError(f"{path}: {e}") from None
 
     def scan(self, token):
-        """Запустить скан (или получить кэш сайта) → job id."""
-        job = self._req("/api/scan", {"token": token}).get("job")
+        """Запустить скан (или получить кэш сайта) → job id. С секретом алертов сайт не ограничивает частоту сканов
+        бота (лимит новых сканов по IP — для остальных)."""
+        headers = {"X-Alerts-Secret": self.alerts_secret} if self.alerts_secret else None
+        job = self._req("/api/scan", {"token": token}, headers=headers).get("job")
         if not job:
             raise ApiError("no job in /api/scan response")
         return job

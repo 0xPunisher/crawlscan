@@ -237,10 +237,15 @@ class TestServerBusy(unittest.TestCase):
         self.env.__enter__()
 
     def tearDown(self):
+        for _ in range(200):                     # сканы теста дошли до конца, пока адаптер подменён
+            if server._ACTIVE[0] == 0:
+                break
+            time.sleep(0.05)
         with server._stores_lock:
-            for st in server._recent_stores.values():
-                st.close()
-            server._recent_stores.clear()
+            for stores in (server._recent_stores, server._rw_stores):
+                for st in stores.values():
+                    st.close()
+                stores.clear()
         self.env.__exit__(None, None, None)
         self.fakes.__exit__(None, None, None)
         self.tmp.cleanup()
@@ -324,6 +329,92 @@ class TestServerBusy(unittest.TestCase):
         self.assertEqual((code, d), (200, {"items": []}))
 
 
+class TestPollingLoad(TestServerBusy):
+    """Опросы страницы не ходят в SQLite: статусы и конфиг из памяти процесса, Cache-Control для Cloudflare;
+    лимит новых сканов по IP (CF-Connecting-IP)."""
+
+    def scan_as(self, token, headers):
+        req = urllib.request.Request(self.base + "/api/scan", data=json.dumps({"token": token}).encode(),
+                                     method="POST", headers={"content-type": "application/json"} | headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read()), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read()), dict(e.headers)
+
+    def test_rewards_status_cached(self):
+        import rewards_service as rs
+        calls = []
+        real = rs.status_json
+        with mock.patch.dict(os.environ, {"REWARDS_ENABLED": "true"}), \
+                mock.patch.object(rs, "status_json", side_effect=lambda *a, **k: calls.append(1) or real(*a, **k)):
+            code, a, h = self.request("/api/rewards/status")
+            self.assertEqual(code, 200)
+            self.assertEqual(h["cache-control"], "public, max-age=30")
+            code, b, _ = self.request("/api/rewards/status")
+            self.assertEqual(len(calls), 1)                          # второй — из памяти, без SQLite
+            self.assertEqual({**a, "now": None}, {**b, "now": None})
+            self.assertIn("now", b)
+            with mock.patch.object(server, "STATUS_TTL", 0):
+                self.request("/api/rewards/status")
+            self.assertEqual(len(calls), 2)
+
+    def test_status_error_not_cached(self):
+        with mock.patch.dict(os.environ, {"REWARDS_ENABLED": "true"}):
+            with mock.patch.object(server, "rewards_store", side_effect=sqlite3.OperationalError("database is locked")):
+                self.assertEqual(self.request("/api/rewards/status")[0], 503)
+            self.assertEqual(self.request("/api/rewards/status")[0], 200)
+
+    def test_draw_status_and_config_cached(self):
+        import draw_service as ds
+        with mock.patch.object(ds, "status_json", return_value={"enabled": False}) as st:
+            for _ in range(3):
+                code, d, h = self.request("/api/draw/status")
+            self.assertEqual((code, d, h["cache-control"], st.call_count), (200, {"enabled": False}, "public, max-age=30", 1))
+        code, _, h = self.request("/api/config")
+        self.assertEqual((code, h["cache-control"]), (200, "public, max-age=30"))
+
+    def test_recent_cached_15s(self):
+        self.request("/api/recent")
+        with mock.patch.object(server, "recent_store", side_effect=AssertionError("SQLite")):
+            code, _, h = self.request("/api/recent")
+        self.assertEqual((code, h["cache-control"]), (200, "public, max-age=15"))
+
+    def test_scan_rate_limit_per_ip(self):
+        ip = {"CF-Connecting-IP": "203.0.113.7"}
+        with mock.patch.object(server, "SCAN_RATE_PER_MIN", 2), mock.patch.object(server, "SCAN_QUEUE_MAX", 100):
+            for t in (fakes.TOKEN, "0x" + "1" * 40):
+                self.assertEqual(self.scan_as(t, ip)[0], 200)
+            code, d, h = self.scan_as("0x" + "9" * 40, ip)
+            self.assertEqual((code, d), (429, server.RATE_LIMITED))
+            self.assertTrue(1 <= int(h["retry-after"]) <= 61)
+            self.assertEqual(self.scan_as(fakes.TOKEN, ip)[0], 200)             # идущий скан или кэш — не новый
+            self.assertEqual(self.scan_as("0x" + "9" * 40, {"CF-Connecting-IP": "198.51.100.1"})[0], 200)
+            self.assertEqual(self.scan_as("0x" + "8" * 40, ip | {"User-Agent": "crawlscan-bot"})[0], 200)
+            with mock.patch.dict(os.environ, {"ALERTS_API_SECRET": "s3cret"}):
+                self.assertEqual(self.scan_as("0x" + "7" * 40, ip | {"X-Alerts-Secret": "s3cret"})[0], 200)
+                self.assertEqual(self.scan_as("0x" + "6" * 40, ip | {"X-Alerts-Secret": "wrong"})[0], 429)
+
+    def test_rate_window(self):
+        with mock.patch.dict(server._RATE, clear=True):
+            for t in (0, 1):
+                server._rate_take(("a", 2), 100.0 + t)
+            with self.assertRaises(server.RateLimited) as cm:
+                server._rate_take(("a", 2), 102.0)
+            self.assertEqual(cm.exception.args[0], 59)
+            server._rate_take(("a", 2), 160.5)                       # первый вышел из окна
+            server._rate_take(None, 160.5)                           # без лимита
+
+    def test_scan_client(self):
+        with mock.patch.dict(os.environ, {"ALERTS_API_SECRET": "s"}):
+            self.assertIsNone(server.scan_client({"X-Alerts-Secret": "s"}, "1.1.1.1"))
+            self.assertEqual(server.scan_client({"CF-Connecting-IP": "2.2.2.2"}, "10.0.0.1"),
+                             ("2.2.2.2", server.SCAN_RATE_PER_MIN))
+            self.assertEqual(server.scan_client({"User-Agent": "crawlscan-bot"}, "10.0.0.1"),
+                             ("bot:10.0.0.1", server.SCAN_RATE_BOT_PER_MIN))
+
+
 class TestRecheckMemory(unittest.TestCase):
 
     def test_skips_when_memory_high(self):
@@ -355,6 +446,22 @@ class TestBotBusy(unittest.TestCase):
                 bot_api.CrawlScan("https://x.test").scan(RH)
         self.assertEqual(str(cm.exception), server.BUSY["message"])
 
+    def test_scan_sends_secret_and_429_is_busy(self):
+        seen = []
+
+        def urlopen(req, timeout=None):
+            seen.append(dict(req.header_items()))
+            raise urllib.error.HTTPError("u", 429, "rl", {}, io.BytesIO(json.dumps(server.RATE_LIMITED).encode()))
+
+        with mock.patch.object(bot_api.urllib.request, "urlopen", side_effect=urlopen):
+            with self.assertRaises(bot_api.Busy):
+                bot_api.CrawlScan("https://x.test", alerts_secret="s3").scan(RH)
+            with self.assertRaises(bot_api.Busy):
+                bot_api.CrawlScan("https://x.test").scan(RH)
+        self.assertEqual(seen[0].get("X-alerts-secret"), "s3")
+        self.assertNotIn("X-alerts-secret", seen[1])
+        self.assertEqual(seen[0].get("User-agent"), "crawlscan-bot")
+
     def test_bot_shows_busy_text(self):
         class BusyAPI(FakeAPI):
             def scan(self, token):
@@ -374,6 +481,10 @@ class TestFrontendBusy(unittest.TestCase):
                                 "scripts", "build_frontend.py"), encoding="utf-8").read()
         self.assertIn(f"const BUSY_TEXT='{server.BUSY['message']}'", src)
         self.assertIn("d.error==='busy'", src)
+        self.assertIn("fail(d.message||d.error||('http '+r.status))", src)   # 429 rate_limited — текст message
+        self.assertIn("if(!document.hidden&&since>(busy?30000:60000)) this.loadRewards();", src)
+        self.assertIn("if(!document.hidden&&((past&&since>60000)||since>300000)) this.loadDraw();", src)
+        self.assertIn("if(document.hidden||t-(this._recentAt||0)<20000) return;", src)
 
 
 if __name__ == "__main__":
