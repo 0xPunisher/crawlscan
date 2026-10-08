@@ -22,6 +22,9 @@ RESERVE_MIN_SEEN = 0.25  # резерв в $ < 25% токенной сторон
 ESTABLISHED_ENV = {"min_age_days": "ESTABLISHED_MIN_AGE_DAYS", "min_liquidity_usd": "ESTABLISHED_MIN_LIQUIDITY_USD",
                    "min_mcap_usd": "ESTABLISHED_MIN_MCAP_USD"}
 WORKERS = 12           # потоков чтения истории кошельков; лимитер RPS в адаптере общий
+# сколько кошельков читать одновременно (по убыванию доли): адаптер с тяжёлыми запросами под общим лимитером
+# (Robinhood: батч из 10 getLogs = 10 слотов RPS) задаёт HISTORY_PARALLEL — при нехватке бюджета крупнейшие
+# успевают первыми; без атрибута — все WORKERS сразу, как раньше
 SPIDERS = 6            # пауков; кошельки раздаются по кругу
 HIST_CAP = d.SHORT_HISTORY_MAX + 1  # монеты до входа считаем до 4: важно 0 / 1..3 / больше
 USE_FUNDING = False    # фандинг выключен: eth_inflows/outgoing_count не вызываются,
@@ -106,6 +109,47 @@ def validate(token):
     return chain_of(token)[1]
 
 
+class _RankGate:
+    """Окно чтения кошельков: задача ранга i стартует, когда i < освобождено + width (не больше width одновременно,
+    в порядке рангов — крупнейшие первыми). Слот освобождается, когда задача закончила или выбрала свою долю
+    времени slot_s (тогда дочитывает в фоне, но очередь не держит: медленный кошелёк не блокирует следующих).
+    close() — бюджет вышел: ждущие задачи сразу выходят без чтения."""
+
+    def __init__(self, width, slot_s=None):
+        self.width, self.slot_s, self.released, self.closed = width, slot_s, 0, False
+        self.cv = threading.Condition()
+
+    def _release(self, done):
+        with self.cv:
+            if not done[0]:
+                done[0] = True
+                self.released += 1
+                self.cv.notify_all()
+
+    def run(self, rank, fn, *args):
+        with self.cv:
+            self.cv.wait_for(lambda: self.closed or rank < self.released + self.width)
+            if self.closed:
+                return None
+        done = [False]
+        timer = None
+        if self.slot_s is not None:
+            timer = threading.Timer(max(0.0, self.slot_s), self._release, (done,))
+            timer.daemon = True
+            timer.start()
+        try:
+            return fn(*args)
+        finally:
+            if timer:
+                timer.cancel()
+            self._release(done)
+
+    def close(self):
+        with self.cv:
+            self.closed = True
+            self.cv.notify_all()
+
+
 _HIST, _HIST_LOCK = {}, threading.Lock()  # (wallet, before_block) -> монет до входа
 
 def _history(a, wallet, before_block, token):
@@ -144,7 +188,8 @@ def _reason(sc, base):
     return {"operator": (f"biggest operator could move price −{m['impact'] * 100:.0f}% if sold "
                          f"({m['operator'] * 100:.1f}% of float)" if m["impact"] is not None else
                          f"biggest operator holds {m['operator'] * 100:.1f}% of float (liquidity not measured)"),
-            "virgin": f"{m['virgin'] * 100:.0f}% virgin wallets in top",
+            "virgin": (f"{m['virgin'] * 100:.0f}% virgin wallets in top" if m["virgin"] is not None
+                       else "virgin share unknown: most of the top couldn't be read"),
             "transfer": f"{m['transfer'] * 100:.1f}% of float received by transfer",
             "sniper": f"snipers hold {m['sniper'] * 100:.1f}% of float",
             "concentration": f"top 20 hold {m['concentration'] * 100:.1f}% of float"}[k]
@@ -238,7 +283,12 @@ def scan(token, emit=lambda e: None):
     # пул перепроверки alerts — тоже фоновый (chains.priority: уступает живым сканам в лимитере RPS)
     ex = ThreadPoolExecutor(max_workers=WORKERS,
                             thread_name_prefix=f"{priority.BG}-pool" if priority.is_background() else "")
-    futs = {ex.submit(_history, a, w, entries[w]["block"], token): w for w in hs if entries[w]["kind"] is not None}
+    order = [w for w in hs if entries[w]["kind"] is not None]   # hs — по убыванию доли: крупнейшие первыми
+    width = getattr(a, "HISTORY_PARALLEL", WORKERS)
+    left = max(0.05, deadline - DETECT_RESERVE - time.time())
+    # доля времени на кошелёк: если каждый уложится в неё, успеют все; кто дольше — уступает слот следующему
+    gate = _RankGate(width, left * width / len(order) if width < len(order) else None)
+    futs = {ex.submit(gate.run, i, _history, a, w, entries[w]["block"], token): w for i, w in enumerate(order)}
 
     def flag(w):
         s = d.wallet_signals({w: data[w]}, ts[launch["block"]], launch["deployer"],
@@ -262,6 +312,7 @@ def scan(token, emit=lambda e: None):
             flag(w)
     except _CFTimeout:
         pass
+    gate.close()
     ex.shutdown(wait=False, cancel_futures=True)
     unread = [w for w in hs if w not in done]
     for w in unread:
@@ -327,7 +378,8 @@ def scan(token, emit=lambda e: None):
                      "signals": sig[a]} for a, _, s in holders],
         "links": links, "packs": packs, "operators": ops,
         "score": sc["score"], "band": sc["band"], "parts": sc["parts"], "gates": sc["gates"],
-        "metrics": sc["metrics"], "headline": sc["headline"], "reason": reason, "reserve": facts["reserve"],
+        "metrics": sc["metrics"], "headline": sc["headline"], "reason": reason, "notes": sc.get("notes", []),
+        "reserve": facts["reserve"],
         "reserve_ok": reserve_ok, "limited": limited, "market_source": gt.get("source"),
         "market_pool": gt.get("pool"),
         "rug": rug,
