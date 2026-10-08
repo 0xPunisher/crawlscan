@@ -79,6 +79,7 @@ class Chain:
                  vest=True, creator=RELAYER):
         self.release, self.available, self.pair, self.X, self.quotes_ok = release, available, pair, virtual, quotes_ok
         self.vest, self.creator = vest, creator
+        self.page_cap = 10 ** 9                 # логов в ответе getLogs (тесты чтения ставят маленький)
         self.calls, self.trs, self.rcs = [], [], {}
         self._build()
         self.head = max(t["block"] for t in self.trs) + 10
@@ -178,7 +179,12 @@ class Chain:
             return data(self.pair, 0, 0xdead, bankr.MIGRATOR, bankr.INITIALIZER, BTOKEN, 0xdead,
                         SUPPLY - (VEST if self.vest else 0), SUPPLY, bankr.INTEGRATOR)
         assert method == "eth_getLogs" and params[0]["address"] == BTOKEN, (method, params)
-        return self.logs(params[0])
+        logs = self.logs(params[0])
+        if len(logs) > self.page_cap:   # как Alchemy: отказ с подсказкой окна, где логов не больше cap
+            lo = int(params[0]["fromBlock"], 16)
+            b = max(lo, int(logs[self.page_cap]["blockNumber"], 16) - 1)
+            raise RuntimeError(f"Log response size exceeded. ... this block range should work: [{hex(lo)}, {hex(b)}]")
+        return logs
 
     def get_token_transfers(self, token, from_block, to_block=None, frm=None, to=None):
         lst = lambda a: None if a is None else ({a} if isinstance(a, str) else set(a))
@@ -202,6 +208,7 @@ class Chain:
                                                       "FLAP_ENABLED": "1" if flap_on else "0"}))
         st.enter_context(mock.patch.dict(bankr._STATE, clear=True))
         st.enter_context(mock.patch.dict(bankr._LAUNCH, clear=True))
+        st.enter_context(mock.patch.dict(bankr._INDEX, clear=True))
         return st
 
 
@@ -455,6 +462,144 @@ class TestCurveImpact(unittest.TestCase):
         base = {"supply": 1000, "circulating": 1000, "holders_total": 12}
         self.assertEqual(d.score(holders, sig, ops, base, 500), d.score(holders, sig, ops, base, 500,
                                                                          impact_curve=None, locked=None))
+
+
+def small_pages(cap=5):
+    """Чтение маленькими страницами: потолок ответа RPC cap логов, участки первой волны — от 1 блока."""
+    return mock.patch.multiple(bankr, READ_CHUNK_MIN=1, READ_CHUNKS=4, READ_TARGET=3), \
+        mock.patch.object(flap, "PAGE_LOGS", cap)
+
+
+class TestHistory(unittest.TestCase):
+
+    def test_parallel_read_splits_by_suggestion_and_reads_all(self):
+        c = Chain()
+        c.page_cap = 5
+        a, b = small_pages()
+        with c.patched(), a, b:
+            got = []
+            n, done = bankr._read_all(BTOKEN, LAUNCH_BLOCK, c.head, got.extend)
+        self.assertTrue(done)
+        self.assertEqual(n, len(c.trs))
+        self.assertEqual(sorted((t["tx"], t["log_index"]) for t in got), sorted((t["tx"], t["log_index"]) for t in c.trs))
+        self.assertGreater(len([m for m, _ in c.calls if m == "eth_getLogs"]), 4)   # делили по подсказке
+
+    def test_cap_and_deadline_stop(self):
+        c = Chain()
+        with c.patched():
+            self.assertFalse(bankr._read_all(BTOKEN, LAUNCH_BLOCK, c.head, lambda p: None, cap=3)[1])
+            self.assertFalse(bankr._read_all(BTOKEN, LAUNCH_BLOCK, c.head, lambda p: None, until=0)[1])
+
+    def test_slow_first_wave_with_cap_gives_up(self):
+        import time as _t
+        c = Chain()
+        slow = lambda m, p: (_t.sleep(0.3), c.rpc(m, p))[1]
+        with c.patched(), mock.patch.object(ch, "rpc", side_effect=slow), mock.patch.object(bankr, "WAVE_MAX", 0.05):
+            t0 = _t.time()
+            n, done = bankr._read_all(BTOKEN, LAUNCH_BLOCK, c.head, lambda p: None, cap=10 ** 9)
+        self.assertFalse(done)
+        self.assertLess(_t.time() - t0, 0.25)
+
+    def test_full_then_indexed_same_result(self):
+        c = Chain()
+        with c.patched():
+            r1 = engine.scan(BTOKEN)
+            self.assertEqual(r1["bankr"]["history"]["mode"], "full")
+            self.assertIn(BTOKEN, bankr._INDEX)                      # индекс — из полной истории
+            r2 = engine.scan(BTOKEN)
+        h = r2["bankr"]["history"]
+        self.assertEqual((h["mode"], h["top_exact"], h["tail_logs"]), ("indexed", True, 0))
+        self.assertFalse(r2["limited"])
+        for k in ("score", "band", "gates", "operators", "holders_total", "circulating"):
+            self.assertEqual(r1[k], r2[k], k)
+        self.assertEqual([(x["wallet"], x["share"], x["signals"]["kind"], x["signals"]["sold"]) for x in r1["holders"]],
+                         [(x["wallet"], x["share"], x["signals"]["kind"], x["signals"]["sold"]) for x in r2["holders"]])
+
+    def test_indexed_reads_tail(self):
+        c = Chain()
+        whale = "0x" + "77" * 20
+        with c.patched():
+            engine.scan(BTOKEN)
+            c.tr(W[3], whale, c.balance(W[3]), "0xmove", c.head + 5)
+            c.rcs["0xmove"] = []
+            c.head += 20
+            r = engine.scan(BTOKEN)
+        self.assertEqual(r["bankr"]["history"]["tail_logs"], 1)
+        hs = {x["wallet"]: x for x in r["holders"]}
+        self.assertIn(whale, hs)
+        self.assertNotIn(W[3], hs)
+        self.assertEqual(hs[whale]["signals"]["kind"], "transfer")
+
+    def test_big_history_windowed_and_index_started(self):
+        c = Chain()
+        started = []
+        with c.patched(), mock.patch.object(bankr, "FULL_MAX_LOGS", 3), \
+                mock.patch.object(bankr, "_index_start", side_effect=lambda t, b, ex: started.append((t, b)) or True):
+            r = engine.scan(BTOKEN)
+        h = r["bankr"]["history"]
+        self.assertEqual((h["index"], h["index_started"]), ("building", True))
+        self.assertEqual(started, [(BTOKEN, LAUNCH_BLOCK)])
+        self.assertNotIn(BTOKEN, bankr._INDEX)
+
+    def test_build_index_balances(self):
+        c = Chain()
+        c.page_cap = 5
+        a, b = small_pages()
+        with c.patched(), a, b:
+            self.assertTrue(bankr.build_index(BTOKEN, LAUNCH_BLOCK, bankr._sets(BTOKEN, bankr.get_launch(BTOKEN))[1]))
+            idx = bankr._INDEX[BTOKEN]
+        self.assertEqual(idx["head"], c.head)
+        for w in W + [DEV, PM, BTOKEN]:
+            self.assertEqual(idx["bal"].get(w, 0), c.balance(w), w)
+
+
+class TestDevGate(unittest.TestCase):
+
+    def setUp(self):
+        self.dev = "0x" + "de" * 20
+        self.holders = [(self.dev, 300, 0.3)] + [("0x" + f"{i:02x}" * 20, 50, 0.05) for i in range(1, 15)]
+        self.sig = {a: {"is_deployer": a == self.dev, "unread": False, "virgin": False, "kind": "buy", "sniper": False,
+                        "launch_bundle": False, "sold": False} for a, _, _ in self.holders}
+        self.ops = [{"wallets": [a], "share": s, "share_supply": s, "level": None, "weighted": s} for a, _, s in self.holders]
+        self.base = {"supply": 1000, "circulating": 1000, "holders_total": 15}
+
+    def score(self, **kw):
+        return d.score(self.holders, self.sig, self.ops, self.base, 200, **kw)
+
+    def test_limited_without_dev_capped_risky(self):
+        sc = self.score(limited=True)
+        self.assertEqual(sc["band"], "RISKY")
+        self.assertNotIn("dev_impact", sc["metrics"])
+
+    def test_dev_gate_danger_even_when_limited(self):
+        sc = self.score(limited=True, dev={"wallet": self.dev, "sellable": 300, "share_supply": 0.3})
+        self.assertEqual(sc["band"], "DANGER")
+        self.assertTrue(sc["gates"][0].startswith("deployer could move price −"))
+        self.assertAlmostEqual(sc["metrics"]["dev_impact"], d.dump_impact(300, 200))
+
+    def test_locked_vesting_not_sellable_no_gate(self):
+        sc = self.score(limited=True, dev={"wallet": self.dev, "sellable": 10, "share_supply": 0.3})
+        self.assertEqual(sc["band"], "RISKY")
+        self.assertFalse([g for g in sc["gates"] if g.startswith("deployer")])
+
+    def test_not_duplicated_with_biggest_operator_gate(self):
+        sc = self.score(dev={"wallet": self.dev, "sellable": 300, "share_supply": 0.3})
+        self.assertEqual(sc["band"], "DANGER")
+        self.assertEqual(len([g for g in sc["gates"] if not g.startswith("soft:")]), 1)
+        self.assertTrue(sc["gates"][0].startswith("biggest operator"))
+
+    def test_engine_dev_gate_on_limited_bankr_scan(self):
+        c = Chain(release=10 * SUPPLY // 100)
+        orig = bankr.history
+        part = lambda *a, **k: (lambda r: (r[0], r[1], dict(r[2], mode="windowed", top_exact=False), r[3]))(orig(*a, **k))
+        with c.patched(), mock.patch.object(bankr, "history", side_effect=part):
+            r = engine.scan(BTOKEN)
+        self.assertTrue(r["limited"])
+        self.assertEqual(r["band"], "DANGER")
+        self.assertTrue(any(g.startswith("deployer could move price") for g in r["gates"]))
+        dh = r["bankr"]["dev_holding"]
+        self.assertEqual((dh["wallet"], dh["wallet_balance"], dh["sellable"]), (DEV, 10 * SUPPLY // 100, 10 * SUPPLY // 100))
+        self.assertAlmostEqual(dh["share_supply"], 0.15)
 
 
 class TestEarly(unittest.TestCase):

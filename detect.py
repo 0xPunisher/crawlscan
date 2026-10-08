@@ -329,7 +329,7 @@ def _sold_into_pool(q, q_factor):
 
 
 def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True, limited=False, q_factor=1,
-          limited_note=LIMITED_NOTE, impact_curve=None, locked=None):
+          limited_note=LIMITED_NOTE, impact_curve=None, locked=None, dev=None):
     """Скор 0–100 (100 = чисто): {"score", "band", "parts", "gates", "metrics", "headline"}.
     reserve — резерв токенов ликвидности (сырые единицы): баланс пула после миграции или кривой до.
     Часть "operator" и её стоп-правило — от dump_impact крупнейшего оператора (q = взвешенная доля
@@ -348,7 +348,11 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     limited_note — пояснение к limited в headline (по умолчанию LIMITED_NOTE; Flap с неполным топом — PARTIAL_NOTE).
     impact_curve — кривая котировок [(q, падение)] (Bankr: V4Quoter): impact по ней, а не по резерву; None — по резерву.
     locked — {кошелёк: токенов}, которые в доле кошелька, но продать сейчас нельзя (вестинг дева Bankr): из q для
-    impact вычитаются (с весом оператора); None — q без изменений."""
+    impact вычитаются (с весом оператора); None — q без изменений.
+    dev — доля дева, точно известная из контрактов (Bankr: кошелёк деплоера через balanceOf + вестинг):
+    {"wallet", "sellable" (что может продать сейчас: кошелёк + доступное в вестинге), "share_supply" (кошелёк + весь
+    вестинг)}. Его продажа уронит цену на ≥ GATE_IMPACT — жёсткое правило, в том числе при limited (числа не зависят
+    от неполного топа); metrics["dev_impact"]. None — правила нет (Pons, Flap: прежний путь)."""
     n = len(holders)
     big = ops[0] if ops else {"share": 0.0, "share_supply": 0.0, "weighted": 0.0, "wallets": []}
     q = _unlocked(big["weighted"] * base["circulating"], big["wallets"], locked,
@@ -400,6 +404,14 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
         gates.append(f"{m['virgin'] * 100:.0f}% virgin wallets in top (≥ {GATE_VIRGIN * 100:.0f}%)")
     if m["transfer"] >= GATE_TRANSFER and not limited:
         gates.append(f"{m['transfer'] * 100:.1f}% of float received by transfer (≥ {GATE_TRANSFER * 100:.0f}%)")
+    dev_gate = False
+    if dev is not None and reserve_ok:
+        m["dev_impact"] = _impact(_sold_into_pool(dev["sellable"], q_factor), reserve, impact_curve)
+        same = gates and gates[0].startswith("biggest operator") and dev["wallet"] in big["wallets"]
+        if m["dev_impact"] >= GATE_IMPACT and not same:
+            gates.append(f"deployer could move price −{m['dev_impact'] * 100:.0f}% if sold "
+                         f"(≥ {GATE_IMPACT * 100:.0f}%; {dev['share_supply'] * 100:.1f}% of supply with vesting)")
+            dev_gate = True
     hard = bool(gates)
     total = round(sum(parts.values()))
     if thin and independent:   # один независимый покупатель с историей в тонком пуле: не DANGER сам по себе
@@ -417,8 +429,9 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     if any(g.startswith("soft:") for g in gates):
         total = min(total, SOFT_GATE_SCORE)
     band = "DANGER" if hard else next((b for lim, b in BANDS if total >= lim), "DANGER")
-    if limited and band == "DANGER":
+    if limited and band == "DANGER" and not dev_gate:
         band = "RISKY"   # старый токен без данных рынка: сигналы холдеров ограничены, вердикт не ниже RISKY
+                         # (кроме правила по деву: его доля известна точно из контрактов)
     return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline,
             "notes": notes}
 

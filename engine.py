@@ -391,10 +391,12 @@ def scan(token, emit=lambda e: None):
     reserve_ok = facts.get("reserve_ok", True) and reserve_seen(facts["reserve"], supply, gt)
     q_factor = facts.get("q_factor", 1)   # Flap после выпуска: налог на продажу токенами (1 − sellTax)
     # Bankr: impact по котировкам V4Quoter (impact_curve), не по резерву; невыкупаемый вестинг дева (locked) —
-    # в его доле, но не в q (продать сейчас нельзя). Pons и Flap: None — прежний путь
+    # в его доле, но не в q (продать сейчас нельзя); dev — доля дева из контрактов (правило и при limited).
+    # Pons и Flap: None — прежний путь
     curve, locked = facts.get("impact_curve"), facts.get("locked")
     sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"), reserve_ok=reserve_ok,
-                 limited=limited, q_factor=q_factor, limited_note=limited_note, impact_curve=curve, locked=locked)
+                 limited=limited, q_factor=q_factor, limited_note=limited_note, impact_curve=curve, locked=locked,
+                 dev=facts.get("dev"))
     reason = _reason(sc, base)
     # probably rug: только вычисления на уже собранных данных, без запросов в сеть
     # и только если DANGER вызван поведенческим жёстким правилом (не одиночным китом в тонком пуле)

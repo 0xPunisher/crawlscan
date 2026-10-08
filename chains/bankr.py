@@ -14,9 +14,10 @@ Dump impact и probably rug — по котировкам V4Quoter (eth_call, б
 Вестинг дева (15% сапплая на контракте токена у большинства запусков): контракт — не холдер, остаток приписан
 бенефициару (деву); ещё не разблокированное в q для impact не входит (продать сейчас нельзя).
 Исследование и замеры — scripts/probe_bankr.py (локально), раздел «Bankr» в DEV_NOTES."""
-import os
+import math, os, re, threading, time
+from concurrent.futures import ThreadPoolExecutor
 
-from chains import flap
+from chains import flap, priority
 from chains import robinhood as ch
 import detect as d
 
@@ -72,6 +73,24 @@ QUOTE_STEP = 101                   # q × 101 / 100
 QUOTE_GAS = 150_000_000            # 40 котировок с хуком ~25–30M газа (замер CHOP/AUREON: 24M на 32)
 ENTRY_TOL = 0.06                   # покупатель получил не больше выхода свопа (+6%: округления, налог роутера) ...
 ENTRY_MIN = 0.15                   # ... и не меньше 15% (антиснайп до 80% + комиссия роутера до ~5%)
+
+# история (history): переводов на сделку ~6–8 (PoolManager ↔ модуль ↔ инициализатор, роутеры) — окна Flap почти не
+# находят кошельков (musebook: 2.4M переводов, 19K холдеров, топ входил всю жизнь токена). Поэтому:
+#   — до FULL_MAX_LOGS (по оценке первой волны) — вся история параллельно в скане (CHOP 95K: ~6 с, ~37 HTTP);
+#   — больше — индекс балансов: строится в фоне (полное чтение, BACKGROUND_RPS), следующие сканы — индекс + хвост.
+FULL_MAX_LOGS = 150_000            # в скане читаем целиком, если оценка истории не больше
+READ_CHUNKS = 16                   # первая волна: до стольких участков блоков параллельно (оценка объёма по ним) ...
+READ_CHUNK_MIN = 20_000            # ... но не короче стольких блоков (хвост индекса — обычно один запрос)
+READ_TARGET = 8_000                # переполненный участок делим на подучастки по стольку логов (по плотности подсказки)
+WAVE_MAX = 3.0                     # секунд: с потолком (cap) первая волна дольше не ждёт — история велика (у плотных
+                                   # участков RPC отвечает «Query timeout» по ~10 с: musebook ждал волну 14 с)
+READ_WORKERS = 12                  # запросов getLogs одновременно (ответ на 10K логов идёт ~1.5–2 с; RPS — общий лимитер)
+INDEX_MAX = 20                     # токенов в индексе (LRU)
+EDGES_MAX = 64                     # входящих отправителей вне инфраструктуры на адрес в индексе (у ботов — тысячи)
+_SUGGEST = re.compile(r"\[(0x[0-9a-fA-F]+),\s*(0x[0-9a-fA-F]+)\]")
+_INDEX = {}                        # token -> {"head", "bal", "first", "sold", "edges", "logs", "built"}; порядок = LRU
+_INDEX_BUILDING = set()
+_INDEX_LOCK = threading.Lock()
 
 _STATE = {}    # token -> getAssetData (Bankr навсегда: интегратор не меняется)
 _LAUNCH = {}   # token -> запуск: блок, дев, PoolKey, получатели комиссий, вестинг (не меняется — навсегда)
@@ -247,9 +266,242 @@ def impact_curve(qs, raw):
     return out
 
 
+def _read_all(token, lo, hi, sink, cap=None, until=None):
+    """Все переводы токена в [lo, hi] параллельно -> (логов, дочитано). sink(переводы) — под замком, по страницам.
+    Первая волна — до READ_CHUNKS равных участков (не короче READ_CHUNK_MIN блоков); ответ «больше 10K логов» с подсказкой [lo, b] — читаем [lo, b],
+    остаток делим по плотности подсказки на подучастки ~READ_TARGET логов (параллельно), без подсказки — пополам.
+    cap — оценка объёма (прочитанное + плотность × блоки переполненных участков первой волны; растёт по мере ответов)
+    больше cap или первая волна не ответила за WAVE_MAX — стоп, не дочитано. until — срок (unix-время): вышел — стоп, не дочитано."""
+    if lo > hi:
+        return 0, True
+    lock, done = threading.Lock(), threading.Event()
+    st = {"pending": 0, "logs": 0, "est": 0, "wave": 0, "stop": False}
+    bg = priority.is_background()
+    pool = ThreadPoolExecutor(max_workers=READ_WORKERS, thread_name_prefix=f"{priority.BG}-bankr" if bg else "bankr")
+
+    def submit(a, b, wave=False):
+        with lock:
+            st["pending"] += 1
+            st["wave"] += wave
+        pool.submit(run, a, b, wave)
+
+    def finish(wave, est):
+        with lock:
+            st["est"] += est
+            st["wave"] -= wave
+            if cap is not None and (st["est"] > cap or st["logs"] > cap):
+                st["stop"] = True
+            st["pending"] -= 1
+            if st["pending"] == 0 or st["stop"]:
+                done.set()
+
+    def run(a, b, wave):
+        est = 0
+        try:
+            if st["stop"] or (until is not None and time.time() > until):
+                st["stop"] = True
+                return
+            flt = {"fromBlock": hex(a), "toBlock": hex(b), "address": token, "topics": [ch.TRANSFER_TOPIC]}
+            try:
+                logs = ch.rpc("eth_getLogs", [flt])
+            except RuntimeError as e:
+                m = _SUGGEST.search(str(e))
+                if m and int(m.group(1), 16) == a and a <= int(m.group(2), 16) < b:
+                    c = int(m.group(2), 16)
+                    dens = flap.PAGE_LOGS / (c - a + 1)
+                    est = int(dens * (b - a + 1))
+                    k = max(1, math.ceil(dens * (b - c) / READ_TARGET))
+                    step = (b - c) // k + 1
+                    submit(a, c)
+                    for i in range(k):
+                        x = c + 1 + i * step
+                        if x <= b:
+                            submit(x, min(b, x + step - 1))
+                elif b > a and ch._is_window_error(str(e).lower()):
+                    submit(a, (a + b) // 2)
+                    submit((a + b) // 2 + 1, b)
+                else:
+                    raise
+                return
+            if len(logs) >= flap.PAGE_LOGS and b > a:   # ответ мог быть обрезан — пополам
+                submit(a, (a + b) // 2)
+                submit((a + b) // 2 + 1, b)
+                est = len(logs) * 2
+                return
+            page = [t for t in map(flap._transfer, logs) if t]
+            est = len(page)
+            with lock:
+                st["logs"] += len(page)
+                if not st["stop"]:
+                    sink(page)
+        except Exception:
+            st["stop"] = True
+            raise
+        finally:
+            finish(wave, est if wave else 0)
+
+    step = (hi - lo) // max(1, min(READ_CHUNKS, (hi - lo + 1) // READ_CHUNK_MIN)) + 1
+    with lock:
+        st["pending"] += 1   # держим, пока раздаём первую волну
+    for i in range(READ_CHUNKS):
+        a = lo + i * step
+        if a <= hi:
+            submit(a, min(hi, a + step - 1), wave=True)
+    finish(False, 0)
+    if cap is not None:   # первая волна долго — история велика: не ждём (оценке без её ответов не на что опереться)
+        t_wave = time.time() + WAVE_MAX
+        while not done.wait(0.05):
+            with lock:
+                if st["wave"] > 0 and time.time() > t_wave:
+                    st["stop"] = True
+                    break
+            if until is not None and time.time() > until:
+                break
+    if not st["stop"]:
+        done.wait(None if until is None else max(0.0, until - time.time()))
+    pool.shutdown(wait=False, cancel_futures=True)
+    with lock:
+        complete = st["pending"] == 0 and not st["stop"]
+        if not complete:
+            st["stop"] = True
+        return st["logs"], complete
+
+
+def _key(t):
+    return t["block"], t["log_index"]
+
+
+def _index_new():
+    return {"bal": {}, "first": {}, "sold": {}, "edges": {}, "head": 0, "logs": 0, "built": time.time()}
+
+
+def _index_apply(ix, transfers, excluded):
+    """Переводы -> индекс (порядок любой: страницы приходят параллельно): балансы; первый вход адреса (самый ранний
+    полученный перевод); первая продажа (самый ранний перевод на рынок); входящие от адресов вне инфраструктуры
+    (прямые переводы между холдерами и раздатчики, до EDGES_MAX отправителей на адрес — самые ранние)."""
+    bal, first, sold, edges = ix["bal"], ix["first"], ix["sold"], ix["edges"]
+    for t in transfers:
+        f, to = t["frm"], t["to"]
+        bal[f] = bal.get(f, 0) - t["amount"]
+        bal[to] = bal.get(to, 0) + t["amount"]
+        if to in excluded:
+            if to in MARKET and f not in MARKET and (f not in sold or _key(t) < _key(sold[f])):
+                sold[f] = t
+            continue
+        if to not in first or _key(t) < _key(first[to]):
+            first[to] = t
+        if f not in excluded:
+            e = edges.setdefault(to, {})
+            if f in e and _key(t) < _key(e[f]) or f not in e and len(e) < EDGES_MAX:
+                e[f] = t
+    ix["logs"] += len(transfers)
+
+
+def _index_put(token, ix):
+    with _INDEX_LOCK:
+        _INDEX.pop(token, None)
+        _INDEX[token] = ix
+        while len(_INDEX) > INDEX_MAX:
+            _INDEX.pop(next(iter(_INDEX)))
+
+
+def build_index(token, launch_block, excluded):
+    """Индекс токена: вся история с запуска (в фоне: BACKGROUND_RPS, уступает живым сканам). Индекс считается по
+    страницам — все переводы в памяти не держим (musebook: 2.4M)."""
+    head = ch.block_number()
+    ix = _index_new()
+    n, complete = _read_all(token, launch_block, head, lambda page: _index_apply(ix, page, excluded))
+    if complete:
+        ix.update(head=head, built=time.time())
+        _index_put(token, ix)
+    return complete
+
+
+def _index_start(token, launch_block, excluded):
+    """Построение индекса в фоновом потоке (один на токен)."""
+    with _INDEX_LOCK:
+        if token in _INDEX_BUILDING or token in _INDEX:
+            return False
+        _INDEX_BUILDING.add(token)
+
+    def job():
+        t0 = time.time()
+        try:
+            with priority.background():
+                ok = build_index(token, launch_block, excluded)
+            print(f"bankr: index {token} {'built' if ok else 'incomplete'} in {time.time() - t0:.0f}s", flush=True)
+        except Exception as e:
+            print(f"bankr: index {token} failed: {type(e).__name__}: {e}", flush=True)
+        finally:
+            with _INDEX_LOCK:
+                _INDEX_BUILDING.discard(token)
+
+    threading.Thread(target=job, name=f"{priority.BG}-bankr-index", daemon=True).start()
+    return True
+
+
+def _from_index(token, ix, supply, excluded):
+    """Под _INDEX_LOCK: (переводы топ-20 для движка, base, балансы инфраструктуры). Переводы — из индекса: первый
+    вход, первая продажа, входящие от адресов вне инфраструктуры — без запросов (их getLogs у ботов — сотни тысяч)."""
+    bal = ix["bal"]
+    held = {a: v for a, v in bal.items() if v > 0 and a not in excluded}
+    top = sorted(held, key=lambda a: -held[a])[:flap.HOLDERS_N]
+    out = {}
+    for a in top:
+        for t in [ix["first"].get(a), ix["sold"].get(a)] + list(ix["edges"].get(a, {}).values()):
+            if t:
+                out[(t["tx"], t["log_index"])] = t
+    base = {"supply": supply, "circulating": sum(held.values()), "holders_total": len(held), "balances": held}
+    return sorted(out.values(), key=_key), base, {a: bal.get(a, 0) for a in excluded if a != ZERO}
+
+
+def history(token, launch_block, supply, excluded, deadline=None):
+    """Переводы для скана: (transfers, base или None, сведения, балансы инфраструктуры или None) — контракт flap.history.
+    indexed — есть индекс: хвост после его головы, балансы точные (top_exact); переводы топ-20 — из индекса (вход,
+    продажи, прямые переводы, раздатчики) без запросов. full — история не больше FULL_MAX_LOGS: вся, параллельно
+    (base None, как у Pons); из неё же индекс для следующих сканов. Иначе — окна Flap (limited) и фоновое построение
+    индекса."""
+    until = (deadline - flap.HISTORY_RESERVE) if deadline is not None else None
+    t0 = time.time()
+    head = ch.block_number()
+    with _INDEX_LOCK:
+        ix = _INDEX.get(token)
+        start = ix["head"] if ix else None
+    if ix is not None:
+        tail = []
+        n, complete = _read_all(token, start + 1, head, tail.extend, until=until)
+        if complete:
+            with _INDEX_LOCK:   # параллельный скан мог уже применить часть хвоста — только блоки после головы
+                cur = ix["head"]
+                _index_apply(ix, [t for t in tail if t["block"] > cur], excluded)
+                ix["head"] = max(cur, head)
+                age = round(time.time() - ix["built"])
+                transfers, base, infra = _from_index(token, ix, supply, excluded)
+                logs = ix["logs"]
+            _index_put(token, ix)
+            info = {"mode": "indexed", "logs": logs, "tail_logs": n, "index_age_s": age, "holder_logs": len(transfers),
+                    "holder_logs_complete": True, "top_exact": True, "coverage": 1.0,
+                    "seconds": {"tail": round(time.time() - t0, 1)}}
+            return transfers, base, info, infra
+    trs = []
+    n, complete = _read_all(token, launch_block, head, trs.extend, cap=FULL_MAX_LOGS, until=until)
+    if complete:
+        trs.sort(key=_key)
+        ix = _index_new()
+        _index_apply(ix, trs, excluded)
+        ix["head"] = head
+        _index_put(token, ix)
+        return trs, None, {"mode": "full", "logs": n, "seconds": {"read": round(time.time() - t0, 1)}}, None
+    probe_s = round(time.time() - t0, 1)
+    started = _index_start(token, launch_block, excluded)
+    transfers, base, info, infra = flap.history(token, launch_block, supply, excluded, deadline)
+    info = dict(info, index="building", index_started=started, full_probe_logs=n, full_probe_s=probe_s)
+    return transfers, base, info, infra
+
+
 def token_facts(token, launch, deadline=None):
     """Факты для движка (общий контракт сетей) + "impact_curve", "locked" и "bankr" (данные лаунчпада).
-    История — как у Flap (flap.history: до 20 000 переводов целиком, больше — окнами в бюджете скана).
+    История — history(): индекс балансов + хвост, вся история параллельно (до FULL_MAX_LOGS) или окна Flap (limited).
     Вестинг: остаток на контракте токена — деву (бенефициарам пропорционально выделенному), в обороте и в доле
     дева; "locked" — ещё не разблокированное (нельзя продать сейчас), движок вычитает его из q для impact.
     Котировки V4Quoter (impact) и доступное в вестинге — один HTTP-батч. reserve — баланс PoolManager (только для
@@ -258,7 +510,7 @@ def token_facts(token, launch, deadline=None):
     st = _STATE.get(token) or detect(token) or {}
     supply = ch.token_supply(token)
     market, excluded = _sets(token, launch)
-    transfers, base, hist, infra_bal = flap.history(token, launch["block"], supply, excluded, deadline)
+    transfers, base, hist, infra_bal = history(token, launch["block"], supply, excluded, deadline)
     if base is None:
         base = d.supply_base(transfers, supply, excluded)
         infra = {}
@@ -274,13 +526,16 @@ def token_facts(token, launch, deadline=None):
     vest = launch.get("vesting") or {}
     total = sum(vest.values())
     bens = sorted(vest)
+    devw = launch.get("deployer")
+    owners = sorted(set(bens) | ({devw} if devw else set()))
     if hist.get("mode") == "windowed":
-        missing = [b for b in bens if b not in base["balances"]]
-        if missing:   # окнами: бенефициар мог не попасть в кандидаты — его баланс на кошельке читаем отдельно
+        missing = [b for b in owners if b not in base["balances"]]
+        if missing:   # неполная история: дев/бенефициар мог не попасть в кандидаты — баланс кошелька отдельно
             for b, v in flap.balances(token, missing).items():   # (оборот окнами = сапплай − инфраструктура:
                 if v > 0:                                         #  этот баланс в нём уже есть)
                     base["balances"][b] = v
                     base["holders_total"] += 1
+    wallet = {a: base["balances"].get(a, 0) for a in owners}   # на кошельках (до приписанного вестинга): точно
     left = min(in_contract, total)   # на контракте токена бывает и присланное сверх вестинга — это не дева
     remaining = {b: left * vest[b] // total for b in bens} if total else {}
     for b, v in remaining.items():   # остаток вестинга — деву: в обороте и в его балансе
@@ -303,6 +558,11 @@ def token_facts(token, launch, deadline=None):
     pair_info = {"kind": "eth" if is_eth else "token", "address": pair,
                  "symbol": "ETH" if is_eth else (ch.token_meta(pair).get("symbol") or None)}
     circ = base["circulating"]
+    dev = None
+    if devw:   # доля дева из контрактов: кошелёк (balanceOf / полная история) + вестинг; продать сейчас — без locked
+        dev = {"wallet": devw, "wallet_balance": wallet.get(devw, 0), "vesting": remaining.get(devw, 0),
+               "sellable": wallet.get(devw, 0) + min(available.get(devw, 0), remaining.get(devw, 0)),
+               "share_supply": (wallet.get(devw, 0) + remaining.get(devw, 0)) / supply if supply else 0.0}
     info = {"pool_id": launch["pool_id"], "pool_key": launch["pool_key"], "pair": pair_info,
             "dev": launch.get("deployer"), "creator": launch.get("creator"),
             "fee_recipients": sorted(excluded & ({a for a, _ in launch.get("beneficiaries") or []}
@@ -312,12 +572,13 @@ def token_facts(token, launch, deadline=None):
                         "locked": sum(locked.values()), "beneficiaries": {b: vest[b] for b in bens},
                         "total_share_supply": total / supply if supply else 0.0,
                         "unlocked_share_supply": unlocked / supply if supply else 0.0},
+            "dev_holding": dev,
             "impact_source": "v4_quoter" if curve else None,
             "impact_curve": [[q / circ if circ else 0.0, i] for q, i in curve],
             "pm_reserve": reserve, "infra": sorted({token, PM, INITIALIZER, HOOK, AIRLOCK}), "history": hist}
     return {"supply": supply, "transfers": transfers, "excluded": excluded, "market": market,
             "reserve": reserve, "reserve_ok": bool(curve), "base": base, "impact_curve": curve,
-            "locked": locked, "bankr": info}
+            "locked": locked, "dev": dev, "bankr": info}
 
 
 def _user_swaps(logs, launch):
