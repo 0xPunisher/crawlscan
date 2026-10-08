@@ -33,10 +33,9 @@ VAULT_PORTAL = "0xe9f7ab7de8fb8756acbb6a1cd13316a43308197b"
 TAX_HELPER = "0xb10bd2672ae63735d677164a54b573a016f0203c"
 V2_FACTORY = "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f"      # Uniswap V2 Factory: пары после выпуска
 SHADOW_FACTORY = "0x0d1ebb179cdbca88d74c923c4255cb2b17474afd"  # «теневые» пары налоговых токенов (зеркало кривой)
-LOCKERS = {  # сторонние локеры/вестинг (своего локера Flap на Robinhood нет, docs.flap.sh); залоченное — в "locked"
-    "0x548129a58bc230549df7f9e33f27e77f6779ff0f",  # Sablier Lockup (NFT SAB-LOCKUP): TasQ — вся покупка дева
-    "0x37c434ec1c54e360900e3a022247d5e20137c1de",  # Sablier: периферия создания стримов (токены идут через неё)
-}
+# сторонние локеры/вестинг сети (своего локера Flap на Robinhood нет, docs.flap.sh): ch.LOCKERS — Sablier
+# (TasQ — вся покупка дева); залоченное — в "locked" результата, в early buyers — статус locked
+LOCKERS = set(ch.LOCKERS)
 INFRA = LOCKERS | {  # не холдеры ни для какого токена Flap (сверх ch.INFRA)
     PORTAL, VAULT_PORTAL, TAX_HELPER, V2_FACTORY, SHADOW_FACTORY,
     "0xd3421b1b616a72bb88993a0cf75709bb8d532cc1",  # Trigger Service

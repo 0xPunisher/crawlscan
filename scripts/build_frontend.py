@@ -1583,7 +1583,7 @@ rep("':'$'+v;", "':'$'+(v>=10?Math.round(v):v.toFixed(2));")
 # ---------------------------------------------------------------------------
 EARLY_JS = r"""// ---- early buyers (GET /api/early after the verdict) ----
 const EARLY_ST={holding_all:['holding all',G],added:['added',G],sold_part:['sold part',A],sold_all:['sold all','#8a959c'],
-  moved:['moved',A],burned:['burned','#8a959c']};
+  moved:['moved',A],burned:['burned','#8a959c'],locked:['locked',G]};
 const eChip=(t,c,title)=>`<span${title?` title="${escH(title)}"`:''} style="font-family:${MONO_F};font-size:10.5px;padding:2px 7px;border-radius:3px;white-space:nowrap;color:${c};border:1px solid ${rgba(c,0.4)};background:${rgba(c,0.08)}">${escH(t)}</span>`;
 const ePct=v=>{v=(v||0)*100; return v===0?'0%':v<0.01?'<0.01%':v<1?v.toFixed(2)+'%':v.toFixed(1)+'%';};
 const eAfter=b=>{const s=b.dt_s; if(s==null) return '+'+b.block_offset+' blk'; return s<60?`+${s}s`:s<3600?`+${Math.round(s/60)}m`:`+${(s/3600).toFixed(1)}h`;};
@@ -1610,7 +1610,9 @@ function earlyHtml(st,ca,W){
     const addr=ex?`<a href="${escH(ex.account(b.wallet))}" target="_blank" rel="noopener" style="color:#dfe5e8">${escH(eShort(b.wallet))}</a>`:`<span style="color:#dfe5e8">${escH(eShort(b.wallet))}</span>`;
     // мелкий перевод (меньше 20% купленного) статуса не меняет — виден долей на чипе
     const small=b.status!=='moved'&&b.moved_share_supply>0?` · ${ePct(b.moved_share_supply)} moved`:'';
-    const chips=[eChip(s[0]+(b.status==='moved'&&b.moved_to&&b.moved_to[0]?' → '+eShort(b.moved_to[0]):small),s[1],
+    // заблокировано в известном локере (Sablier и т.п.) — не выход: «locked in Sablier»
+    const lockTxt=b.status==='locked'?' in '+((b.locked_in&&b.locked_in.length)?b.locked_in.join(', '):'a locker'):'';
+    const chips=[eChip(s[0]+lockTxt+(b.status==='moved'&&b.moved_to&&b.moved_to[0]?' → '+eShort(b.moved_to[0]):small),s[1],
       small&&b.moved_to&&b.moved_to.length?'moved to '+b.moved_to.map(eShort).join(', '):'')];
     if(b.dev) chips.push(eChip('dev',RD));
     (b.scan_flags||[]).forEach(f=>chips.push(eChip(f,f==='operator'?RD:A)));

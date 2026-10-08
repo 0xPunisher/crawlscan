@@ -382,7 +382,7 @@ def record_early(body):
         return
     try:
         if body.get("available") and not body.get("error") and not body.get("stale_at") and body.get("summary"):
-            alerts_store().set_early(body["token"], body["summary"]["now_share_supply"])
+            alerts_store().set_early(body["token"], body["summary"].get("held_share_supply", body["summary"]["now_share_supply"]))   # локер — не выход
     except Exception as e:
         print(f"alerts: early share not saved: {type(e).__name__}: {e}", flush=True)
 

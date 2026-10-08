@@ -154,4 +154,4 @@ def known_share(chain, token):
         hit = _STATUS.get((chain, token))
     if not hit or time.time() - hit[0] >= STALE_TTL:
         return None
-    return d.early_report(hit[1], hit[2])["summary"]["now_share_supply"]
+    return d.early_report(hit[1], hit[2])["summary"]["held_share_supply"]   # блокировка в локере — не выход

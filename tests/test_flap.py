@@ -684,6 +684,19 @@ class TestF2Early(unittest.TestCase):
         self.assertEqual((st[W[3]]["sold"], st[W[3]]["moved"]), (1_000_000 * E18, {}))
         self.assertEqual(st[W[4]]["moved"], {W[11]: 2_000_000 * E18})
 
+    def test_dev_lock_in_sablier_is_locked(self):
+        self.c = Chain(status=flap.STATUS_DEX, buy_tax=0, sell_tax=0, circ=flap.SUPPLY)
+        periphery = "0x37c434ec1c54e360900e3a022247d5e20137c1de"
+        self.c.tr(DEV, periphery, 95_000_000 * E18, "0xlock")         # как TasQ: дев запер покупку в Sablier
+        with self.c.patched():
+            data = flap.early_buyers(FTOKEN, 20)
+            st = flap.early_status(FTOKEN, data["buyers"], launch=data["launch"])
+        rep = d.early_report(data, st)
+        dev = rep["buyers"][0]
+        self.assertEqual((dev["wallet"], dev["dev"], dev["status"], dev["locked_in"], dev["moved_to"]),
+                         (DEV, True, "locked", ["Sablier"], []))
+        self.assertIn(periphery, flap.LOCKERS)                          # Flap: Sablier — по-прежнему не холдер
+
     def test_not_flap(self):
         c = Chain()
         with c.patched():
@@ -739,6 +752,8 @@ class TestF2Frontend(unittest.TestCase):
         self.assertIn("flapOn:!!d.flap", t)                                     # флаг — из /api/config
         self.assertIn("state={flapOn:false,", t)                                # по умолчанию выключено
         self.assertIn("chart appears after the token graduates", t)
+        self.assertIn("locked:['locked',G]", t)                                  # early buyers: «locked in Sablier»
+        self.assertIn("' in '+((b.locked_in&&b.locked_in.length)", t)
         self.assertIn("'https://flap.sh/robinhood/'", t)
         self.assertIn("flap:!!this.state.flapOn&&x.launchpad==='flap'", t)      # лента: бейдж только при флаге
         self.assertIn("this.state.flapOn&&this.state.view==='scan'", t)         # шапка: только при флаге

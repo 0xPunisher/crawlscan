@@ -450,11 +450,16 @@ EARLY_EXIT_DUST = 0.01  # осталось меньше 1% купленного 
 EARLY_MOVED_MIN = 0.20  # статус moved — только если на другие кошельки ушло столько купленного или больше
 
 
-def early_status(bought, now, sold=0, moved=0, burned=0):
-    """holding_all | added | sold_part | sold_all | moved | burned.
+def early_status(bought, now, sold=0, moved=0, burned=0, locked=0):
+    """holding_all | added | sold_part | sold_all | moved | burned | locked.
+    locked — токены в известном локере (Sablier и т.п.): не выход. Заблокировано не меньше EARLY_MOVED_MIN купленного
+    и не меньше проданного, переведённого и сожжённого — locked; иначе заблокированное считается как на кошельке.
     Перевод меньше EARLY_MOVED_MIN купленного — мелкий: статус по остальной части (купленное минус переведённое),
     сам перевод виден только долей (moved_share_supply). Вышел (осталось ≤ EARLY_EXIT_DUST) или вышел частично —
     по тому, чего больше: продано, переведено, сожжено (поровну — продажа)."""
+    if locked and locked >= bought * EARLY_MOVED_MIN and locked >= max(sold, moved, burned):
+        return "locked"
+    now += locked
     big_move = moved >= bought * EARLY_MOVED_MIN
     base = bought if big_move else bought - moved
     if now > base:
@@ -472,7 +477,9 @@ def early_report(data, status, flags=None):
     """{"buyers": [...], "summary": {...}} из early_buyers (data) и early_status (status) адаптера.
     flags — {кошелёк: [флаги скана]} для кошельков, которые скан проверял (топ-20); остальным scan_flags = None.
     Доли — от сапплая. dt_s — секунды от запуска, block_offset — блоков (Solana: слотов) от запуска.
-    summary.same_destination — адреса, куда перевели токены 2+ покупателя (признак одного владельца)."""
+    summary.same_destination — адреса, куда перевели токены 2+ покупателя (признак одного владельца).
+    Заблокированное в локере (locked, locked_in — у адаптеров Robinhood) — не выход: такой покупатель держит,
+    summary.held_share_supply = на кошельках + в локерах (now_share_supply — только на кошельках)."""
     launch, supply = data["launch"], status["supply"] or 1
     rows, dest = [], {}
     for i, b in enumerate(data["buyers"], 1):
@@ -486,17 +493,19 @@ def early_report(data, status, flags=None):
             "dt_s": b["ts"] - launch["ts"] if b.get("ts") is not None and launch.get("ts") is not None else None,
             "block_offset": b["block"] - launch["block"],
             "bought_share_supply": b["bought"] / supply, "now_share_supply": st["now"] / supply,
-            "status": early_status(b["bought"], st["now"], st["sold"], moved, st["burned"]),
+            "status": early_status(b["bought"], st["now"], st["sold"], moved, st["burned"], st.get("locked", 0)),
             "sold_share_supply": st["sold"] / supply, "moved_share_supply": moved / supply,
             "burned_share_supply": st["burned"] / supply,
+            "locked_share_supply": st.get("locked", 0) / supply, "locked_in": list(st.get("locked_in") or []),
             "moved_to": sorted(st["moved"], key=lambda a: -st["moved"][a]),
             "scan_flags": flags.get(w) if flags is not None and w in flags else None,
             "partial": st["partial"]})
-    held = [r for r, b in zip(rows, data["buyers"]) if status["wallets"].get(r["wallet"], {}).get("now", 0)
-            > b["bought"] * EARLY_EXIT_DUST]
+    keep = lambda w: (status["wallets"].get(w) or {}).get("now", 0) + (status["wallets"].get(w) or {}).get("locked", 0)
+    held = [r for r, b in zip(rows, data["buyers"]) if keep(r["wallet"]) > b["bought"] * EARLY_EXIT_DUST]
     return {"buyers": rows, "summary": {
         "buyers": len(rows), "exited": len(rows) - len(held), "holding": len(held),
         "now_share_supply": sum(r["now_share_supply"] for r in rows),
+        "held_share_supply": sum(r["now_share_supply"] + r["locked_share_supply"] for r in rows),
         "bought_share_supply": sum(r["bought_share_supply"] for r in rows),
         "same_destination": [{"to": to, "wallets": ws} for to, ws in dest.items() if len(ws) >= 2],
         "partial": any(r["partial"] for r in rows)}}
