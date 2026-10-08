@@ -217,6 +217,48 @@ class TestDetect(unittest.TestCase):
         self.assertIn("soft: one holder could move price −64% (thin liquidity)", s.score["gates"])
         self.assertFalse([g for g in s.score["gates"] if not g.startswith("soft:")])   # жёстких правил нет
 
+    def lone_whale(self, **kw):
+        """Как test_j: один кошелёк с 20% сапплая в тонком пуле (падение 64%), свойства кошелька — kw."""
+        s = Scenario()
+        whale = s.wallet(2000, **kw)
+        s.normal(19, share=50)
+        rest = SUPPLY - 2000 - sum(50 + 7 * i for i in range(19))
+        s.move(POOL, 3000)
+        s.move(LOCKER, rest - 3000)
+        s.run()
+        self.assertEqual(s.ops[0]["wallets"], [whale])
+        self.assertAlmostEqual(s.score["metrics"]["impact"], 1 - 0.6 ** 2)
+        return s
+
+    def assert_hard_impact(self, s):
+        self.assertEqual(s.score["band"], "DANGER")
+        self.assertTrue(any(g.startswith("biggest operator could move price −64% if sold") for g in s.score["gates"]))
+        self.assertFalse([g for g in s.score["gates"] if "one holder" in g])
+
+    def test_j_lone_deployer_stays_danger(self):
+        self.assert_hard_impact(self.lone_whale(addr=DEPLOYER))
+
+    def test_j_lone_virgin_stays_danger(self):
+        s = self.lone_whale(distinct=0)
+        self.assertTrue(s.signals[s.ops[0]["wallets"][0]]["virgin"])
+        self.assert_hard_impact(s)
+
+    def test_j_lone_transfer_stays_danger(self):
+        self.assert_hard_impact(self.lone_whale(kind="transfer", via=BUNDLER))
+
+    def test_j_lone_unread_history_stays_danger(self):
+        # история не прочитана в бюджет — «имеет историю» не доказано: не смягчаем
+        self.assert_hard_impact(self.lone_whale(distinct=None))
+
+    def test_j_lone_entry_not_found_stays_danger(self):
+        self.assert_hard_impact(self.lone_whale(kind=None))
+
+    def test_j_lone_short_history_buyer_is_soft(self):
+        # история короткая (1–3 монеты), но есть, и сам купил — независимый: мягкое правило
+        s = self.lone_whale(distinct=2)
+        self.assertEqual(s.score["band"], "RISKY")
+        self.assertIn("soft: one holder could move price −64% (thin liquidity)", s.score["gates"])
+
     def test_j2_linked_operator_impact_is_danger(self):
         # те же 20% сапплая, но у двух кошельков, купивших одной транзакцией (доказанная связь) → DANGER
         s = Scenario()

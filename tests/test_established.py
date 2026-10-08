@@ -472,6 +472,17 @@ class TestDexScreenerFallback(unittest.TestCase):
         self.assertNotEqual(res["band"], "TOO_ESTABLISHED")
         self.assertEqual(res["market_pool"], young[0]["pairAddress"])
 
+    def test_gt_liquidity_is_sum_of_pools(self):
+        """Ликвидность шапки — сумма reserve_in_usd пулов (total_reserve_in_usd токена бывает меньше суммы
+        его же пулов: $CrawlScan $7.8K при пуле $43.8K); у пулов нет резервов — total_reserve_in_usd."""
+        d = gt_response(liq=7_790.0)
+        d["included"] = [{"type": "pool", "attributes": {"address": "a", "reserve_in_usd": "43798.67"}},
+                         {"type": "pool", "attributes": {"address": "b", "reserve_in_usd": "5499.15"}},
+                         {"type": "pool", "attributes": {"address": "c"}},
+                         {"type": "token", "attributes": {"address": "t", "reserve_in_usd": "1e9"}}]
+        self.assertAlmostEqual(market._gt_market(d)["liquidity_usd"], 49_297.82)
+        self.assertEqual(market._gt_market(gt_response(liq=7_790.0))["liquidity_usd"], 7_790.0)
+
     def test_parse_dexscreener(self):
         sol = ts.SOL_TOKEN
         with mock.patch.object(market, "_ds", return_value=ds_response(token=sol, chain="solana")) as ds:

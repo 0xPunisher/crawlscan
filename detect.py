@@ -45,7 +45,9 @@ SCALE = {
     "concentration": (0.25, 0.70),
 }
 GATE_IMPACT = 0.50         # стоп: продажа крупнейшего оператора уронит цену на ≥ 50% — если он из 2+ связанных
-                           # кошельков; один независимый кошелёк (тонкий пул) — мягкое правило, band не хуже RISKY
+                           # кошельков или один, но подозрительный (деплоер, virgin, без прочитанной истории, вход
+                           # переводом или не найден); независимый покупатель с историей (тонкий пул) — мягкое
+                           # правило, band не хуже RISKY
 LIQ_MIN_USD = 1_000        # мягкое правило: ликвидность из шапки < $1,000 → band не лучше RISKY
 GATE_VIRGIN = 0.80         # стоп: девственных ≥ 80% топа ...
 GATE_VIRGIN_MIN = 5        # ... минимум 5 холдеров (без деплоера)
@@ -335,8 +337,12 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     parts = {k: parts[k] for k in WEIGHTS}
     gates = []
     thin = impact is not None and impact >= GATE_IMPACT and not limited
-    linked_big = len(big["wallets"]) > 1   # доказанные связи или стая: поведенческий сигнал, не просто тонкий пул
-    if thin and linked_big:
+    # смягчаем только независимого покупателя с историей: один кошелёк, сам купил, история прочитана и не пуста,
+    # не деплоер; связанные кошельки или подозрительный одиночка — жёсткое правило, как раньше
+    lone = big["wallets"][0] if len(big["wallets"]) == 1 else None
+    s0 = signals.get(lone) if lone else None
+    independent = bool(s0) and s0["kind"] == "buy" and not s0["is_deployer"] and not s0["virgin"] and not s0["unread"]
+    if thin and not independent:
         gates.append(f"biggest operator could move price −{m['impact'] * 100:.0f}% if sold "
                      f"(≥ {GATE_IMPACT * 100:.0f}%; {m['operator'] * 100:.1f}% of float)")
     if len(non_dev) >= GATE_VIRGIN_MIN and m["virgin"] >= GATE_VIRGIN:
@@ -345,7 +351,7 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
         gates.append(f"{m['transfer'] * 100:.1f}% of float received by transfer (≥ {GATE_TRANSFER * 100:.0f}%)")
     hard = bool(gates)
     total = round(sum(parts.values()))
-    if thin and not linked_big:   # один независимый кошелёк в тонком пуле: не DANGER сам по себе
+    if thin and independent:   # один независимый покупатель с историей в тонком пуле: не DANGER сам по себе
         gates.append(f"soft: one holder could move price −{m['impact'] * 100:.0f}% (thin liquidity)")
     groups = [o for o in ops if o["level"] == "pack"
               or (o["level"] == "proven" and len(o["wallets"]) >= SOFT_GATE_WALLETS)]

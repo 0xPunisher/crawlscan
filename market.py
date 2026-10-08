@@ -181,9 +181,15 @@ def _gt_market(d, now=None):
     pools = [(f((p.get("attributes") or {}).get("reserve_in_usd")) or 0.0, (p.get("attributes") or {}).get("address"))
              for p in d.get("included") or [] if p.get("type") == "pool"]
     pools = [p for p in pools if p[1]]
+    # ликвидность — сумма reserve_in_usd пулов из ответа (top_pools), как у DexScreener (сумма пар); поле токена
+    # total_reserve_in_usd бывает сильно меньше суммы его же пулов ($CrawlScan 2026-10-08: $7.8K при пуле $43.8K).
+    # Нет резервов у пулов — запасной путь: total_reserve_in_usd
+    reserves = [f((p.get("attributes") or {}).get("reserve_in_usd")) for p in d.get("included") or []
+                if p.get("type") == "pool"]
+    reserves = [r for r in reserves if r is not None]
     return {"name": a.get("name"), "ticker": a.get("symbol"), "price_usd": f(a.get("price_usd")),
             "mcap_usd": f(a.get("market_cap_usd")) or f(a.get("fdv_usd")), "fdv_usd": f(a.get("fdv_usd")),
-            "liquidity_usd": f(a.get("total_reserve_in_usd")),
+            "liquidity_usd": sum(reserves) if reserves else f(a.get("total_reserve_in_usd")),
             "vol24h_usd": f((a.get("volume_usd") or {}).get("h24")),
             "age_days": round(((now or time.time()) - min(born)) / 86400, 1) if born else None,
             "pool": max(pools)[1] if pools else None, "source": "gt"}
