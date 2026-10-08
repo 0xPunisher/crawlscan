@@ -13,7 +13,7 @@ python3 server.py
 
 Open http://localhost:8000 and paste a Pons V2 token address, or go straight to `http://localhost:8000/?ca=0x...`.
 
-Optional environment variables: `PORT` (default 8000) and `CRAWLER_RPS` (requests per second to the RPC, default 8).
+Optional environment variables: `PORT` (default 8000), `CRAWLER_RPS` (requests per second to the RPC, default 8), `MAX_CONCURRENT` (scans at the same time, default 3), `BACKGROUND_RPS` (separate request rate for background work such as reward checks and alert rechecks, which always waits for live scans; default 2, `0` turns it off) and `TRANSFER_CACHE_ENABLED` (keep token transfer history between scans and read only the new part; off by default, `TRANSFER_CACHE_MAX` caps the number of cached transfers, default 200000).
 
 To run a scan from the terminal and watch the events:
 

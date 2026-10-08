@@ -12,6 +12,7 @@ import os, re, sys, threading, time, traceback
 from datetime import datetime, timedelta, timezone
 
 import rewards as rw
+from chains import priority
 from chains import robinhood as ch
 
 DEFAULT_TOKEN = "0x19dCb63C4d2F29A6f077F094a4f858fC790145e1"
@@ -398,7 +399,8 @@ class Scheduler(threading.Thread):
             log(f"ignored invalid DEV_WALLETS entries: {len(self.cfg['invalid_dev_wallets'])}")
         while not self._stop.is_set():
             try:
-                self.tick()
+                with priority.background():   # уступает живым сканам, свой лимит BACKGROUND_RPS
+                    self.tick()
             except Exception:
                 log("tick failed: " + traceback.format_exc(limit=3).replace("\n", " | "))
             self._stop.wait(TICK)

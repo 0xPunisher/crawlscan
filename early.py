@@ -14,6 +14,7 @@ import threading, time
 import detect as d
 import engine
 import market
+from chains import priority
 
 N = 20                    # покупателей
 BUDGET = 10.0             # секунд на расчёт (сеть)
@@ -26,6 +27,18 @@ CACHE_MAX = 500           # токенов в кэше
 _BUYERS, _STATUS, _INFLIGHT = {}, {}, {}   # key -> (ts, data); key -> (ts, data, status); key -> Event
 _lock = threading.Lock()
 _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+
+def background(chain, token):
+    """Расчёт без истории живого скана (адаптер её хранит, но скана моложе SCAN_TTL нет) — фоновая работа:
+    уступает живым сканам и идёт под BACKGROUND_RPS (server: priority.background() вместо live())."""
+    a = engine.CHAINS[chain]
+    return hasattr(a, "scan_history") and a.scan_history(token) is None
+
+
+def budget(a):
+    """Бюджет расчёта: у фонового — во столько раз больше, во сколько BACKGROUND_RPS ниже лимита адаптера."""
+    return BUDGET * (priority.background_scale(a.RPS) if priority.is_background() else 1.0)
 
 
 def clear_cache():
@@ -54,7 +67,7 @@ def _out(base, hit, flags, stale=False):
 def _compute(a, key, token):
     """(ts, data, status) или None (токен не с лаунчпада). Исключения — наверх (сбой сети)."""
     t0, r0 = time.time(), a.REQUESTS[0]
-    deadline = t0 + BUDGET
+    deadline = t0 + budget(a)
     with _lock:
         b = _BUYERS.get(key)
     data = b[1] if b and t0 - b[0] < BUYERS_TTL else None
@@ -93,7 +106,7 @@ def get(token, flags=None):
         if owner:
             ev = _INFLIGHT[key] = threading.Event()
     if not owner:   # тот же токен уже считается — ждём его результат
-        ev.wait(BUDGET + 5)
+        ev.wait(BUDGET * priority.background_scale(a.RPS) + 5)   # владелец мог считать в фоне
         with _lock:
             hit = _STATUS.get(key)
         if hit and time.time() - hit[0] < STATUS_TTL:

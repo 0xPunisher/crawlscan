@@ -179,21 +179,15 @@ def associated_token_account(owner, mint, token_program=TOKEN):
 # ---------------------------------------------------------------------------
 # RPC
 # ---------------------------------------------------------------------------
-_MIN_GAP = 1.0 / RPS
-_rl_lock = threading.Lock()
-_next_slot = [0.0]
+_LIMIT = priority.Throttle(RPS)                          # общий лимитер адаптера
+_BG_LIMIT = priority.Throttle(priority.background_rps())  # свой лимит фоновой работы (BACKGROUND_RPS)
 
 
 def _rate_limit():
     # Разносит HTTP-запросы во времени. Вес — один HTTP, а не элемент батча: Alchemy Solana
     # ограничивает compute units, и батч из 100 getTransaction проходит без 429; per-item 429 ретраим.
-    priority.wait_turn()   # фоновая перепроверка alerts уступает живым сканам
-    with _rl_lock:
-        now = time.time()
-        wait = _next_slot[0] - now
-        if wait > 0:
-            time.sleep(wait)
-        _next_slot[0] = max(now, _next_slot[0]) + _MIN_GAP
+    # фон уступает живым сканам и не быстрее BACKGROUND_RPS
+    priority.rate_limit(_LIMIT, _BG_LIMIT)
 
 
 REQUESTS = [0]  # счётчик HTTP-запросов к RPC (включая ретраи)

@@ -202,9 +202,11 @@ def scan(token, emit=lambda e: None):
     исключённые адреса, рынок, резерв токенов ликвидности (reserve) и, если сеть знает
     балансы напрямую (Solana), base."""
     t0 = time.time()
-    deadline = t0 + BUDGET
     chain, token = chain_of(token)
     a = CHAINS[chain]
+    # фоновый скан (перепроверка alerts) идёт под своим лимитом BACKGROUND_RPS: бюджет растёт во столько же раз,
+    # чтобы прочитать столько же кошельков, сколько живой скан
+    deadline = t0 + BUDGET * (priority.background_scale(a.RPS) if priority.is_background() else 1.0)
     r0 = a.REQUESTS[0]
     seq = [0]
 

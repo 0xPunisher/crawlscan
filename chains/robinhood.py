@@ -69,19 +69,13 @@ def _is_rate_limited(body):
     return False
 
 RPS = int(os.environ.get("CRAWLER_RPS", "8"))  # потолок запросов/сек глобально
-_MIN_GAP = 1.0 / RPS
-_rl_lock = threading.Lock()
-_next_slot = [0.0]
+_LIMIT = priority.Throttle(RPS)                          # общий лимитер адаптера
+_BG_LIMIT = priority.Throttle(priority.background_rps())  # свой лимит фоновой работы (BACKGROUND_RPS)
 def _rate_limit(n=1):
     # разносит запросы во времени, чтобы не превышать лимит провайдера (QuickNode 15 rps и т.п.) и не ловить 429.
     # n — вес запроса: провайдеры считают каждый элемент батча отдельным вызовом.
-    priority.wait_turn()   # фоновая перепроверка alerts уступает живым сканам
-    with _rl_lock:
-        now = time.time()
-        wait = _next_slot[0] - now
-        if wait > 0:
-            time.sleep(wait)
-        _next_slot[0] = max(now, _next_slot[0]) + _MIN_GAP * n
+    # фон (перепроверки alerts, награды, early без скана) уступает живым сканам и не быстрее BACKGROUND_RPS
+    priority.rate_limit(_LIMIT, _BG_LIMIT, n)
 
 
 REQUESTS = [0]  # счётчик HTTP-запросов к RPC (включая ретраи)
@@ -331,14 +325,132 @@ def token_facts(token, launch):
     Виртуальная добавка кривой Pons только на стороне котировки (phantomQuote()); токенная
     сторона цены — tokenReserve() == реальный баланс кривой, поэтому берём реальный баланс.
     reserve_ok = False, если ни кривая, ни pool manager не держат токен (0): резерв не измерен, а не «ликвидности нет»."""
-    transfers = get_token_transfers(token, launch["block"])
-    supply = token_supply(token)
+    transfers, supply = load_transfers(token, launch["block"])
     remember_scan(token, launch, transfers, supply)
     pools = {launch["curve"].lower(), V4_POOL_MGR}
     reserve = sum(t["amount"] * ((t["to"] in pools) - (t["frm"] in pools)) for t in transfers)
     return {"supply": supply, "transfers": transfers, "excluded": excluded_addresses(launch["curve"]),
             "market": market_addresses(launch["curve"]), "reserve": max(0, reserve), "reserve_ok": reserve > 0,
             "base": None}
+
+
+# ---------------------------------------------------------------------------
+# кэш истории переводов токена между сканами (TRANSFER_CACHE_ENABLED, по умолчанию выключен)
+# ---------------------------------------------------------------------------
+TRANSFER_CACHE_ENABLED = os.environ.get("TRANSFER_CACHE_ENABLED", "").strip().lower() in ("1", "true", "yes")
+TRANSFER_CACHE_MAX = 200_000   # переводов во всех токенах (LRU по токенам); ~670 байт на перевод — до ~130 МБ
+TRANSFER_CACHE_LAG = 20        # последние блоки у головы при следующем скане читаются заново (нода могла отстать)
+ZERO_ADDR = "0x" + "0" * 40
+_TCACHE = {}                   # token -> {"from", "head", "transfers", "n", "last"}; порядок вставки = LRU
+_TCACHE_SIZE = [0]
+_TCACHE_LOCK = threading.Lock()
+TCACHE_STATS = {"hit": 0, "miss": 0, "invalid": 0, "evicted": 0}
+
+try:
+    TRANSFER_CACHE_MAX = int(os.environ.get("TRANSFER_CACHE_MAX", "").strip() or TRANSFER_CACHE_MAX)
+except ValueError:
+    pass
+
+
+def _key(t):
+    return (t["block"], t["log_index"])
+
+
+def _supply_matches(transfers, supply):
+    """История полная: выпущено (с 0x0) минус сожжено (на 0x0) == totalSupply (ERC20 + Burnable Pons V2)."""
+    return sum(t["amount"] for t in transfers if t["frm"] == ZERO_ADDR) - \
+        sum(t["amount"] for t in transfers if t["to"] == ZERO_ADDR) == supply
+
+
+def _tcache_drop(token):
+    e = _TCACHE.pop(token, None)
+    if e is not None:
+        _TCACHE_SIZE[0] -= e["n"]
+    return e
+
+
+def _tcache_get(token, from_block):
+    """Проверенная запись кэша или None. Повреждённая (не тот запуск, длина или последний перевод не совпали,
+    порядок нарушен, перевод после прочитанной головы) — удаляется. Списки в кэше не меняются: проверка — без замка."""
+    with _TCACHE_LOCK:
+        e = _TCACHE.pop(token, None)
+        if e is not None:
+            _TCACHE[token] = e            # в конец: недавно использован
+    if e is None:
+        return None
+    trs = e["transfers"]
+    if (e["from"] == from_block and len(trs) == e["n"] and (_key(trs[-1]) if trs else None) == e["last"]
+            and (not trs or trs[-1]["block"] <= e["head"]) and all(_key(a) < _key(b) for a, b in zip(trs, trs[1:]))):
+        return e
+    with _TCACHE_LOCK:
+        if _TCACHE.get(token) is e:
+            _tcache_drop(token)
+    TCACHE_STATS["invalid"] += 1
+    return None
+
+
+def _tcache_put(token, from_block, transfers, head):
+    """История до прочитанной головы head. Больше TRANSFER_CACHE_MAX — не храним; дальше вытесняются давно
+    использованные токены. Параллельный скан уже записал историю свежее — оставляем её."""
+    with _TCACHE_LOCK:
+        old = _TCACHE.get(token)
+        if old is not None and old["head"] > head:
+            return
+        _tcache_drop(token)
+        if len(transfers) > TRANSFER_CACHE_MAX:
+            return
+        _TCACHE[token] = {"from": from_block, "head": head, "transfers": transfers, "n": len(transfers),
+                          "last": _key(transfers[-1]) if transfers else None}
+        _TCACHE_SIZE[0] += len(transfers)
+        while _TCACHE_SIZE[0] > TRANSFER_CACHE_MAX:
+            _tcache_drop(next(iter(_TCACHE)))   # самый давно использованный
+            TCACHE_STATS["evicted"] += 1
+
+
+def tcache_clear():
+    with _TCACHE_LOCK:
+        _TCACHE.clear()
+        _TCACHE_SIZE[0] = 0
+
+
+def cached_transfers(token, from_block):
+    """Вся история токена из кэша (то, что прочитал последний скан) или None."""
+    e = _tcache_get(token.lower(), from_block)
+    return e and e["transfers"]
+
+
+def load_transfers(token, from_block):
+    """(переводы с from_block до головы, totalSupply) для скана. Кэш выключен — как раньше: вся история getLogs.
+    Включён и есть проверенная история токена — читается только хвост: с блока head − TRANSFER_CACHE_LAG прошлого
+    чтения (у головы нода могла отдать не всё — эти блоки перечитываются) до новой головы. Склейка сверяется
+    с totalSupply, не сошлось — полное чтение. Полное чтение, не сошедшееся с totalSupply, в кэш не идёт."""
+    token = token.lower()
+    if not TRANSFER_CACHE_ENABLED:
+        transfers = get_token_transfers(token, from_block)
+        return transfers, token_supply(token)
+    head = block_number()
+    e = _tcache_get(token, from_block)
+    transfers = None
+    if e is not None and e["head"] <= head:
+        upto = max(from_block - 1, e["head"] - TRANSFER_CACHE_LAG)
+        cut = len(e["transfers"])
+        while cut and e["transfers"][cut - 1]["block"] > upto:
+            cut -= 1
+        transfers = e["transfers"][:cut] + get_token_transfers(token, upto + 1, head)
+        supply = token_supply(token)
+        if _supply_matches(transfers, supply):
+            TCACHE_STATS["hit"] += 1
+        else:
+            transfers = None
+            TCACHE_STATS["invalid"] += 1
+    if transfers is None:
+        TCACHE_STATS["miss"] += e is None
+        transfers = get_token_transfers(token, from_block, head)
+        supply = token_supply(token)
+        if not _supply_matches(transfers, supply):
+            return transfers, supply
+    _tcache_put(token, from_block, transfers, head)
+    return transfers, supply
 
 
 def get_token_transfers(token, from_block, to_block=None, frm=None, to=None):
@@ -734,19 +846,33 @@ _SCAN_LOCK = threading.Lock()
 
 def remember_scan(token, launch, transfers, supply):
     """Полная история переводов с запуска, которую прочитал скан (token_facts): early buyers берёт
-    покупателей, балансы и выходы из неё и дочитывает только хвост после неё."""
+    покупателей, балансы и выходы из неё и дочитывает только хвост после неё.
+    Кэш переводов включён и история в нём — здесь только отметка скана, сама история — из кэша (одна копия)."""
+    token = token.lower()
+    if TRANSFER_CACHE_ENABLED:
+        with _TCACHE_LOCK:
+            if (_TCACHE.get(token) or {}).get("transfers") is transfers:
+                transfers = None
     with _SCAN_LOCK:
-        _SCAN[token.lower()] = (time.time(), dict(launch), transfers, supply)
+        _SCAN[token] = (time.time(), dict(launch), transfers, supply)
         if len(_SCAN) > SCAN_MAX:
             for k, _ in sorted(_SCAN.items(), key=lambda kv: kv[1][0])[:len(_SCAN) - SCAN_MAX]:
                 del _SCAN[k]
 
 
 def scan_history(token):
-    """(launch, transfers, supply) из последнего скана моложе SCAN_TTL или None."""
+    """(launch, transfers, supply) из последнего скана моложе SCAN_TTL или None.
+    История из кэша переводов вытеснена или повреждена — None (early buyers читает сам)."""
     with _SCAN_LOCK:
         hit = _SCAN.get(token.lower())
-    return hit[1:] if hit and time.time() - hit[0] < SCAN_TTL else None
+    if not hit or time.time() - hit[0] >= SCAN_TTL:
+        return None
+    launch, transfers, supply = hit[1:]
+    if transfers is None:
+        transfers = cached_transfers(token, launch["block"])
+        if transfers is None:
+            return None
+    return launch, transfers, supply
 
 
 def _with_tail(token, transfers):
