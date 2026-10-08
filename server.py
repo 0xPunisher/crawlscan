@@ -54,9 +54,10 @@ user agent crawlscan-bot — SCAN_RATE_BOT_PER_MIN, верный X-Alerts-Secret
 При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан;
 изменился важный показатель — уведомление подписчикам в Telegram (alerts_notify.py, свой поток, TG_BOT_TOKEN);
 плановые перепроверки отслеживаемых токенов — alerts_recheck.py (свой поток, уступает живым сканам).
-Не больше 3 сканов одновременно (остальные ждут слота), в очереди — не больше SCAN_QUEUE_MAX; сверх очереди или
-при памяти процесса выше MEMORY_SOFT_LIMIT_MB (memguard.py) новый скан — 503 busy с Retry-After (кэш и уже идущий
-скан того же токена отдаются как раньше). Сбой базы в /api/rewards/* и /api/draw/* — 503, процесс и сканы живут.
+Не больше 3 сканов одновременно (остальные ждут слота), в очереди — не больше SCAN_QUEUE_MAX; сверх очереди — 503 busy
+с Retry-After (кэш и уже идущий скан того же токена отдаются как раньше). Память процесса (memguard.py) выше мягкого
+порога после сброса кэшей — сканы до MAX_CONCURRENT без очереди, выше жёсткого — 503 busy. Раз в минуту в лог
+строка с памятью, числом активных сканов и счётчиками за минуту. Сбой базы в /api/rewards/* и /api/draw/* — 503, процесс и сканы живут.
 PORT из env, по умолчанию 8000.
 """
 import hashlib, hmac, json, os, re, threading, time, uuid
@@ -126,6 +127,7 @@ _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
 SCAN_QUEUE_MAX = 6         # новых сканов ждут слота сверх MAX_CONCURRENT (env SCAN_QUEUE_MAX); дальше — 503 busy
 SCAN_QUEUE_MAX = _env_int("SCAN_QUEUE_MAX", SCAN_QUEUE_MAX)
 _ACTIVE = [0]              # сканов идёт или ждёт слота (под _lock)
+_STATS = {"started": 0, "busy": 0}   # новых сканов и отказов busy с прошлой строки memguard (под _lock)
 RETRY_AFTER = 5            # секунд: заголовок Retry-After у 503 busy
 BUSY = {"error": "busy", "message": "Scanner is busy, try again in a few seconds"}
 # частота новых сканов с одного IP (CF-Connecting-IP): обычный клиент / бот CrawlScan по user agent;
@@ -214,6 +216,20 @@ def _reuse(token, now):
     return None
 
 
+def _busy(why):
+    with _lock:
+        _STATS["busy"] += 1
+    raise Busy(why)
+
+
+def scan_stats():
+    """Для строки memguard раз в минуту: (активных сканов, хвост строки); счётчики обнуляются."""
+    with _lock:
+        active, started, busy = _ACTIVE[0], _STATS["started"], _STATS["busy"]
+        _STATS["started"] = _STATS["busy"] = 0
+    return active, f", last min: {started} started, {busy} busy"
+
+
 def start_scan(token, client=None):
     """job_id: свежий кэш по токену или уже идущий скан того же токена, иначе новый.
     Новый — только если в очереди есть место и память ниже порога, иначе Busy; и если client (ключ, лимит в минуту)
@@ -230,18 +246,19 @@ def start_scan(token, client=None):
             return jid
         active = _ACTIVE[0]
     if active >= MAX_CONCURRENT + SCAN_QUEUE_MAX:
-        print(f"scan: busy, {active} scans running or queued", flush=True)
-        raise Busy("queue")
-    if memguard.over(live=active):   # вне _lock: сброс кэшей и gc не держат остальные запросы
-        raise Busy("memory")
+        _busy("queue")
+    if memguard.over(live=active, cap=MAX_CONCURRENT):   # вне _lock: сброс кэшей и gc не держат остальные запросы
+        _busy("memory")
     with _lock:
         jid = _reuse(token, now)
         if jid:
             return jid
         if _ACTIVE[0] >= MAX_CONCURRENT + SCAN_QUEUE_MAX:
+            _STATS["busy"] += 1
             raise Busy("queue")
         _rate_take(client, now)
         _ACTIVE[0] += 1
+        _STATS["started"] += 1
         jid = uuid.uuid4().hex[:12]
         JOBS[jid] = {"token": token, "chain": chain, "events": [], "done": False, "result": None, "error": None,
                      "ts": now}
@@ -958,6 +975,8 @@ def start_alerts_rechecker():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"rh-crawler on http://0.0.0.0:{port}", flush=True)
+    print(memguard.status_line(0), flush=True)
+    memguard.start_monitor(scan_stats)
     start_draw_scheduler()
     start_rewards_scheduler()
     start_alerts_rechecker()
