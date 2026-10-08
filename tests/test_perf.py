@@ -378,13 +378,56 @@ class TestBackground(unittest.TestCase):
                 bgw.assert_called_once()
                 self.assertEqual(mw.call_count, 2)
 
-    def test_rewards_scheduler_is_background(self):
+    def test_rewards_scheduler_is_critical(self):
+        """Планировщик наград (розыгрыш, сжигания, выплаты) — критичный: не фон, не ждёт живых сканов."""
         seen = []
         sch = rs.Scheduler(store=None, cfg={"token": "x", "dev_wallets": [], "invalid_dev_wallets": []})
         with mock.patch.dict(os.environ, {"BACKGROUND_RPS": "2"}), \
-                mock.patch.object(sch, "tick", side_effect=lambda: (seen.append(priority.is_background()), sch.stop())):
+                mock.patch.object(sch, "tick", side_effect=lambda: (
+                    seen.append((priority.is_critical(), priority.is_background())), sch.stop())):
             sch.run()
-        self.assertEqual(seen, [True])
+        self.assertEqual(seen, [(True, False)])
+        self.assertFalse(priority.is_critical())
+
+    def test_critical_does_not_wait_for_live_scans(self):
+        """Живые сканы идут непрерывно: критичный запрос проходит сразу (свой лимит и общий), фоновый — ждёт."""
+        for a in (ch, fakes.engine.sol):
+            with mock.patch.object(a._BG_LIMIT, "wait") as bgw, mock.patch.object(a._CRIT_LIMIT, "wait") as cw, \
+                    mock.patch.object(a._LIMIT, "wait") as mw, mock.patch.object(priority, "YIELD_MAX", 0.3), \
+                    priority.live():
+                t0 = time.time()
+                with priority.critical(), priority.background():   # critical сильнее background
+                    a._rate_limit()
+                self.assertLess(time.time() - t0, 0.2)
+                cw.assert_called_once()
+                bgw.assert_not_called()
+                mw.assert_called_once()
+                t0 = time.time()
+                with priority.background():
+                    if priority.is_background():
+                        a._rate_limit()
+                        self.assertGreaterEqual(time.time() - t0, 0.25)   # фон уступил живому скану
+                cw.assert_called_once()
+
+    def test_critical_rps_env(self):
+        with mock.patch.dict(os.environ, {"CRITICAL_RPS": ""}):
+            self.assertEqual(priority.critical_rps(), 2.0)
+        with mock.patch.dict(os.environ, {"CRITICAL_RPS": "5"}):
+            self.assertEqual(priority.critical_rps(), 5.0)
+        with mock.patch.dict(os.environ, {"CRITICAL_RPS": "0"}):
+            self.assertEqual(priority.critical_rps(), 0)
+        with mock.patch.dict(os.environ, {"CRITICAL_RPS": "x"}):
+            self.assertEqual(priority.critical_rps(), 2.0)
+
+    def test_rewards_scheduler_ignores_memory_guard(self):
+        """Защита по памяти розыгрыш не блокирует: планировщик наград memguard не спрашивает."""
+        import memguard
+        sch = rs.Scheduler(store=None, cfg={"token": "x", "dev_wallets": [], "invalid_dev_wallets": []})
+        with mock.patch.object(memguard, "over", side_effect=AssertionError("memguard")) as over, \
+                mock.patch.object(rs, "pending_days", return_value=[]), \
+                mock.patch.object(sch, "_next_check", 10 ** 12):
+            sch.tick(now=1)
+        over.assert_not_called()
 
     def test_background_scan_budget_scaled(self):
         deadlines = []

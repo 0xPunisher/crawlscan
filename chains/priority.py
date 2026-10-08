@@ -1,10 +1,12 @@
 """Приоритет живых сканов над фоновой работой в лимитерах RPS адаптеров.
 
 Фоновая работа — поток с именем на BG (поток перепроверок alerts и пул кошельков, который движок запускает
-из фона) или код внутри background() (планировщик наград, /api/early без истории живого скана).
+из фона) или код внутри background() (/api/early без истории живого скана).
 Перед каждым запросом в сеть такой поток ждёт (wait_turn), пока идут живые сканы пользователей
 (live() — счётчик в server), и проходит свой отдельный лимит BACKGROUND_RPS (Throttle адаптера).
 Живые потоки не ждут никогда: для них — одна проверка потока.
+Критичная работа (critical(): планировщик наград — розыгрыш, сжигания, выплаты) живым сканам не уступает и не
+считается фоном: проходит свой лимит CRITICAL_RPS (гарантированная доля) и общий лимит адаптера.
 RATE_LIMITED в адаптерах — сколько раз нода ответила rate-limit (для паузы перепроверок).
 """
 import os, threading, time
@@ -16,16 +18,34 @@ BACKGROUND_RPS = 2.0      # по умолчанию env BACKGROUND_RPS: запр
 _cond = threading.Condition()
 _live = [0]
 _tls = threading.local()
+CRITICAL_RPS = 2.0        # по умолчанию env CRITICAL_RPS: запросов/сек критичной работы адаптера; 0 — без своего лимита
 YIELDS = [0]              # сколько раз фоновые запросы уступили живым сканам
 
 
+def is_critical():
+    return getattr(_tls, "crit", False)
+
+
 def is_background():
+    if is_critical():
+        return False
     return getattr(_tls, "bg", False) or threading.current_thread().name.startswith(BG)
 
 
 @contextmanager
+def critical():
+    """Критичная работа в текущем потоке (планировщик наград): не ждёт живых сканов, свой лимит CRITICAL_RPS."""
+    prev = getattr(_tls, "crit", False)
+    _tls.crit = True
+    try:
+        yield
+    finally:
+        _tls.crit = prev
+
+
+@contextmanager
 def background():
-    """Фоновая работа в текущем потоке (планировщик наград, /api/early без истории скана).
+    """Фоновая работа в текущем потоке (/api/early без истории скана).
     BACKGROUND_RPS=0 — выключатель: такая работа не фоновая, как раньше (перепроверки alerts — фон всегда)."""
     prev = getattr(_tls, "bg", False)
     _tls.bg = prev or background_rps() > 0
@@ -73,6 +93,15 @@ def background_rps():
     return v if v > 0 else 0.0
 
 
+def critical_rps():
+    """CRITICAL_RPS из env (пусто или неверно — дефолт; 0 или меньше — своего лимита нет, только общий)."""
+    try:
+        v = float(os.environ.get("CRITICAL_RPS", "").strip() or CRITICAL_RPS)
+    except ValueError:
+        return CRITICAL_RPS
+    return v if v > 0 else 0.0
+
+
 def background_scale(rps):
     """Во сколько раз фон медленнее живого скана под лимитом адаптера rps: бюджеты фона растягиваются на столько же,
     чтобы фоновый скан успевал прочитать столько же, сколько живой. Своего лимита нет или он не ниже rps — 1."""
@@ -100,8 +129,14 @@ class Throttle:
             time.sleep(slot - now)
 
 
-def rate_limit(main, bg, n=1):
-    """Общий путь лимитеров адаптеров: фон уступает живым сканам и проходит свой лимит bg, затем — общий main."""
+def rate_limit(main, bg, n=1, crit=None):
+    """Общий путь лимитеров адаптеров: критичная работа — свой лимит crit и общий main, без ожидания живых сканов;
+    фон уступает живым сканам и проходит свой лимит bg, затем — общий main."""
+    if is_critical():
+        if crit is not None:
+            crit.wait(n)
+        main.wait(n)
+        return
     wait_turn()
     if is_background() and bg.gap:
         bg.wait(n)

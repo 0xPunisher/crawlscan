@@ -50,7 +50,8 @@ Alerts, подписки для бота (только при ALERTS_ENABLED=tru
 для Cloudflare; у статуса наград поле now всегда текущее); сбой не кэшируется.
 Новых сканов с одного IP (CF-Connecting-IP) — не больше SCAN_RATE_PER_MIN в минуту, иначе 429 rate_limited с Retry-After;
 user agent crawlscan-bot — SCAN_RATE_BOT_PER_MIN, верный X-Alerts-Secret (наш бот) — без лимита.
-Лента /api/recent кэшируется 15 секунд; запись — после завершения скана, сбой базы скан не ломает.
+Лента /api/recent кэшируется 15 секунд (запись скана сбрасывает кэш; чтение, пересёкшееся с записью, в кэш не идёт);
+запись — после завершения скана, сбой базы скан не ломает (в лог «recent: not saved»).
 При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан;
 изменился важный показатель — уведомление подписчикам в Telegram (alerts_notify.py, свой поток, TG_BOT_TOKEN);
 плановые перепроверки отслеживаемых токенов — alerts_recheck.py (свой поток, уступает живым сканам).
@@ -110,6 +111,7 @@ RECENT_DEFAULT = 12        # записей в ленте по умолчани�
 JOBS = {}                  # job_id -> {"token", "chain", "events", "done", "result", "error", "ts"}
 CHARTS = {}                # token -> {"ok": (ts, удачный ответ) | None, "miss": (ts, пустой ответ) | None}
 RECENT = {}                # limit -> (ts, ответ /api/recent)
+_RECENT_GEN = [0]          # поколение ленты: +1 при каждой записи скана (под _lock)
 BY_TOKEN = {}              # token -> job_id последнего скана
 _lock = threading.Lock()
 
@@ -409,6 +411,7 @@ def record_recent(result):
     try:
         if recent_store().record(result):
             with _lock:
+                _RECENT_GEN[0] += 1
                 RECENT.clear()
     except Exception as e:
         print(f"recent: not saved: {type(e).__name__}: {e}", flush=True)
@@ -649,13 +652,15 @@ def get_recent(limit):
         hit = RECENT.get(limit)
         if hit and now - hit[0] < RECENT_TTL:
             return hit[1]
+        gen = _RECENT_GEN[0]
     try:
         out = {"items": recent_store().recent(limit)}
     except Exception as e:
         print(f"recent: not read: {type(e).__name__}: {e}", flush=True)
         return {"items": []}
     with _lock:
-        RECENT[limit] = (now, out)
+        if _RECENT_GEN[0] == gen:   # пока читали, скан записался — этот ответ уже старый, в кэш не кладём
+            RECENT[limit] = (now, out)
     return out
 
 
