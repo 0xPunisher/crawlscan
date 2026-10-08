@@ -22,7 +22,7 @@ if ROOT not in sys.path:
 import env                                          # noqa: E402
 import trade                                        # noqa: E402
 from bot import text as T                           # noqa: E402
-from bot.api import AlertsOff, ApiError, CrawlScan, Rejected   # noqa: E402
+from bot.api import AlertsOff, ApiError, Busy, CrawlScan, Rejected   # noqa: E402
 from bot.tg import Telegram, TelegramError          # noqa: E402
 
 WORKERS = 3            # сканов одновременно на весь бот
@@ -377,6 +377,9 @@ class Bot:
                 self.sleep(self.poll_every)
         except Rejected as e:
             return T.rejected(addr, str(e)), None
+        except Busy:
+            self.log(f"api {addr}: site busy")
+            return T.SITE_BUSY, None
         except ApiError as e:
             self.log(f"api {addr}: {e}")
             return T.UNREACHABLE, None

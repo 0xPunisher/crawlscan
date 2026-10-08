@@ -46,14 +46,16 @@ def _ago(sec):
 
 class Rechecker:
     def __init__(self, store, scan, after, notify, live_count=priority.live_count, rate_limited=lambda: 0,
-                 yields=lambda: priority.YIELDS[0], clock=time.time, sleep=time.sleep, log=None, cfg=None):
+                 yields=lambda: priority.YIELDS[0], clock=time.time, sleep=time.sleep, log=None, cfg=None,
+                 memory_high=lambda: False):
         """store() → AlertsStore; scan(token) → результат движка; after(result) — путь живого скана без ленты;
         notify(chat_id, text, markup) — служебное сообщение (или None: без TG_BOT_TOKEN не пишем);
-        rate_limited() — счётчик ответов rate-limit RPC (сумма по адаптерам)."""
+        rate_limited() — счётчик ответов rate-limit RPC (сумма по адаптерам);
+        memory_high() — память процесса выше порога (memguard): перепроверки не запускаются."""
         cfg = cfg or config()
         self.store, self.scan, self.after, self.notify = store, scan, after, notify
         self.live_count, self.rate_limited, self.yields = live_count, rate_limited, yields
-        self.clock, self.sleep = clock, sleep
+        self.clock, self.sleep, self.memory_high = clock, sleep, memory_high
         self.log = log or (lambda m: print(m, flush=True))
         self.min_age, self.max_per_hour = cfg["recheck_min"] * 60, cfg["max_per_hour"]
         self.starts = collections.deque()     # clock() начала перепроверок за последний час
@@ -108,6 +110,9 @@ class Rechecker:
             live = self.live_count()
             if live:
                 self.log(f"alerts: recheck skipped: {live} live scan{'s' if live > 1 else ''}, {left} waiting")
+                return
+            if self.memory_high():
+                self.log(f"alerts: recheck skipped: memory high, {left} waiting")
                 return
             self.recheck(q, left, now)
 

@@ -120,6 +120,7 @@ const CHAIN_NAME={robinhood:'Robinhood',solana:'Solana'};
 const SAMPLES=__SAMPLES__;
 const PLACEHOLDER={robinhood:'0x… token contract address',solana:'token mint address (base58)'};
 const SOON='Solana support is coming soon';
+const BUSY_TEXT='Scanner is busy, try again in a few seconds';   // = server.BUSY.message
 const EXPLORER={solana:{account:a=>'https://solscan.io/account/'+a,token:a=>'https://solscan.io/token/'+a}};   // Robinhood: ссылок нет
 const FULL={};   // короткий адрес -> полный (ссылки на эксплорер)
 const shortAddr=a=>{const c=chainOf(a); if(!c) return a; const s=a.slice(0,c==='robinhood'?6:4)+'…'+a.slice(-4); FULL[s]=a; return s;};
@@ -234,7 +235,9 @@ rep('''  // Fake player. To go live: replace with e.g. new EventSource('/crawl?c
         const d=await r.json().catch(()=>({}));
         if(!alive()) return;
         if(!r.ok&&d.error===SOON){this.soon(ca); return;}   // Solana выключена: сообщение под полем, не поломка
-        if(!r.ok||!d.job){fail(d.error||('http '+r.status)); step(); return;}
+        // перегрузка (503 busy) или шлюз не дождался сервера (502/504) — «занято, повторите», а не поломка
+        if(!r.ok&&(d.error==='busy'||[502,503,504].includes(r.status))){fail(d.message||BUSY_TEXT); step(); return;}
+        if(!r.ok||!d.job){fail(d.message||d.error||('http '+r.status)); step(); return;}   // 429: текст из message
         feed.job=d.job; poll(); step();
       }catch(err){fail('server unreachable'); step();}
     })();
@@ -724,10 +727,10 @@ rep("  blank(ca){return {", r"""  loadDraw(){   // статус розыгрыш
       });
     });
   }
-  drawTick(){   // таймер раз в секунду; после розыгрыша и раз в 5 минут — свежие данные
+  drawTick(){   // таймер раз в секунду; после розыгрыша и раз в 5 минут — свежие данные (не в скрытой вкладке)
     const d=this.state.draw, now=Date.now(); if(!d) return;
     const since=now-this._drawAt, past=Date.parse(d.st.next_draw)<now-60000;
-    if((past&&since>60000)||since>300000) this.loadDraw();
+    if(!document.hidden&&((past&&since>60000)||since>300000)) this.loadDraw();
     this.setState({drawNow:now});
   }
   runVerify(){
@@ -931,13 +934,13 @@ rep("  blank(ca){return {", r"""  loadRewards(){   // статус Rewards & Bur
     }
     this.setState(s); this.rwTick(st);
   }
-  rwTick(fresh){   // таймеры раз в секунду; свежий статус раз в минуту, в нуле таймера — каждые 10 секунд
+  rwTick(fresh){   // таймеры раз в секунду; свежий статус раз в минуту, в нуле таймера — раз в 30 с; скрытая вкладка — без запросов
     const st=fresh||this.state.rw, now=Date.now(); if(!st) return;
     const b=this._rwBurn, d=this._rwDraw;
     while(now>=b.target&&burnedFor(st,b.target)) b.target+=b.slot;
     if(now>=d.target&&st.last_draw&&st.last_draw.day>=d.day){d.target=Date.parse(st.next_draw); d.day=st.next_draw_day;}
     const busy=now>=b.target||now>=d.target, since=now-this._rwAt;
-    if(since>(busy?10000:60000)) this.loadRewards();
+    if(!document.hidden&&since>(busy?30000:60000)) this.loadRewards();
     this.setState({rwNow:now});
   }
   copyText(key,text){   // copy с галочкой на 1.5 с
@@ -1362,8 +1365,9 @@ rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:no
 # Строка: тикер, сеть, адрес, скор и вердикт цветом полосы, «probably rug», «2m ago»; клик — скан (?ca=),
 # клик по адресу — копирует полный адрес (скан не открывает).
 # ---------------------------------------------------------------------------
-rep("  blank(ca){return {", r"""  loadRecent(){   // лента «recently scanned»: только при открытой вкладке
-    if(document.hidden) return;
+rep("  blank(ca){return {", r"""  loadRecent(){   // лента «recently scanned»: только при открытой вкладке и не чаще раза в 20 с
+    const t=Date.now(); if(document.hidden||t-(this._recentAt||0)<20000) return;
+    this._recentAt=t;
     fetch('/api/recent?limit=12').then(r=>r.ok?r.json():null)
       .then(d=>{if(d&&Array.isArray(d.items)) this.setState({recent:d.items});}).catch(()=>{});
   }
