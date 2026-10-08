@@ -59,6 +59,7 @@ TOO_ESTABLISHED = "TOO_ESTABLISHED"
 ESTABLISHED = {"min_age_days": 30.0, "min_liquidity_usd": 750_000.0, "min_mcap_usd": 10_000_000.0}
 ESTABLISHED_HEADLINE = "This token is too established for CrawlScan."
 LIMITED_NOTE = " — market data unavailable, older token: holder signals are limited"
+PARTIAL_NOTE = " — long history, top holders partially read: holder signals are limited"   # Flap: история окнами
 ESTABLISHED_TEXT = ("CrawlScan is built for fresh memecoins. On large, older tokens the top holders are mostly "
                     "exchanges and big liquidity pools: tokens reach exchange wallets by transfer, not by buying, "
                     "and liquidity is spread across many pools, so holder patterns don't mean what they mean "
@@ -299,7 +300,8 @@ def _sold_into_pool(q, q_factor):
     return q if q_factor == 1 else q * q_factor
 
 
-def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True, limited=False, q_factor=1):
+def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True, limited=False, q_factor=1,
+          limited_note=LIMITED_NOTE):
     """Скор 0–100 (100 = чисто): {"score", "band", "parts", "gates", "metrics", "headline"}.
     reserve — резерв токенов ликвидности (сырые единицы): баланс пула после миграции или кривой до.
     Часть "operator" и её стоп-правило — от dump_impact крупнейшего оператора (q = взвешенная доля
@@ -314,13 +316,14 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     limited=True — данных рынка нет (GT не ответил), а токен старый (сигналы холдеров ограничены):
     жёсткие правила по impact и transfer не применяются, band не ниже RISKY, к headline добавляется LIMITED_NOTE.
     Меньше MIN_HOLDERS холдеров (base["holders_total"]) → score None, band TOO_EARLY_OR_LATE.
-    q_factor — доля продажи, которая дойдёт до ликвидности (1 − налог на продажу, если налог берётся токенами)."""
+    q_factor — доля продажи, которая дойдёт до ликвидности (1 − налог на продажу, если налог берётся токенами).
+    limited_note — пояснение к limited в headline (по умолчанию LIMITED_NOTE; Flap с неполным топом — PARTIAL_NOTE)."""
     n = len(holders)
     big = ops[0] if ops else {"share": 0.0, "share_supply": 0.0, "weighted": 0.0, "wallets": []}
     impact = dump_impact(_sold_into_pool(big["weighted"] * base["circulating"], q_factor), reserve) if reserve_ok else None
     headline = (f"{n} wallets → {len(ops)} operators, biggest holds "
                 f"{big['share'] * 100:.1f}% of float ({big['share_supply'] * 100:.1f}% of supply)"
-                + _impact_phrase(impact, ops) + (LIMITED_NOTE if limited else ""))
+                + _impact_phrase(impact, ops) + (limited_note if limited else ""))
     if base["holders_total"] < MIN_HOLDERS:
         return {"score": None, "band": TOO_EARLY, "parts": {}, "gates": [], "metrics": {}, "headline": headline}
 

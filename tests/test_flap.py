@@ -36,9 +36,34 @@ def data(*xs):
     return "0x" + "".join(word(x) for x in xs)
 
 
-def tlog(frm, to, amount, tx, token=FTOKEN, i=0):
+def tlog(frm, to, amount, tx, token=FTOKEN, i=0, block=LAUNCH_BLOCK):
     return {"address": token, "topics": [ch.TRANSFER_TOPIC, ch.topic_for(frm), ch.topic_for(to)],
-            "data": data(amount), "transactionHash": tx, "blockNumber": hex(LAUNCH_BLOCK), "logIndex": hex(i)}
+            "data": data(amount), "transactionHash": tx, "blockNumber": hex(block), "logIndex": hex(i)}
+
+
+def decode_aggregate_call(calldata):
+    """calldata Multicall3.aggregate -> [(target, data)] (обратное flap._encode_aggregate)."""
+    h = calldata[10:]
+    word = lambda i: int(h[64 * i:64 * i + 64], 16)
+    n = word(1)
+    out = []
+    for k in range(n):
+        el = 2 + word(2 + k) // 32
+        target = "0x" + h[64 * el + 24:64 * el + 64]
+        ln = word(el + 2)
+        out.append((target, "0x" + h[64 * (el + 3):64 * (el + 3) + 2 * ln]))
+    return out
+
+
+def encode_aggregate_result(rets):
+    """(blockNumber, bytes[]) для ответа Multicall3.aggregate."""
+    n = len(rets)
+    body, offs, pos = [], [], 32 * n
+    for r in rets:
+        b = bytes.fromhex(r[2:])
+        el = f"{len(b):064x}" + (b + b"\0" * (-len(b) % 32)).hex()
+        offs.append(pos); pos += len(el) // 2; body.append(el)
+    return "0x" + word(1) + word(64) + word(n) + "".join(word(o) for o in offs) + "".join(body)
 
 
 def elog(address, topic, *xs):
@@ -57,10 +82,12 @@ class Chain:
                  creator=DEV, recipient=DEV, recipient_vault=False, reserves=(20 * E18, 70_000_000 * E18)):
         self.status, self.buy_tax, self.sell_tax, self.circ = status, buy_tax, sell_tax, circ
         self.creator, self.recipient, self.recipient_vault, self.reserves = creator, recipient, recipient_vault, reserves
-        self.batches = []
+        self.batches, self.multicalls, self.getlogs = [], 0, 0
+        self.page_cap = 10 ** 9                 # логов в ответе getLogs (тесты окон ставят маленький)
         self.dex = status == flap.STATUS_DEX
         self.trs, self.rcs = [], {}
         self._build()
+        self.head = max(t["block"] for t in self.trs) + 10
 
     def tr(self, frm, to, amount, tx, block=None):
         self.trs.append({"frm": frm, "to": to, "amount": amount, "tx": tx, "block": block or LAUNCH_BLOCK + len(self.trs),
@@ -104,12 +131,19 @@ class Chain:
         return [self.status, 3 * E18, self.circ, 5, 6, 1_918_979_700 * 10 ** 9, H, 2_124_381_054 * E18, 800_000_000 * E18,
                 0, 0, 0, self.buy_tax, self.sell_tax, PAIR if self.dex else 0, 264 * 10 ** 15, 0, 0]
 
+    def balance(self, a):
+        return sum(t["amount"] * ((t["to"] == a) - (t["frm"] == a)) for t in self.trs)
+
     def rpc_batch(self, calls):
         self.batches.append(calls)
         out = []
         for m, p in calls:
             to, sel = p[0]["to"].lower(), p[0]["data"][:10]
-            if sel == flap.SEL_STATE:
+            if to == flap.MULTICALL and sel == flap.SEL_AGGREGATE:
+                self.multicalls += 1
+                out.append(encode_aggregate_result([data(self.balance("0x" + d[-40:]))
+                                                    for _, d in decode_aggregate_call(p[0]["data"])]))
+            elif sel == flap.SEL_STATE:
                 out.append(data(*self.state_words()) if to == flap.PORTAL and FTOKEN[2:] in p[0]["data"] else None)
             elif sel == flap.SEL_TAX_PROCESSOR:
                 out.append(data(TAXP) if self.buy_tax or self.sell_tax else None)
@@ -126,9 +160,33 @@ class Chain:
                 out.append(None)
         return out
 
+    def logs(self, flt):
+        """eth_getLogs по переводам токена: окно блоков, топики from / to (OR-списки)."""
+        lo, hi = int(flt["fromBlock"], 16), (self.head if flt["toBlock"] == "latest" else int(flt["toBlock"], 16))
+        tp = flt.get("topics") or []
+        ok = lambda i, a: len(tp) <= i or tp[i] is None or ch.topic_for(a) in (tp[i] if isinstance(tp[i], list) else [tp[i]])
+        return [tlog(t["frm"], t["to"], t["amount"], t["tx"], i=t["log_index"], block=t["block"])
+                for t in sorted(self.trs, key=lambda t: (t["block"], t["log_index"]))
+                if lo <= t["block"] <= hi and ok(1, t["frm"]) and ok(2, t["to"])]
+
     def rpc(self, method, params):
-        assert method == "eth_getLogs" and params[0]["address"] == FTOKEN
-        return [tlog(ZERO, flap.PORTAL, flap.SUPPLY, "0xlaunch")]
+        if method == "eth_blockNumber":
+            return hex(self.head)
+        assert method == "eth_getLogs" and params[0]["address"] == FTOKEN, (method, params)
+        self.getlogs += 1
+        logs = self.logs(params[0])
+        if len(logs) > self.page_cap:   # как Alchemy: отказ с подсказкой окна, где логов не больше cap
+            lo = int(params[0]["fromBlock"], 16)
+            b = max(lo, int(logs[self.page_cap]["blockNumber"], 16) - 1)
+            raise RuntimeError(f"Log response size exceeded. ... this block range should work: [{hex(lo)}, {hex(b)}]")
+        return logs
+
+    def get_token_transfers(self, token, from_block, to_block=None, frm=None, to=None):
+        assert token == FTOKEN
+        lst = lambda a: None if a is None else ({a} if isinstance(a, str) else set(a))
+        f, t_ = lst(frm), lst(to)
+        return [t for t in sorted(self.trs, key=lambda t: (t["block"], t["log_index"]))
+                if t["block"] >= from_block and (f is None or t["frm"] in f) and (t_ is None or t["to"] in t_)]
 
     def patched(self, enabled=True):
         st = fakes.patched()
@@ -136,7 +194,8 @@ class Chain:
         p("rpc_batch", side_effect=self.rpc_batch)
         p("rpc", side_effect=self.rpc)
         p("receipt_logs", side_effect=lambda txs, chunk=50: {h: self.rcs.get(h, []) for h in txs})
-        p("get_token_transfers", side_effect=lambda t, b: list(self.trs) if t == FTOKEN else fakes.transfers())
+        p("get_token_transfers", side_effect=lambda t, b, *a, **k: self.get_token_transfers(t, b, *a, **k)
+          if t == FTOKEN else fakes.transfers())
         p("token_supply", side_effect=lambda t: flap.SUPPLY if t == FTOKEN else fakes.SUPPLY)
         st.enter_context(mock.patch.dict(os.environ, {"FLAP_ENABLED": "1" if enabled else "0"}))
         st.enter_context(mock.patch.dict(flap._STATE, clear=True))
@@ -292,6 +351,128 @@ class TestDex(unittest.TestCase):
         r = self.scan()
         sig = {h["wallet"]: h["signals"] for h in r["holders"]}
         self.assertEqual(sig[W[5]]["eth_in"], E18 // 10)   # получено amt × (1 − 3%): в допуске
+
+
+WHALE = fakes.wallet(220)
+X_DIST = fakes.wallet(200)                 # не холдер: раздал токены двум холдерам в середине истории
+
+
+def long_chain(whale=False):
+    """Токен с длинной историей: запуск и покупки в начале, в середине — продажа холдера, прямой перевод между
+    холдерами, общий раздатчик (и, если whale, спящий кит: купил в середине и больше не двигался), дальше —
+    шум мелких кошельков до самого конца (свежее окно — только шум)."""
+    c = Chain()
+    b = LAUNCH_BLOCK + 1000
+    fill = [fakes.wallet(100 + i) for i in range(40)]
+    for i, f in enumerate(fill):
+        c.tr(flap.PORTAL, f, 1000 * E18, f"0xf{i:03d}", b + i)
+    c.tr(W[3], flap.PORTAL, 1_000_000 * E18, "0xmidsell", b + 4000)
+    c.tr(W[5], W[6], 2_000_000 * E18, "0xmiddirect", b + 4100)
+    c.tr(flap.PORTAL, X_DIST, 3_000 * E18, "0xxbuy", b + 4200)
+    c.tr(X_DIST, W[8], 1_000 * E18, "0xdist1", b + 4300)
+    c.tr(X_DIST, W[9], 1_000 * E18, "0xdist2", b + 4301)
+    if whale:
+        c.tr(flap.PORTAL, WHALE, 40_000_000 * E18, "0xwhale", b + 4500)
+        c.rcs["0xwhale"] = [bought(WHALE, 40_000_000 * E18, E18)]
+    for k in range(200):
+        c.tr(fill[k % 40], fill[(k + 1) % 40], E18, f"0xn{k:03d}", b + 6000 + 100 * k)
+    c.head = max(t["block"] for t in c.trs) + 10
+    c.page_cap = 25
+    return c
+
+
+def windowed(max_logs=30, samples=2):
+    """Маленькие окна для подставной истории: порог, окно запуска, страница RPC, свежих страниц, выборок."""
+    return mock.patch.multiple(flap, HISTORY_MAX_LOGS=max_logs, EARLY_BLOCKS=100, PAGE_LOGS=25, RECENT_PAGES=1,
+                               SAMPLE_PAGES=samples)
+
+
+class TestWindowedHistory(unittest.TestCase):
+    KEYS = ("score", "band", "parts", "gates", "metrics", "headline", "reason", "operators", "links", "rug",
+            "circulating", "reserve")
+
+    def scan(self, c, max_logs, samples=2):
+        with c.patched(), windowed(max_logs, samples):
+            return engine.scan(FTOKEN)
+
+    def test_windowed_equals_full(self):
+        full = self.scan(long_chain(), 10 ** 9)
+        c = long_chain()
+        win = self.scan(c, 30)
+        self.assertEqual(full["flap"]["history"]["mode"], "full")
+        h = win["flap"]["history"]
+        self.assertEqual(h["mode"], "windowed")
+        self.assertTrue(h["top_exact"] and h["early_complete"])
+        self.assertLess(h["logs_read"], len(c.trs))          # прочитана не вся история
+        for k in self.KEYS:
+            self.assertEqual(win[k], full[k], k)
+        strip = lambda r: [(x["wallet"], x["share"], x["signals"]) for x in r["holders"]]
+        self.assertEqual(strip(win), strip(full))
+        kinds = {l["kind"] for l in win["links"]}
+        self.assertTrue({"direct", "distributor"} <= kinds, kinds)   # связи из середины истории найдены
+        sig = {x["wallet"]: x["signals"] for x in win["holders"]}
+        self.assertTrue(sig[W[3]]["sold"])                   # продажа из середины истории
+        self.assertGreaterEqual(c.multicalls, 1)
+
+    def test_sampling_finds_mid_history_whale(self):
+        full = self.scan(long_chain(whale=True), 10 ** 9)
+        win = self.scan(long_chain(whale=True), 30, samples=8)
+        self.assertIn(WHALE, [x["wallet"] for x in win["holders"]])     # кит из середины — в выборке
+        self.assertTrue(win["flap"]["history"]["top_exact"])
+        self.assertFalse(win["limited"])
+        for k in self.KEYS:
+            self.assertEqual(win[k], full[k], k)
+
+    def test_dormant_whale_reported_not_exact(self):
+        full = self.scan(long_chain(whale=True), 10 ** 9)
+        win = self.scan(long_chain(whale=True), 30, samples=0)
+        self.assertIn(WHALE, [x["wallet"] for x in full["holders"]])
+        self.assertNotIn(WHALE, [x["wallet"] for x in win["holders"]])   # не попал ни в одно окно
+        h = win["flap"]["history"]
+        self.assertFalse(h["top_exact"])
+        self.assertLess(h["coverage"], 0.97)
+        self.assertEqual(win["circulating"], full["circulating"])        # оборот — по балансам, точный
+        self.assertTrue(win["limited"])                                  # топ не точный: сигналы ограничены
+        self.assertIn("top holders partially read", win["headline"])
+
+    def test_small_history_read_fully_in_pages(self):
+        c = long_chain()
+        r = self.scan(c, 10 ** 9)
+        self.assertEqual((r["flap"]["history"]["mode"], r["flap"]["history"]["logs"]), ("full", len(c.trs)))
+        self.assertGreater(c.getlogs, 1)                     # страницами по подсказке RPC
+        self.assertEqual(c.multicalls, 0)
+
+    def test_deadline_stops_reading(self):
+        c = long_chain()
+        with c.patched(), windowed(10 ** 9):
+            flap.detect(FTOKEN)
+            trs, base, info, _ = flap.history(FTOKEN, LAUNCH_BLOCK, flap.SUPPLY, {flap.PORTAL, ZERO},
+                                              deadline=0.0)   # время уже вышло: одна страница и окна без свежих
+        self.assertEqual(info["mode"], "windowed")
+        self.assertEqual(info["recent_logs"], 0)
+        self.assertTrue(base["balances"])
+
+    def test_multicall_splits_on_413(self):
+        import urllib.error
+        c = long_chain()
+        real = c.rpc_batch
+        def picky(calls):   # как RPC: большой запрос — 413
+            if len(calls) > 1 or len(decode_aggregate_call(calls[0][1][0]["data"])) > 3:
+                raise urllib.error.HTTPError("rpc", 413, "Payload Too Large", {}, None)
+            return real(calls)
+        addrs = sorted({t["to"] for t in c.trs})
+        with c.patched(), mock.patch.object(ch, "rpc_batch", side_effect=picky), \
+                mock.patch.multiple(flap, MULTICALL_CHUNK=10, MULTICALL_PER_HTTP=3):
+            got = flap.balances(FTOKEN, addrs)
+        self.assertEqual(got, {a: c.balance(a) for a in addrs})
+
+    def test_constants_match_detect(self):
+        self.assertEqual((flap.HOLDERS_N, flap.DUST_SHARE), (d.TOP_N, d.DUST_SHARE))
+
+    def test_multicall_roundtrip(self):
+        calls = [(FTOKEN, flap.SEL_BALANCE + flap._arg(a)) for a in W[:3]]
+        self.assertEqual(decode_aggregate_call(flap._encode_aggregate(calls)), calls)
+        self.assertEqual(flap._decode_aggregate(encode_aggregate_result([data(5), data(7)])), [data(5), data(7)])
 
 
 class TestDetectQFactor(unittest.TestCase):

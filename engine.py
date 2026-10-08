@@ -217,7 +217,8 @@ def scan(token, emit=lambda e: None):
         return est
 
     ev("stage", "transfers")
-    facts = a.token_facts(token, launch)
+    # Flap: история большого токена читается окнами в бюджете скана (deadline считается от начала скана)
+    facts = a.token_facts(token, launch, deadline) if a is flap else a.token_facts(token, launch)
     transfers, supply, excluded, mkt = facts["transfers"], facts["supply"], facts["excluded"], facts["market"]
     base = facts["base"] or d.supply_base(transfers, supply, excluded)
     holders = d.top_holders(base)
@@ -309,11 +310,16 @@ def scan(token, emit=lambda e: None):
     # подстраховка без GT: рынка не знаем, а токен по блокчейну старше порога too established —
     # сигналы холдеров ограничены: без жёстких правил по impact и transfer и без probably rug
     limited = not gt and time.time() - ts[launch["block"]] > limits["min_age_days"] * 86400
+    # Flap: большая история прочитана окнами и топ не гарантированно точный — сигналы холдеров тоже ограничены
+    hist = (facts.get("flap") or {}).get("history") or {}
+    partial = hist.get("mode") == "windowed" and not hist.get("top_exact")
+    limited_note = d.PARTIAL_NOTE if partial and not limited else d.LIMITED_NOTE
+    limited = limited or partial
     # резерв надёжен: адаптер нашёл пул (на кривой — всегда) и он согласуется с ликвидностью GT
     reserve_ok = facts.get("reserve_ok", True) and reserve_seen(facts["reserve"], supply, gt)
     q_factor = facts.get("q_factor", 1)   # Flap после выпуска: налог на продажу токенами (1 − sellTax)
     sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"), reserve_ok=reserve_ok,
-                 limited=limited, q_factor=q_factor)
+                 limited=limited, q_factor=q_factor, limited_note=limited_note)
     reason = _reason(sc, base)
     # probably rug: только вычисления на уже собранных данных, без запросов в сеть
     rug = None if limited else d.rug_projection(holders, sig, ops, base, facts["reserve"], sc["band"],
