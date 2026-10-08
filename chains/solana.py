@@ -181,13 +181,14 @@ def associated_token_account(owner, mint, token_program=TOKEN):
 # ---------------------------------------------------------------------------
 _LIMIT = priority.Throttle(RPS)                          # общий лимитер адаптера
 _BG_LIMIT = priority.Throttle(priority.background_rps())  # свой лимит фоновой работы (BACKGROUND_RPS)
+_CRIT_LIMIT = priority.Throttle(priority.critical_rps())  # свой лимит критичной работы (CRITICAL_RPS)
 
 
 def _rate_limit():
     # Разносит HTTP-запросы во времени. Вес — один HTTP, а не элемент батча: Alchemy Solana
     # ограничивает compute units, и батч из 100 getTransaction проходит без 429; per-item 429 ретраим.
     # фон уступает живым сканам и не быстрее BACKGROUND_RPS
-    priority.rate_limit(_LIMIT, _BG_LIMIT)
+    priority.rate_limit(_LIMIT, _BG_LIMIT, crit=_CRIT_LIMIT)
 
 
 REQUESTS = [0]  # счётчик HTTP-запросов к RPC (включая ретраи)

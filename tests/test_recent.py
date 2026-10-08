@@ -173,6 +173,44 @@ class TestServerFeed(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertLessEqual(len(d["items"]), 50)
 
+    def test_new_scan_shows_at_once(self):
+        """Скан записался — лента без ожидания RECENT_TTL (кэш сброшен), новый токен сверху."""
+        st = server.recent_store()
+        st.record(res("0x" + "11" * 20), ts=int(time.time()) - 3600)
+        _, old, _ = self.get("/api/recent?limit=12")
+        self.assertEqual(len(old["items"]), 1)
+        self.scan(fakes.TOKEN)
+        _, feed, _ = self.get("/api/recent?limit=12")
+        self.assertEqual(feed["items"][0]["token"], fakes.TOKEN)
+        self.assertLess(time.time() - feed["items"][0]["ts"], 60)
+
+    def test_read_racing_write_is_not_cached(self):
+        """Чтение базы началось до записи скана, закончилось после: старый ответ в кэш не попадает."""
+        st = server.recent_store()
+        st.record(res("0x" + "11" * 20), ts=100)
+        real = st.recent
+
+        def slow(limit):
+            out = real(limit)
+            server.record_recent(res("0x" + "22" * 20))      # скан записался, пока читали
+            return out
+        with mock.patch.object(st, "recent", side_effect=slow):
+            stale = server.get_recent(12)
+        self.assertEqual([x["ts"] for x in stale["items"]], [100])
+        fresh = server.get_recent(12)
+        self.assertEqual(fresh["items"][0]["token"], "0x" + "22" * 20)
+
+    def test_frontend_polls_bypass_browser_cache(self):
+        """Cloudflare переписывает Cache-Control на max-age=14400: опросы на странице идут с cache: 'no-store'."""
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "scripts", "build_frontend.py")) as f:
+            src = f.read()
+        for url in ("'/api/recent?limit=12'", "'/api/rewards/status'", "`/api/rewards/history?kind="):
+            i = src.index("fetch(" + url)
+            self.assertIn(",NO_STORE)", src[i:i + 120], url)
+        self.assertIn("const j=u=>fetch(u,NO_STORE)", src)                # /api/draw/*
+        self.assertIn("const NO_STORE={cache:'no-store'}", src)
+
 
 if __name__ == "__main__":
     unittest.main()

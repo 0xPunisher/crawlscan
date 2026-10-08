@@ -172,41 +172,125 @@ class TestHistoryCap(unittest.TestCase):
 class TestMemguard(unittest.TestCase):
 
     def setUp(self):
-        memguard._state["relieved"] = 0.0
+        memguard._state.update(relieved=0.0, pause=memguard.RELIEVE_EVERY)
+        self.env = mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": "", "MEMORY_HARD_LIMIT_MB": ""})
+        self.env.__enter__()
+        self.out = io.StringIO()
+        self.stdout = mock.patch("sys.stdout", self.out)
+        self.stdout.__enter__()
 
-    def test_soft_limit(self):
-        with mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": ""}):
-            with mock.patch.object(memguard, "cgroup_limit_mb", return_value=None):
-                self.assertEqual(memguard.soft_limit_mb(), 1536)
-            with mock.patch.object(memguard, "cgroup_limit_mb", return_value=1024):
-                self.assertEqual(memguard.soft_limit_mb(), 716)
-            with mock.patch.object(memguard, "cgroup_limit_mb", return_value=8192):
-                self.assertEqual(memguard.soft_limit_mb(), 1536)
-        with mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": "900"}):
-            self.assertEqual(memguard.soft_limit_mb(), 900)
+    def tearDown(self):
+        self.stdout.__exit__(None, None, None)
+        self.env.__exit__(None, None, None)
 
-    def test_over(self):
+    def test_limits_from_container(self):
+        with mock.patch.object(memguard, "cgroup_limit_mb", return_value=None):      # cgroup не читается
+            self.assertEqual(memguard.container_limit_mb(), 6000)
+            self.assertEqual(memguard.soft_limit_mb(), 4500)
+            self.assertEqual(memguard.hard_limit_mb(), 5400)
+        with mock.patch.object(memguard, "cgroup_limit_mb", return_value=8192):      # Railway 8 ГБ
+            self.assertEqual(memguard.soft_limit_mb(), 6144)
+            self.assertEqual(memguard.hard_limit_mb(), 7372)
+        with mock.patch.object(memguard, "cgroup_limit_mb", return_value=1024):
+            self.assertEqual(memguard.soft_limit_mb(), 768)
+            self.assertEqual(memguard.hard_limit_mb(), 921)
+        with mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": "900", "MEMORY_HARD_LIMIT_MB": "1200"}):
+            self.assertEqual((memguard.soft_limit_mb(), memguard.hard_limit_mb()), (900, 1200))
+        with mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": "900", "MEMORY_HARD_LIMIT_MB": "500"}):
+            self.assertEqual(memguard.hard_limit_mb(), 900)                          # не ниже мягкого
+
+    def test_cgroup_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "memory.max")
+            with mock.patch.object(memguard, "CGROUP_FILES", (f,)):
+                self.assertIsNone(memguard.cgroup_limit_mb())
+                for raw, want in (("8589934592\n", 8192), ("max\n", None)):
+                    with open(f, "w") as fh:
+                        fh.write(raw)
+                    self.assertEqual(memguard.cgroup_limit_mb(), want)
+
+    def limits(self, soft=100, hard=200):
+        return mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": str(soft), "MEMORY_HARD_LIMIT_MB": str(hard)})
+
+    def test_below_soft_no_relief(self):
         dropped = []
-        with mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": "100"}), \
-                mock.patch.object(memguard, "_droppers", [lambda: dropped.append(1)]):
-            with mock.patch.object(memguard, "rss_mb", return_value=50):
-                self.assertFalse(memguard.over(live=2))
-            self.assertEqual(dropped, [])
-            with mock.patch.object(memguard, "rss_mb", return_value=500):
-                self.assertTrue(memguard.over(live=2))
-                self.assertEqual(dropped, [1])
-                self.assertTrue(memguard.over(live=2))
-                self.assertEqual(dropped, [1])                  # не чаще RELIEVE_EVERY
-                self.assertFalse(memguard.over(live=0))         # без сканов отказ память не освободит
-            rss = iter([500, 60])                               # сброс кэшей помог
-            memguard._state["relieved"] = 0.0
-            with mock.patch.object(memguard, "rss_mb", side_effect=lambda: next(rss)):
-                self.assertFalse(memguard.over(live=2))
+        with self.limits(), mock.patch.object(memguard, "_droppers", [lambda: dropped.append(1)]), \
+                mock.patch.object(memguard, "rss_mb", return_value=50):
+            self.assertFalse(memguard.over(live=9, cap=3))
+        self.assertEqual(dropped, [])
+
+    def test_relief_helped(self):
+        rss = iter([500, 500, 300, 60])        # проверка, до сброса, после gc, после malloc_trim
+        with self.limits(), mock.patch.object(memguard, "_droppers", [lambda: None]), \
+                mock.patch.object(memguard, "_trim", return_value=True) as trim, \
+                mock.patch.object(memguard, "rss_mb", side_effect=lambda: next(rss)):
+            self.assertFalse(memguard.over(live=8, cap=3))
+        trim.assert_called_once()
+        self.assertIn("memory: relieve 500 MB -> caches+gc 300 MB -> malloc_trim 60 MB", self.out.getvalue())
+        self.assertEqual(memguard._state["pause"], memguard.RELIEVE_EVERY)
+
+    def test_stuck_memory_soft_band_allows_up_to_cap(self):
+        """Сброс не снизил память (прод: 2583 -> 2583): между порогами сканы идут до cap, выше жёсткого — занято."""
+        dropped = []
+        with self.limits(), mock.patch.object(memguard, "_droppers", [lambda: dropped.append(1)]), \
+                mock.patch.object(memguard, "_trim", return_value=True):
+            with mock.patch.object(memguard, "rss_mb", return_value=150):
+                self.assertFalse(memguard.over(live=0, cap=3))
+                self.assertFalse(memguard.over(live=1, cap=3))
+                self.assertFalse(memguard.over(live=2, cap=3))
+                self.assertTrue(memguard.over(live=3, cap=3))     # без очереди
+                self.assertTrue(memguard.over(live=1))            # cap 0 (перепроверки alerts) — выше мягкого занято
+            self.assertEqual(dropped, [1])                         # бесполезный сброс — не чаще RELIEVE_IDLE
+            self.assertEqual(memguard._state["pause"], memguard.RELIEVE_IDLE)
+            with mock.patch.object(memguard, "rss_mb", return_value=250):
+                self.assertTrue(memguard.over(live=1, cap=3))
+                self.assertFalse(memguard.over(live=0, cap=3))    # без сканов отказ память не освободит
+            memguard._state["relieved"] -= memguard.RELIEVE_IDLE
+            with mock.patch.object(memguard, "rss_mb", return_value=150):
+                memguard.over(live=1, cap=3)
+            self.assertEqual(dropped, [1, 1])
+        self.assertEqual(self.out.getvalue().count("memory: relieve"), 2)
+        self.assertNotIn("letting the scan start", self.out.getvalue())
+
+    def test_disabled_or_no_proc(self):
         with mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": "0"}), \
                 mock.patch.object(memguard, "rss_mb", return_value=10 ** 6):
             self.assertFalse(memguard.over(live=5))
         with mock.patch.object(memguard, "rss_mb", return_value=None):
             self.assertFalse(memguard.over(live=5))
+
+    def test_trim_without_glibc(self):
+        with mock.patch.object(memguard, "_libc", []), \
+                mock.patch.object(memguard.ctypes, "CDLL", side_effect=OSError("no libc.so.6")):
+            self.assertFalse(memguard._trim())
+            self.assertFalse(memguard._trim())
+        lib = mock.Mock()
+        with mock.patch.object(memguard, "_libc", [lib]):
+            self.assertTrue(memguard._trim())
+        lib.malloc_trim.assert_called_once_with(0)
+        with mock.patch.object(memguard, "rss_mb", return_value=None), \
+                mock.patch.object(memguard, "_trim", return_value=False):
+            memguard.relieve()
+        self.assertIn("malloc_trim n/a", self.out.getvalue())
+
+    def test_status_line_and_monitor(self):
+        with self.limits(), mock.patch.object(memguard, "rss_mb", return_value=2583.4), \
+                mock.patch.object(memguard, "cgroup_limit_mb", return_value=8192):
+            self.assertEqual(memguard.status_line(2, ", x"),
+                             "memory: rss 2583 MB (soft 100 MB, hard 200 MB, limit 8192 MB), scans active 2, x")
+            ticks, stop = threading.Event(), threading.Event()
+
+            def stats():
+                ticks.set()
+                return 1, ""
+            t = memguard.start_monitor(stats, every=0.01, stop=stop)
+            self.assertTrue(ticks.wait(2))
+            stop.set()
+            t.join(2)
+            self.assertFalse(t.is_alive())
+        with mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": "0"}), \
+                mock.patch.object(memguard, "rss_mb", return_value=None):
+            self.assertEqual(memguard.status_line(0), "memory: rss ? MB (guard off), scans active 0")
 
     def test_server_registers_adapter_cache_drop(self):
         self.assertIn(ch.drop_caches, memguard._droppers)
@@ -228,7 +312,7 @@ class TestServerBusy(unittest.TestCase):
     def setUp(self):
         with server._lock:
             server.JOBS.clear(); server.BY_TOKEN.clear()
-        memguard._state["relieved"] = 0.0
+        memguard._state.update(relieved=0.0, pause=memguard.RELIEVE_EVERY)
         self.fakes = fakes.patched()
         self.fakes.__enter__()
         self.tmp = tempfile.TemporaryDirectory()
@@ -301,13 +385,38 @@ class TestServerBusy(unittest.TestCase):
         self.assertEqual(server._ACTIVE[0], 0)
 
     def test_memory_busy(self):
-        with mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": "100"}), \
-                mock.patch.object(memguard, "rss_mb", return_value=900):
-            with mock.patch.object(server, "_ACTIVE", [1]):
+        env = {"MEMORY_SOFT_LIMIT_MB": "100", "MEMORY_HARD_LIMIT_MB": "200"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(memguard, "rss_mb", return_value=900):
+            with mock.patch.object(server, "_ACTIVE", [1]):                    # выше жёсткого
                 code, d, _ = self.request("/api/scan", {"token": fakes.TOKEN})
             self.assertEqual((code, d["error"]), (503, "busy"))
             code, _, _ = self.request("/api/scan", {"token": fakes.TOKEN})      # сканов нет — пускаем
             self.assertEqual(code, 200)
+
+    def test_memory_soft_band_up_to_max_concurrent(self):
+        env = {"MEMORY_SOFT_LIMIT_MB": "100", "MEMORY_HARD_LIMIT_MB": "200"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(memguard, "rss_mb", return_value=150):
+            active = [server.MAX_CONCURRENT - 1]
+            with mock.patch.object(server, "_ACTIVE", active):
+                code, _, _ = self.request("/api/scan", {"token": fakes.TOKEN})
+                self.assertEqual(code, 200)
+                for _ in range(200):                     # скан закончился под подменённым счётчиком
+                    if active[0] == server.MAX_CONCURRENT - 1:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(active[0], server.MAX_CONCURRENT - 1)
+            with mock.patch.object(server, "_ACTIVE", [server.MAX_CONCURRENT]):
+                code, d, _ = self.request("/api/scan", {"token": fakes.OTHER})
+                self.assertEqual((code, d["error"]), (503, "busy"))
+
+    def test_scan_stats_per_minute(self):
+        server.scan_stats()
+        self.scan_done()
+        with self.full():
+            self.request("/api/scan", {"token": fakes.OTHER})
+        active, tail = server.scan_stats()
+        self.assertEqual(tail, ", last min: 1 started, 1 busy")
+        self.assertEqual(server.scan_stats()[1], ", last min: 0 started, 0 busy")
 
     def test_rewards_db_failure_is_503_and_scan_lives(self):
         locked = sqlite3.OperationalError("database is locked")

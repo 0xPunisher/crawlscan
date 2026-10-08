@@ -75,11 +75,13 @@ def _is_rate_limited(body):
 RPS = int(os.environ.get("CRAWLER_RPS", "8"))  # потолок запросов/сек глобально
 _LIMIT = priority.Throttle(RPS)                          # общий лимитер адаптера
 _BG_LIMIT = priority.Throttle(priority.background_rps())  # свой лимит фоновой работы (BACKGROUND_RPS)
+_CRIT_LIMIT = priority.Throttle(priority.critical_rps())  # свой лимит критичной работы (CRITICAL_RPS)
 def _rate_limit(n=1):
     # разносит запросы во времени, чтобы не превышать лимит провайдера (QuickNode 15 rps и т.п.) и не ловить 429.
     # n — вес запроса: провайдеры считают каждый элемент батча отдельным вызовом.
-    # фон (перепроверки alerts, награды, early без скана) уступает живым сканам и не быстрее BACKGROUND_RPS
-    priority.rate_limit(_LIMIT, _BG_LIMIT, n)
+    # фон (перепроверки alerts, early без скана) уступает живым сканам и не быстрее BACKGROUND_RPS;
+    # критичная работа (планировщик наград) не уступает, не быстрее CRITICAL_RPS
+    priority.rate_limit(_LIMIT, _BG_LIMIT, n, crit=_CRIT_LIMIT)
 
 
 REQUESTS = [0]  # счётчик HTTP-запросов к RPC (включая ретраи)
