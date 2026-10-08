@@ -19,7 +19,7 @@ Telegram bot: [@CrawlScanBot](https://t.me/CrawlScanBot)
 [![license](https://img.shields.io/badge/license-MIT-9fd9ff?style=flat-square\&labelColor=07090b)](LICENSE)
 [![tests](https://img.shields.io/github/actions/workflow/status/0xPunisher/crawlscan/tests.yml?branch=main\&style=flat-square\&labelColor=07090b\&label=tests)](https://github.com/0xPunisher/crawlscan/actions/workflows/tests.yml)
 
-![crawlscan](banner.jpg)
+![crawlscan](banner12.png)
 
 </div>
 
