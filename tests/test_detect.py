@@ -246,12 +246,61 @@ class TestDetect(unittest.TestCase):
     def test_j_lone_transfer_stays_danger(self):
         self.assert_hard_impact(self.lone_whale(kind="transfer", via=BUNDLER))
 
-    def test_j_lone_unread_history_stays_danger(self):
-        # история не прочитана в бюджет — «имеет историю» не доказано: не смягчаем
-        self.assert_hard_impact(self.lone_whale(distinct=None))
+    def assert_unknown_soft(self, s):
+        self.assertEqual(s.score["band"], "RISKY")
+        self.assertIn("soft: biggest holder couldn't be fully read; could move price −64% (thin liquidity)",
+                      s.score["gates"])
+        self.assertFalse([g for g in s.score["gates"] if not g.startswith("soft:")])
 
-    def test_j_lone_entry_not_found_stays_danger(self):
-        self.assert_hard_impact(self.lone_whale(kind=None))
+    def test_j_lone_unread_history_is_soft(self):
+        # история не прочитана в бюджет — не улика: мягкое правило, причина «couldn't be fully read»
+        self.assert_unknown_soft(self.lone_whale(distinct=None))
+
+    def test_j_lone_entry_not_found_is_soft(self):
+        self.assert_unknown_soft(self.lone_whale(kind=None))
+
+    def test_j_lone_unread_deployer_stays_danger(self):
+        # деплоер — улика и без прочитанной истории
+        self.assert_hard_impact(self.lone_whale(addr=DEPLOYER, distinct=None))
+
+    def test_virgin_share_over_read_wallets(self):
+        # 20 холдеров: 4 непрочитанных, из 16 прочитанных 4 девственных → 25% (а не 4/20 = 20%)
+        s = Scenario()
+        for _ in range(4):
+            s.wallet(100, distinct=None)
+        for _ in range(4):
+            s.wallet(100, distinct=0)
+        s.normal(12)
+        s.run()
+        m = s.score["metrics"]
+        self.assertAlmostEqual(m["unread"], 4 / 20)
+        self.assertAlmostEqual(m["virgin"], 4 / 16)
+        self.assertEqual(s.score["notes"], [])
+
+    def test_virgin_neutral_when_most_unread(self):
+        # 15 из 20 не прочитаны: доля девственных неизвестна — нейтральная половина веса, без правила, пометка
+        s = Scenario()
+        for _ in range(15):
+            s.wallet(100, distinct=None)
+        for _ in range(5):
+            s.wallet(100, distinct=0)                                     # прочитанные — все девственные
+        s.run()
+        self.assertIsNone(s.score["metrics"]["virgin"])
+        self.assertEqual(s.score["parts"]["virgin"], d.WEIGHTS["virgin"] / 2)
+        self.assertFalse([g for g in s.score["gates"] if "virgin" in g])  # 5/5 девственных, но правило молчит
+        self.assertEqual(s.score["notes"], ["virgin: 15 of 20 top wallets unread — scored neutral"])
+
+    def test_virgin_gate_needs_five_read(self):
+        # 4 прочитанных девственных + 3 непрочитанных (≤ 50%): прочитанных < 5 — правила по virgin нет
+        s = Scenario()
+        for _ in range(4):
+            s.wallet(100, distinct=0)
+        for _ in range(3):
+            s.wallet(100, distinct=None)
+        s.normal(3)
+        s.run()
+        self.assertAlmostEqual(s.score["metrics"]["virgin"], 4 / 7)
+        self.assertFalse([g for g in s.score["gates"] if "virgin" in g])
 
     def test_j_lone_short_history_buyer_is_soft(self):
         # история короткая (1–3 монеты), но есть, и сам купил — независимый: мягкое правило

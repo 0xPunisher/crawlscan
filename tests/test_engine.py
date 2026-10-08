@@ -1,5 +1,5 @@
 """Тесты engine.scan на синтетическом токене (подставной адаптер из tests/fakes.py, без сети)."""
-import time, unittest
+import threading, time, unittest
 from unittest import mock
 
 import fakes
@@ -86,6 +86,43 @@ class TestScan(unittest.TestCase):
             self.assertIn("unread", flags[w]["flags"])
             self.assertNotIn("virgin", flags[w]["flags"])
         self.assertEqual(events[-1]["type"], "done")
+
+    def test_biggest_wallets_read_first(self):
+        # медленная история у всех; окно 2 и маленький бюджет — успевают крупнейшие, а не случайные
+        order = []
+        def slow(wallet_, before_block, token, window=None, cap=4):
+            order.append(wallet_)
+            time.sleep(0.15)
+            return 4
+        with fakes.patched(history_fn=slow), mock.patch.object(engine, "BUDGET", 1.2), \
+                mock.patch.object(engine, "DETECT_RESERVE", 0.2), mock.patch.object(ch, "HISTORY_PARALLEL", 2, create=True):
+            res = engine.scan(fakes.TOKEN)
+        by_share = [h["wallet"] for h in res["holders"]]
+        read = [w for w in by_share if w not in res["unread"]]
+        self.assertTrue(read, "ничего не прочитано")
+        self.assertEqual(read, by_share[:len(read)])                     # прочитаны ровно крупнейшие
+        rank = {w: i for i, w in enumerate(by_share)}
+        for i, w in enumerate(order[:len(read)]):                         # начаты в порядке доли (внутри окна 2 —
+            self.assertLess(rank[w], i + 2, (i, w))                       # соседи могут поменяться местами)
+
+    def test_rank_gate_slow_task_yields_slot(self):
+        gate = engine._RankGate(1, slot_s=0.05)
+        started = []
+        def task(name, delay):
+            started.append((name, time.time()))
+            time.sleep(delay)
+        t0 = time.time()
+        th = [threading.Thread(target=gate.run, args=(0, task, "slow", 0.5)),
+              threading.Thread(target=gate.run, args=(1, task, "fast", 0.0))]
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
+        got = dict(started)
+        self.assertLess(got["fast"] - t0, 0.3)                            # не ждал медленного до конца
+        gate2 = engine._RankGate(1)
+        gate2.close()
+        self.assertIsNone(gate2.run(5, task, "never", 0))                 # бюджет вышел — без чтения
 
     def test_not_pons_token(self):
         with fakes.patched():
