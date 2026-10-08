@@ -14,7 +14,7 @@ import threading, time
 import detect as d
 import engine
 import market
-from chains import priority
+from chains import flap, priority
 
 N = 20                    # покупателей
 BUDGET = 10.0             # секунд на расчёт (сеть)
@@ -32,6 +32,8 @@ _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
 def background(chain, token):
     """Расчёт без истории живого скана (адаптер её хранит, но скана моложе SCAN_TTL нет) — фоновая работа:
     уступает живым сканам и идёт под BACKGROUND_RPS (server: priority.background() вместо live())."""
+    if flap.candidate(token):   # Flap: истории скана для early нет (как у Solana) — расчёт живой
+        return False
     a = engine.CHAINS[chain]
     return hasattr(a, "scan_history") and a.scan_history(token) is None
 
@@ -66,6 +68,8 @@ def _out(base, hit, flags, stale=False):
 
 def _compute(a, key, token):
     """(ts, data, status) или None (токен не с лаунчпада). Исключения — наверх (сбой сети)."""
+    if flap.candidate(token) and flap.detect(token) is not None:   # Flap (FLAP_ENABLED): один HTTP, Pons — без запросов
+        a = flap
     t0, r0 = time.time(), a.REQUESTS[0]
     deadline = t0 + budget(a)
     with _lock:
@@ -120,7 +124,8 @@ def get(token, flags=None):
         finally:
             _sem.release()
         if res is None:
-            return base | {"available": False, "reason": engine.NOT_LAUNCHPAD[chain]}
+            return base | {"available": False, "reason": engine.NOT_LAUNCHPAD_FLAP if chain == "robinhood" and flap.enabled()
+                           else engine.NOT_LAUNCHPAD[chain]}
         return _out(base, res, flags)
     except Exception as e:
         print(f"early: {token} failed: {type(e).__name__}: {e}", flush=True)

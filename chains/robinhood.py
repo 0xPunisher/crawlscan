@@ -896,7 +896,14 @@ def early_buyers(token, n=20, deadline=None):
     launch = hist[0] if hist else get_launch(token)
     if launch is None:
         return None
-    excluded, market = excluded_addresses(launch["curve"]), market_addresses(launch["curve"])
+    return early_buyers_from(token, n, deadline, launch, excluded_addresses(launch["curve"]),
+                             market_addresses(launch["curve"]), classify_entries, hist)
+
+
+def early_buyers_from(token, n, deadline, launch, excluded, market, classify, hist=None):
+    """Ядро early_buyers для лаунчпада Robinhood (Pons, Flap): launch — {"block", "curve", "deployer"},
+    excluded — не покупатели, market — откуда токен приходит покупкой без чека, classify — classify_entries
+    лаунчпада (покупка по чеку), hist — история скана (launch, transfers, supply) или None."""
     head = None if hist else block_number()
     lo, span, trs = launch["block"], EARLY_WINDOW, list(hist[1]) if hist else []
     buyers, checked = [], set()
@@ -922,7 +929,7 @@ def early_buyers(token, n=20, deadline=None):
             # токен пришёл прямо с кривой, роутера Pons или pool manager — покупка без чека;
             # иначе (сторонний бот-роутер, другой кошелёк) — по чеку входа
             unsure = [a for a in wallets if src.get(a) not in market]
-            ent = classify_entries(token, trs, unsure) if unsure else {}
+            ent = classify(token, trs, unsure) if unsure else {}
             buyers += [a for a in wallets if a not in ent or ent[a]["kind"] == "buy"]
         if len(buyers) >= n or hi >= head or (deadline and time.time() > deadline):
             break
@@ -953,6 +960,19 @@ def early_status(token, buyers, deadline=None, launch=None, out_cap=EARLY_OUT_CA
     partial — выходов не на рынок больше out_cap или не успели до deadline."""
     token = token.lower()
     hist = scan_history(token)
+    market = market_addresses(launch["curve"]) if launch and launch.get("curve") else ROUTERS | {V4_POOL_MGR}
+    return early_status_from(token, buyers, deadline, market, _pons_sell, hist, out_cap)
+
+
+def _pons_sell(token, logs):
+    """Чек выхода — продажа Pons: CurveSell или токен ушёл в V4 pool manager в той же транзакции."""
+    return any((l.get("topics") or [""])[0].lower() == CURVE_SELL for l in logs) or any(
+        (p := parse_transfer(l)) and p["token"] == token and p["to"] == V4_POOL_MGR for l in logs)
+
+
+def early_status_from(token, buyers, deadline, market, is_sell, hist=None, out_cap=EARLY_OUT_CAP):
+    """Ядро early_status для лаунчпада Robinhood (Pons, Flap): market — выход туда = продажа,
+    is_sell(token, логи чека) — продажа через сторонний контракт; hist — история скана или None."""
     supply = hist[2] if hist else token_supply(token)
     ws = [b["wallet"] for b in buyers]
     out = {w: {"now": 0, "sold": 0, "moved": {}, "burned": 0, "partial": False} for w in ws}
@@ -971,7 +991,6 @@ def early_status(token, buyers, deadline=None, launch=None, out_cap=EARLY_OUT_CA
         out[t["to"]]["now"] += t["amount"]
     for t in outs:
         out[t["frm"]]["now"] -= t["amount"]
-    market = market_addresses(launch["curve"]) if launch and launch.get("curve") else ROUTERS | {V4_POOL_MGR}
     check = defaultdict(list)
     for t in outs:
         o = out[t["frm"]]
@@ -993,8 +1012,7 @@ def early_status(token, buyers, deadline=None, launch=None, out_cap=EARLY_OUT_CA
             break
         part = txs[i:i + 50]
         for h, logs in receipt_logs(part).items():
-            if any((l.get("topics") or [""])[0].lower() == CURVE_SELL for l in logs) or any(
-                    (p := parse_transfer(l)) and p["token"] == token and p["to"] == V4_POOL_MGR for l in logs):
+            if is_sell(token, logs):
                 sells.add(h)
         checked |= set(part)
     for t in pick:

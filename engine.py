@@ -253,8 +253,12 @@ def scan(token, emit=lambda e: None):
     # лаунчпад Robinhood: Flap — только при FLAP_ENABLED, суффикс 8888/7777 (без RPC) и подтверждение Portal
     # (один HTTP); остальные — Pons прежним путём, без дополнительных запросов
     flap_state = flap.detect(token) if chain == "robinhood" else None
+    eth_box, eth_thread = {}, None
     if flap_state is not None:
         a = flap
+        if flap_state["status"] != flap.STATUS_DEX:   # кривая: GT её не знает, цена = Portal × ETH/USD (параллельно)
+            eth_thread = threading.Thread(target=lambda: eth_box.update(usd=market.native_usd(network)), daemon=True)
+            eth_thread.start()
         launch = flap.get_launch(token, flap_state)
     else:
         launch = a.get_launch(token)
@@ -380,6 +384,20 @@ def scan(token, emit=lambda e: None):
     rug = None if limited else d.rug_projection(holders, sig, ops, base, facts["reserve"], sc["band"],
                                                 snipers=a.RUG_SNIPERS, reserve_ok=reserve_ok, behavioral=behavioral,
                                                 q_factor=q_factor)
+    # Flap на кривой: GeckoTerminal её не знает — имя и тикер из контракта, цена = Portal × ETH/USD,
+    # капа = цена × весь сапплай, ликвидность = ETH в кривой × ETH/USD
+    fl = facts.get("flap") or {}
+    curve = fl.get("phase") == "bonding_curve"
+    if curve:
+        gt = {k: v for k, v in gt.items()
+              if k not in ("name", "ticker", "price_usd", "mcap_usd", "liquidity_usd", "vol24h_usd")}
+        if eth_thread is not None:
+            eth_thread.join(timeout=max(0.0, min(2.0, deadline - time.time())))
+        usd = eth_box.get("usd")
+        if usd and fl.get("price_eth"):
+            gt.update(price_usd=fl["price_eth"] * usd, mcap_usd=fl["price_eth"] * usd * supply / 1e18)
+        if usd and fl.get("reserve_eth") is not None:
+            gt["liquidity_usd"] = fl["reserve_eth"] * usd
     if rug:
         rug["level_usd"] = gt["price_usd"] * rug["level_factor"] if gt.get("price_usd") else None
     meta = {}

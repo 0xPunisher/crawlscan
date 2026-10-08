@@ -12,7 +12,8 @@ fetch_market берёт цену, ликвидность, капу, возрас
 import json, os, socket, threading, time, urllib.request, urllib.error
 from datetime import datetime
 
-GT = "https://api.geckoterminal.com/api/v2/networks"
+GT_API = "https://api.geckoterminal.com/api/v2"
+GT = GT_API + "/networks"
 GT_BUDGET = 3.0   # секунд на шапку целиком (все попытки): дольше скан не ждёт
 GT_FIRST = 1.5    # секунд на GT в fetch_market до перехода на DexScreener (успевает 2 попытки на 429)
 DS = "https://api.dexscreener.com/tokens/v1"
@@ -90,7 +91,7 @@ def _cache_get(key):
     return hit[1] if hit and time.time() - hit[0] < GT_CACHE_TTL else None
 
 
-def _gt(path, budget=GT_BUDGET):
+def _gt(path, budget=GT_BUDGET, base=GT):
     """GET к GeckoTerminal. На все попытки (включая паузы после 429) не больше budget секунд:
     шапка не должна задерживать скан. Удачный ответ кэшируется на GT_CACHE_TTL. Неудачные попытки
     пишутся в лог одной строкой (и при итоговом сбое, и при успехе после повторов)."""
@@ -113,8 +114,8 @@ def _gt(path, budget=GT_BUDGET):
             raise last or TimeoutError("geckoterminal: no time left")
         try:
             if forced:
-                raise urllib.error.HTTPError(GT + path, 429, "GT_FORCE_FAIL", {}, None)
-            data = _get(GT + path, left)
+                raise urllib.error.HTTPError(base + path, 429, "GT_FORCE_FAIL", {}, None)
+            data = _get(base + path, left)
             if fails:
                 log("ok after")
             _cache_put(path, data)
@@ -170,6 +171,36 @@ def fetch_market(token, network="robinhood", now=None, budget=GT_BUDGET):
     if out:
         _cache_put(key, dict(out))
     return out
+
+
+NATIVE_WRAPPED = {"robinhood": "0x0bd7d308f8e1639fab988df18a8011f41eacad73"}   # WETH: цена нативной монеты сети
+
+
+def native_usd(network="robinhood", budget=GT_BUDGET):
+    """Цена ETH в USD (WETH сети) или None: GT /simple/.../token_price (кэш GT_CACHE_TTL), не ответил —
+    самая ликвидная пара WETH на DexScreener. Для цены токенов Flap на кривой (Portal знает цену в ETH,
+    GeckoTerminal кривую не знает)."""
+    weth = NATIVE_WRAPPED.get(network)
+    if not weth:
+        return None
+    end = time.time() + budget
+    try:
+        d = _gt(f"/simple/networks/{network}/token_price/{weth}", budget=min(budget, GT_FIRST), base=GT_API)
+        v = (((d.get("data") or {}).get("attributes") or {}).get("token_prices") or {}).get(weth)
+        if v not in (None, "") and float(v) > 0:
+            return float(v)
+    except Exception:
+        pass
+    try:
+        key = ("native", network)
+        if (hit := _cache_get(key)) is not None:
+            return hit
+        out = _ds_market(weth, network, budget=max(0.3, min(DS_BUDGET, end - time.time())))
+        if out.get("price_usd"):
+            _cache_put(key, out["price_usd"])
+        return out.get("price_usd")
+    except Exception:
+        return None
 
 
 def _gt_market(d, now=None):

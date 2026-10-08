@@ -104,6 +104,17 @@ HELP = (
     "Send a token address to scan it."
 )
 
+LAUNCHPADS_FLAP = "<b>Launchpads</b>: Pons V2 and Flap on Robinhood Chain, pump.fun on Solana.\n\n"
+
+
+def help_text(flap=False):
+    """/help; Flap включён на сайте — строка о площадках перед последней строкой."""
+    if not flap:
+        return HELP
+    tail = "Send a token address to scan it."
+    return HELP[:-len(tail)] + LAUNCHPADS_FLAP + tail
+
+
 ASK_ADDRESS = "Send me a token address from Robinhood Chain or Solana"
 HINT = "Send me a token address from Robinhood Chain (0x…) or Solana. /help explains the verdict."
 SCAN_USAGE = "Usage: /scan &lt;token address&gt;"
@@ -182,9 +193,25 @@ def rug_lines(rug):
     return lines
 
 
+def _tax(x):
+    return f"{x * 100:.2f}".rstrip("0").rstrip(".") + "%"
+
+
+def flap_line(res):
+    """Токен Flap: "Flap · bonding curve 26% · tax 3%/3%" или "Flap · Uniswap V2"; не Flap — None."""
+    f = res.get("flap") if res.get("launchpad") == "flap" else None
+    if not isinstance(f, dict):
+        return None
+    parts = ["Flap", "Uniswap V2" if f.get("phase") == "dex" else e(f.get("phase_text") or "bonding curve")]
+    tax = f.get("tax") or {}
+    if tax.get("buy") or tax.get("sell"):
+        parts.append(f"tax {_tax(tax.get('buy') or 0)}/{_tax(tax.get('sell') or 0)}")
+    return " · ".join(parts)
+
+
 def verdict(res):
     """Результат скана сайта → HTML-текст вердикта."""
-    lines = [title(res), ""]
+    lines = [title(res)] + ([fl] if (fl := flap_line(res)) else []) + [""]
     holders = len(res.get("holders") or [])
     ops = res.get("operators") or []
     if res.get("band") == TOO_ESTABLISHED:     # полный скан не запускался: без скора

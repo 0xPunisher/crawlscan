@@ -251,6 +251,35 @@ class TestVerdict(unittest.TestCase):
         drain(bot)
         return tg.of("editMessageText")[-1]
 
+    def test_flap_line(self):
+        curve = result(header={"name": "Quant", "ticker": "QUANT"}) | {
+            "launchpad": "flap", "flap": {"phase": "bonding_curve", "phase_text": "bonding curve 26%",
+                                          "tax": {"buy": 0.03, "sell": 0.03}}}
+        t = self.scan(FakeAPI(curve))["text"]
+        self.assertIn("<b>$QUANT</b> · Quant · Robinhood Chain\nFlap · bonding curve 26% · tax 3%/3%\n", t)
+        self.assertIn("Score", t)                                     # остальное — как у Pons
+        dex = curve | {"flap": {"phase": "dex", "phase_text": "dex", "tax": {"buy": 0, "sell": 0}}}
+        self.assertEqual(T.flap_line(dex), "Flap · Uniswap V2")
+        odd = curve | {"flap": {"phase": "dex", "tax": {"buy": 0.0899, "sell": 0.02}}}
+        self.assertEqual(T.flap_line(odd), "Flap · Uniswap V2 · tax 8.99%/2%")
+        pons = self.scan(FakeAPI(result()))["text"]
+        self.assertNotIn("Flap", pons)
+        self.assertIsNone(T.flap_line(result()))
+
+    def test_help_lists_flap_only_when_site_has_it(self):
+        self.assertEqual(T.help_text(False), T.HELP)
+        self.assertNotIn("Flap", T.HELP)
+        self.assertIn("Pons V2 and Flap", T.help_text(True))
+        self.assertTrue(T.help_text(True).endswith("Send a token address to scan it."))
+
+        class FlapAPI(FakeAPI):
+            def config(self):
+                return {"solana": True, "alerts": False, "flap": True, "trade": {}}
+        bot, tg, _ = make(FlapAPI())
+        bot.handle_update(private("/help"))
+        bot.handle_update({"callback_query": {"id": "q", "data": "help", "message": {"chat": {"id": 1}}}})
+        self.assertEqual(tg.texts(), [T.help_text(True)] * 2)
+
     def test_verdict(self):
         res = result(gates=["biggest operator could move price −62% if sold (≥ 50%; 9.0% of float)",
                             "soft: liquidity too thin ($512)"], band="DANGER", score=31,

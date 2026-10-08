@@ -1,6 +1,7 @@
 """Лента «Recently scanned»: SQLite, тот же файл, что у розыгрыша (DRAW_DB_PATH, по умолчанию ./data/draw.db),
 таблица recent_scans. Один токен — одна запись: новый скан того же токена обновляет её и поднимает наверх.
 Пишется только завершённый скан с вердиктом (ошибки и «not a token address» сюда не попадают).
+launchpad — "flap" у токенов Flap (result["launchpad"]), иначе NULL; колонка добавляется в старую базу при старте.
 """
 import os, sqlite3, threading, time
 
@@ -21,7 +22,7 @@ def entry(result, ts=None):
         return None
     h = result.get("header") or {}
     score = result.get("score")
-    return {"token": result["token"], "chain": result.get("chain") or "robinhood",
+    return {"token": result["token"], "chain": result.get("chain") or "robinhood", "launchpad": result.get("launchpad"),
             "ticker": h.get("ticker") or None, "name": h.get("name") or None,
             "score": int(score) if isinstance(score, (int, float)) else None, "band": result["band"],
             "rug": bool(result.get("rug")), "ts": int(ts if ts is not None else time.time())}
@@ -36,6 +37,9 @@ class RecentStore:
         self.db.row_factory = sqlite3.Row
         with self._lock, self.db:
             self.db.executescript(SCHEMA)
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(recent_scans)")}
+            if "launchpad" not in cols:
+                self.db.execute("ALTER TABLE recent_scans ADD COLUMN launchpad TEXT")
 
     def close(self):
         with self._lock:
@@ -47,8 +51,8 @@ class RecentStore:
         if e is None:
             return None
         with self._lock, self.db:
-            self.db.execute("INSERT OR REPLACE INTO recent_scans(token, chain, ticker, name, score, band, rug, ts) "
-                            "VALUES (:token, :chain, :ticker, :name, :score, :band, :rug, :ts)", {**e, "rug": int(e["rug"])})
+            self.db.execute("INSERT OR REPLACE INTO recent_scans(token, chain, launchpad, ticker, name, score, band, rug, ts) "
+                            "VALUES (:token, :chain, :launchpad, :ticker, :name, :score, :band, :rug, :ts)", {**e, "rug": int(e["rug"])})
         return e
 
     def recent(self, limit=12):

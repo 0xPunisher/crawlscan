@@ -60,6 +60,10 @@
   - «Trade on Axiom» под вердиктом: шаблоны ссылок по сети из /api/config (env TRADE_URL_*), новая вкладка;
     адрес токена в шапке результата — копируется кликом (иконка copy, галочка «copied»), без ссылки на эксплорер.
 
+  - Flap (только при /api/config → flap и только у токенов Flap): бейдж Flap у сети, фаза, налог,
+    «tax goes to the dev», flap.sh в шапке; факт pool; карточка «chart appears after the token graduates»
+    у токена на кривой; бейдж в ленте; «Robinhood (Pons, Flap) and Solana» и карточка роадмапа.
+
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
 и index.html не перезаписывает.
 
@@ -1655,6 +1659,99 @@ rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:no
     ".cs-early-b,.cs-early-n{grid-row:2;font-size:11.5px}.cs-early-b{grid-column:2}.cs-early-b::before{content:'bought ';color:#5f6b72}"
     ".cs-early-n{grid-column:3;text-align:right}.cs-early-n::before{content:'now ';color:#5f6b72}"
     ".cs-early-s{grid-column:2/-1;grid-row:3}}\n")
+
+# ---------------------------------------------------------------------------
+# Flap (лаунчпад Robinhood, только при FLAP_ENABLED: /api/config → flap). Всё — только у токенов Flap
+# (result.launchpad === 'flap') и только когда флаг включён; Pons и Solana выглядят как раньше.
+#   - шапка результата: бейдж Flap рядом с сетью; строкой ниже — фаза («bonding curve N%» / «Uniswap V2»),
+#     налог «tax 3% / 3%» (buy / sell, если есть), «tax goes to the dev», ссылка flap.sh;
+#   - факт pool: «Flap · bonding curve N%» / «Flap · Uniswap V2»;
+#   - чарт токена на кривой (GeckoTerminal кривую не знает; свечи, если есть, — чужого пула, не цена кривой):
+#     всегда карточка «chart appears after the token graduates»,
+#     цена now из шапки (Portal × ETH/USD), ссылка flap.sh, причины rug — как обычно;
+#   - лента recently scanned: бейдж Flap рядом с сетью;
+#   - тексты с площадками (подзаголовок героя, строка под полем, роадмап): Pons и Flap — только при флаге.
+# ---------------------------------------------------------------------------
+FLAP_COLOR = "#f472b6"
+FLAP_JS = r"""// ---- Flap launchpad (FLAP_ENABLED) ----
+const FLAP_COLOR='__FLAP_COLOR__';
+const flapUrl=a=>'https://flap.sh/robinhood/'+encodeURIComponent(a);
+const flapOf=r=>r&&r.launchpad==='flap'&&r.flap&&typeof r.flap==='object'?r.flap:null;
+const flapPct=x=>(Math.round((x||0)*10000)/100).toString()+'%';   // 0.03 -> 3%, 0.0899 -> 8.99%
+const flapPhase=f=>f.phase==='dex'?'Uniswap V2':(f.phase_text||'bonding curve');
+function flapCurveCard(ca,hdrPrice,rug){   // токен на кривой: свечей у GeckoTerminal нет — понятная карточка, не ошибка
+  return `<div style="display:flex;justify-content:space-between;gap:12px;padding:14px 20px 0;font-family:${MONO_F};font-size:11px;color:#5f6b72"><span>price</span><span>Flap · bonding curve</span></div>`
+    +`<div data-chart-flap="1" style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:14px 24px;padding:22px 20px 24px;font-family:${MONO_F}">`
+    +`<div style="display:flex;flex-direction:column;gap:8px;min-width:0"><span style="font-size:14px;color:#c9d1d6">chart appears after the token graduates</span>`
+    +`<span style="font-size:12.5px;color:#8a959c;text-wrap:pretty">The token still trades on the Flap bonding curve${hdrPrice>0?` · now <span style="color:#00c805">${fmtP(hdrPrice)}</span>`:''}</span></div>`
+    +(rug?`<span style="font-size:15px;color:#ff4d4d">probably rug −${dropPct(rug)}% if suspicious holders sell</span>`:'')
+    +`<a href="${escH(flapUrl(ca))}" target="_blank" rel="noopener" style="font-size:13px;color:#9fd9ff;white-space:nowrap">open on flap.sh ↗</a></div>`+rugReasons(rug);
+}
+
+"""
+rep("class Component extends DCLogic {", FLAP_JS.replace("__FLAP_COLOR__", FLAP_COLOR) + "class Component extends DCLogic {")
+# флаг с сервера
+rep(".then(d=>this.setState({solanaOn:!!d.solana,trade:d.trade||null}))",
+    ".then(d=>this.setState({solanaOn:!!d.solana,trade:d.trade||null,flapOn:!!d.flap}))")
+rep("  state={recent:[],view:'landing',", "  state={flapOn:false,recent:[],view:'landing',")
+# факт pool
+rep("            pool:ch==='solana'?(r.launch&&r.launch.complete?'PumpSwap':'pump.fun curve'):'Pons V2',",
+    "            pool:ch==='solana'?(r.launch&&r.launch.complete?'PumpSwap':'pump.fun curve'):flapOf(r)?'Flap · '+flapPhase(flapOf(r)):'Pons V2',")
+# шапка: бейдж и строка Flap
+rep("  blank(ca){return {", """  flapVals(){   // токен Flap и флаг включён: бейдж, фаза, налог, ссылка flap.sh
+    const raw=this.m&&this.m.result&&this.m.result.raw, f=this.state.flapOn&&this.state.view==='scan'&&!this.m.error&&flapOf(raw);
+    if(!f) return {flapOn:false,flapPhase:'',flapTaxOn:false,flapTax:'',flapDevTax:false,flapUrl:'#'};
+    const tax=f.tax||{}, taxOn=!!(tax.buy||tax.sell);
+    return {flapOn:true,flapPhase:flapPhase(f),flapTaxOn:taxOn,flapTax:taxOn?`tax ${flapPct(tax.buy)} / ${flapPct(tax.sell)}`:'',
+      flapDevTax:taxOn&&!!f.tax_recipient_is_dev,flapUrl:flapUrl(raw.token)};
+  }
+  blank(ca){return {""")
+rep("      ...this.tradeVals(),", "      ...this.tradeVals(),\n      ...this.flapVals(),")
+FPILL = f"align-self:center;{MONO};font-size:10.5px;padding:2px 8px;border-radius:999px;white-space:nowrap"
+CHAIN_PILL = ('{{chainLabel}}</span>\n            </div>\n'
+              '            <button sc-camel-on-click="{{copyScanCa}}"')
+rep(CHAIN_PILL,
+    '{{chainLabel}}</span>'
+    f'<sc-if value="{{{{flapOn}}}}" hint-placeholder-val="{{{{false}}}}"><span data-launchpad="flap" style="{FPILL};color:{FLAP_COLOR};'
+    f'border:1px solid {FLAP_COLOR};background:rgba(244,114,182,0.08)">Flap</span></sc-if>\n            </div>\n'
+    f'            <sc-if value="{{{{flapOn}}}}" hint-placeholder-val="{{{{false}}}}"><div data-flap-info="1" style="display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-width:0">'
+    f'<span style="{FPILL};color:#c9d1d6;border:1px solid #2c353b;background:#0b1013">{{{{flapPhase}}}}</span>'
+    f'<sc-if value="{{{{flapTaxOn}}}}" hint-placeholder-val="{{{{false}}}}"><span style="{FPILL};color:#c9d1d6;border:1px solid #2c353b;background:#0b1013">{{{{flapTax}}}}</span></sc-if>'
+    f'<sc-if value="{{{{flapDevTax}}}}" hint-placeholder-val="{{{{false}}}}"><span title="the buy and sell tax is paid to the token deployer" style="{FPILL};color:#f5a623;border:1px solid rgba(245,166,35,0.45);background:rgba(245,166,35,0.08)">tax goes to the dev</span></sc-if>'
+    f'<a href="{{{{flapUrl}}}}" target="_blank" rel="noopener" data-flap-link="1" style="{MONO};font-size:12px;color:#9fd9ff;white-space:nowrap;margin-left:2px" style-hover="color:#ffffff">flap.sh ↗</a>'
+    '</div></sc-if>\n'
+    '            <button sc-camel-on-click="{{copyScanCa}}"')
+# чарт: токен Flap на кривой без свечей — карточка вместо виджета / ошибки
+rep("      const url=(est||noCandles)?widgetUrl(m.ca,d.pool||raw.market_pool):null;\n",
+    "      const fl=flapOf(raw);\n"
+    "      if(fl&&fl.phase==='bonding_curve'&&m.chart.status!=='loading'){   // свечи GT у кривой — не цена кривой\n"
+    "        const k=[m.ca,'flap',rug?rug.drop:0].join('|'); if(el.dataset.k===k) return; el.dataset.k=k;\n"
+    "        el.innerHTML=flapCurveCard(raw.token||m.ca,(raw.header||{}).price_usd,rug); return;\n"
+    "      }\n"
+    "      const url=(est||noCandles)?widgetUrl(m.ca,d.pool||raw.market_pool):null;\n")
+# лента: бейдж Flap рядом с сетью
+rep("        chain:sol?'Solana':'Robinhood', chainColor:sol?'#9945FF':'#00c805',",
+    "        chain:sol?'Solana':'Robinhood', chainColor:sol?'#9945FF':'#00c805', flap:!!this.state.flapOn&&x.launchpad==='flap',")
+rep('              <span class="cs-rc-c" style="{PILL};color:{{{{r.chainColor}}}};border:1px solid {{{{r.chainColor}}}};justify-self:start">{{{{r.chain}}}}</span>\n'.replace('{PILL}', PILL).replace('{{{{', '{{').replace('}}}}', '}}'),
+    f'              <span class="cs-rc-c" style="display:inline-flex;gap:5px;justify-self:start"><span style="{PILL};color:{{{{r.chainColor}}}};border:1px solid {{{{r.chainColor}}}}">{{{{r.chain}}}}</span>'
+    f'<sc-if value="{{{{r.flap}}}}" hint-placeholder-val="{{{{false}}}}"><span data-launchpad="flap" style="{PILL};color:{FLAP_COLOR};border:1px solid {FLAP_COLOR}">Flap</span></sc-if></span>\n')
+rep(".cs-recent-row{grid-template-columns:minmax(0,1fr) 92px 110px",
+    ".cs-recent-row{grid-template-columns:minmax(0,1fr) 136px 110px")
+# телефон: у строки Flap вторая строка шире (бейдж) — адрес третьей строкой, иначе он наезжает на «▼ rug»
+rep('class="cs-recent-row" style=', 'class="cs-recent-row" data-flap="{{r.flapAttr}}" style=')
+rep("flap:!!this.state.flapOn&&x.launchpad==='flap',", "flap:!!this.state.flapOn&&x.launchpad==='flap', flapAttr:this.state.flapOn&&x.launchpad==='flap'?'1':'0',")
+rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:none}"
+    "\n@media (max-width:640px){.cs-recent-row[data-flap=\"1\"]{grid-template-areas:\"t t s v\" \"c c r g\" \"a a a a\"!important}}\n")
+# тексты с площадками: «Robinhood (Pons, Flap) and Solana» — только при флаге
+RH_AND_SOL = '<span style="white-space:nowrap">Robinhood and <span style="color:#9945FF">Solana</span></span>'
+RH_AND_SOL_FLAP = ('<span style="white-space:nowrap">Robinhood <sc-if value="{{flapOn2}}" hint-placeholder-val="{{false}}">'
+                   '<span data-launchpads="1">(Pons, Flap) </span></sc-if>and <span style="color:#9945FF">Solana</span></span>')
+rep(RH_AND_SOL, RH_AND_SOL_FLAP, count=2)
+rep("      ...this.flapVals(),", "      ...this.flapVals(),\n      flapOn2:!!this.state.flapOn,")
+# роадмап: Flap — в конец SHIPPED, только при флаге
+flap_card = (f'<sc-if value="{{{{flapOn2}}}}" hint-placeholder-val="{{{{false}}}}">' + ITEM + TITLE + 'Flap launchpad</span>' + DESC
+             + 'Flap tokens on Robinhood Chain: bonding curve progress, buy and sell tax, early buyers, same verdict.</span></div></sc-if>\n')
+rep(alerts_card, alerts_card + flap_card)
 
 enc = encode(t)
 TITLE_OLD = '<title>Bundled Page</title>'
