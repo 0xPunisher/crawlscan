@@ -7,6 +7,7 @@
 import os, re, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _CFTimeout
 
+from chains import bankr
 from chains import flap
 from chains import priority
 from chains import robinhood as ch
@@ -41,6 +42,15 @@ GT_NETWORK = {"robinhood": "robinhood", "solana": "solana"}
 
 class ScanError(Exception):
     """Понятная пользователю ошибка скана (плохой адрес, не Pons V2 / pump.fun, Solana выключена)."""
+
+
+def not_launchpad(chain):
+    """Текст ошибки «не с лаунчпада» по включённым лаунчпадам сети (выключатели FLAP_ENABLED, BANKR_ENABLED)."""
+    if chain != "robinhood":
+        return NOT_LAUNCHPAD[chain]
+    pads = ["Pons V2"] + (["Flap"] if flap.enabled() else []) + (["Bankr"] if bankr.enabled() else [])
+    return f"not a {pads[0]} token" if len(pads) == 1 else \
+        f"not a {', '.join(pads[:-1])} or {pads[-1]} token"
 
 
 def solana_enabled():
@@ -251,10 +261,15 @@ def scan(token, emit=lambda e: None):
 
     ev("stage", "launch")
     # лаунчпад Robinhood: Flap — только при FLAP_ENABLED, суффикс 8888/7777 (без RPC) и подтверждение Portal
-    # (один HTTP); остальные — Pons прежним путём, без дополнительных запросов
+    # (один HTTP); Bankr — только при BANKR_ENABLED, суффикс ba3 (без RPC) и один eth_call Airlock;
+    # остальные — Pons прежним путём, без дополнительных запросов
     flap_state = flap.detect(token) if chain == "robinhood" else None
+    bankr_state = bankr.detect(token) if chain == "robinhood" and flap_state is None else None
     eth_box, eth_thread = {}, None
-    if flap_state is not None:
+    if bankr_state is not None:
+        a = bankr
+        launch = bankr.get_launch(token, bankr_state)
+    elif flap_state is not None:
         a = flap
         if flap_state["status"] != flap.STATUS_DEX:   # кривая: GT её не знает, цена = Portal × ETH/USD (параллельно)
             eth_thread = threading.Thread(target=lambda: eth_box.update(usd=market.native_usd(network)), daemon=True)
@@ -263,13 +278,13 @@ def scan(token, emit=lambda e: None):
     else:
         launch = a.get_launch(token)
     if launch is None:
-        raise ScanError(NOT_LAUNCHPAD_FLAP if chain == "robinhood" and flap.enabled() else NOT_LAUNCHPAD[chain])
+        raise ScanError(not_launchpad(chain))
     if est := late_established():
         return est
 
     ev("stage", "transfers")
     # Flap: история большого токена читается окнами в бюджете скана (deadline считается от начала скана)
-    facts = a.token_facts(token, launch, deadline) if a is flap else a.token_facts(token, launch)
+    facts = a.token_facts(token, launch, deadline) if a in (flap, bankr) else a.token_facts(token, launch)
     transfers, supply, excluded, mkt = facts["transfers"], facts["supply"], facts["excluded"], facts["market"]
     base = facts["base"] or d.supply_base(transfers, supply, excluded)
     holders = d.top_holders(base)
@@ -368,22 +383,25 @@ def scan(token, emit=lambda e: None):
     # сигналы холдеров ограничены: без жёстких правил по impact и transfer и без probably rug
     limited = not gt and time.time() - ts[launch["block"]] > limits["min_age_days"] * 86400
     # Flap: большая история прочитана окнами и топ не гарантированно точный — сигналы холдеров тоже ограничены
-    hist = (facts.get("flap") or {}).get("history") or {}
+    hist = (facts.get("flap") or facts.get("bankr") or {}).get("history") or {}
     partial = hist.get("mode") == "windowed" and not hist.get("top_exact")
     limited_note = d.PARTIAL_NOTE if partial and not limited else d.LIMITED_NOTE
     limited = limited or partial
     # резерв надёжен: адаптер нашёл пул (на кривой — всегда) и он согласуется с ликвидностью GT
     reserve_ok = facts.get("reserve_ok", True) and reserve_seen(facts["reserve"], supply, gt)
     q_factor = facts.get("q_factor", 1)   # Flap после выпуска: налог на продажу токенами (1 − sellTax)
+    # Bankr: impact по котировкам V4Quoter (impact_curve), не по резерву; невыкупаемый вестинг дева (locked) —
+    # в его доле, но не в q (продать сейчас нельзя). Pons и Flap: None — прежний путь
+    curve, locked = facts.get("impact_curve"), facts.get("locked")
     sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"), reserve_ok=reserve_ok,
-                 limited=limited, q_factor=q_factor, limited_note=limited_note)
+                 limited=limited, q_factor=q_factor, limited_note=limited_note, impact_curve=curve, locked=locked)
     reason = _reason(sc, base)
     # probably rug: только вычисления на уже собранных данных, без запросов в сеть
     # и только если DANGER вызван поведенческим жёстким правилом (не одиночным китом в тонком пуле)
     behavioral = any(not g.startswith("soft:") for g in sc["gates"])
     rug = None if limited else d.rug_projection(holders, sig, ops, base, facts["reserve"], sc["band"],
                                                 snipers=a.RUG_SNIPERS, reserve_ok=reserve_ok, behavioral=behavioral,
-                                                q_factor=q_factor)
+                                                q_factor=q_factor, impact_curve=curve, locked=locked)
     # Flap на кривой: GeckoTerminal её не знает — имя и тикер из контракта, цена = Portal × ETH/USD,
     # капа = цена × весь сапплай, ликвидность = ETH в кривой × ETH/USD
     fl = facts.get("flap") or {}
@@ -407,7 +425,8 @@ def scan(token, emit=lambda e: None):
     elapsed = round(time.time() - t0, 1)
     ev("done", reason, score=sc["score"], band=sc["band"], headline=sc["headline"], rug=rug)
 
-    extra = {"launchpad": "flap", "flap": facts["flap"]} if "flap" in facts else {}
+    extra = ({"launchpad": "flap", "flap": facts["flap"]} if "flap" in facts else
+             {"launchpad": "bankr", "bankr": facts["bankr"]} if "bankr" in facts else {})
     return extra | {
         "token": token, "chain": chain, "header": header,
         "launch": launch | {"ts": ts[launch["block"]]},

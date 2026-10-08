@@ -274,6 +274,29 @@ def dump_impact(q, reserve):
     return 1.0 - (reserve / (reserve + q)) ** 2
 
 
+def curve_impact(q, curve):
+    """Падение цены после продажи q по кривой котировок [(q_i, падение_i)] (по возрастанию q; Bankr — V4Quoter):
+    между точками — линейно; меньше первой — пропорционально от нуля; больше последней — как у последней."""
+    if q <= 0:
+        return 0.0
+    if q <= curve[0][0]:
+        return curve[0][1] * q / curve[0][0]
+    for (q0, i0), (q1, i1) in zip(curve, curve[1:]):
+        if q <= q1:
+            return i0 + (i1 - i0) * (q - q0) / (q1 - q0)
+    return curve[-1][1]
+
+
+def _impact(q, reserve, curve=None):
+    """dump_impact по резерву x*y=k или, если есть кривая котировок (curve не пустая), по ней."""
+    return curve_impact(q, curve) if curve else dump_impact(q, reserve)
+
+
+def _unlocked(q, wallets, locked, k=1.0):
+    """q минус ещё не разблокированное у этих кошельков (вестинг дева: в доле есть, продать сейчас нельзя), × k."""
+    return max(0, q - k * sum(locked.get(w, 0) for w in wallets)) if locked else q
+
+
 def _part(name, x, scale=None):
     good, bad = SCALE[scale or name]
     k = 1.0 if x <= good else 0.0 if x >= bad else (bad - x) / (bad - good)
@@ -306,7 +329,7 @@ def _sold_into_pool(q, q_factor):
 
 
 def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True, limited=False, q_factor=1,
-          limited_note=LIMITED_NOTE):
+          limited_note=LIMITED_NOTE, impact_curve=None, locked=None):
     """Скор 0–100 (100 = чисто): {"score", "band", "parts", "gates", "metrics", "headline"}.
     reserve — резерв токенов ликвидности (сырые единицы): баланс пула после миграции или кривой до.
     Часть "operator" и её стоп-правило — от dump_impact крупнейшего оператора (q = взвешенная доля
@@ -322,10 +345,15 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     жёсткие правила по impact и transfer не применяются, band не ниже RISKY, к headline добавляется LIMITED_NOTE.
     Меньше MIN_HOLDERS холдеров (base["holders_total"]) → score None, band TOO_EARLY_OR_LATE.
     q_factor — доля продажи, которая дойдёт до ликвидности (1 − налог на продажу, если налог берётся токенами).
-    limited_note — пояснение к limited в headline (по умолчанию LIMITED_NOTE; Flap с неполным топом — PARTIAL_NOTE)."""
+    limited_note — пояснение к limited в headline (по умолчанию LIMITED_NOTE; Flap с неполным топом — PARTIAL_NOTE).
+    impact_curve — кривая котировок [(q, падение)] (Bankr: V4Quoter): impact по ней, а не по резерву; None — по резерву.
+    locked — {кошелёк: токенов}, которые в доле кошелька, но продать сейчас нельзя (вестинг дева Bankr): из q для
+    impact вычитаются (с весом оператора); None — q без изменений."""
     n = len(holders)
     big = ops[0] if ops else {"share": 0.0, "share_supply": 0.0, "weighted": 0.0, "wallets": []}
-    impact = dump_impact(_sold_into_pool(big["weighted"] * base["circulating"], q_factor), reserve) if reserve_ok else None
+    q = _unlocked(big["weighted"] * base["circulating"], big["wallets"], locked,
+                  big["weighted"] / big["share"] if locked and big["share"] else 1.0)
+    impact = _impact(_sold_into_pool(q, q_factor), reserve, impact_curve) if reserve_ok else None
     headline = (f"{n} wallets → {len(ops)} operators, biggest holds "
                 f"{big['share'] * 100:.1f}% of float ({big['share_supply'] * 100:.1f}% of supply)"
                 + _impact_phrase(impact, ops) + (limited_note if limited else ""))
@@ -396,7 +424,7 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
 
 
 def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, reserve_ok=True, behavioral=True,
-                   q_factor=1):
+                   q_factor=1, impact_curve=None, locked=None):
     """Проекция «probably rug»: куда упадёт цена, если весь подозрительный запас продадут в ликвидность.
     Только при band DANGER (скор и вердикт не меняет); иначе, без запаса или при падении
     < RUG_MIN_DROP — None.
@@ -413,7 +441,7 @@ def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, res
     behavioral — DANGER вызван поведенческим жёстким правилом (связанный оператор, virgin, transfer); нет — None:
     одиночный кит в тонком пуле или низкий скор без сигналов — не rug. Части запаса — только поведенческие
     (linked, transfer, virgin, bundle/snipers): кит без сигналов в запас не входит.
-    q_factor — как в score: до ликвидности доходит q × q_factor."""
+    q_factor — как в score: до ликвидности доходит q × q_factor. impact_curve и locked — как в score."""
     if band != "DANGER" or not reserve_ok or not behavioral:
         return None
     linked = {w for o in ops if len(o["wallets"]) > 1 for w in o["wallets"]}
@@ -435,7 +463,7 @@ def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, res
         q += sum(r[1] for r in rows)
     if not taken:
         return None
-    drop = dump_impact(_sold_into_pool(q, q_factor), reserve)
+    drop = _impact(_sold_into_pool(_unlocked(q, taken, locked), q_factor), reserve, impact_curve)
     if drop < RUG_MIN_DROP:
         return None
     share = sum(p["share"] for p in parts)
