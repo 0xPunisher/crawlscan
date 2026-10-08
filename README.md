@@ -54,6 +54,8 @@ What normally requires manual blockchain analysis is reduced to a few seconds.
 | **Robinhood Chain** | Pons V2 (bonding curve and Uniswap V4 pools) | Robinhood explorer |
 | **Solana**          | pump.fun (bonding curve, PumpSwap and Raydium after migration) | Solscan |
 
+**Flap** on Robinhood Chain (bonding curve, then Uniswap V2 after graduation, with optional buy and sell tax) is supported behind `FLAP_ENABLED` and is off by default. With it on, Flap results show the curve progress or the pool, the tax and whether it goes to the dev, a price from the curve while GeckoTerminal doesn't list the token yet, and early buyers through the curve and the pair. The site and the bot mention Flap only when it is on.
+
 ## Why CRAWLSCAN is different
 
 Most token scanners answer questions like:
@@ -262,6 +264,7 @@ cp .env.example .env
 # CRAWLER_RPC=https://robinhood-mainnet.g.alchemy.com/v2/<your-key>
 # SOLANA_RPC=https://solana-mainnet.g.alchemy.com/v2/<your-key>
 # SOLANA_ENABLED=true          # Solana scans are off unless this is true
+# FLAP_ENABLED=true            # Flap tokens on Robinhood Chain are off unless this is true
 python3 server.py
 ```
 
@@ -306,6 +309,7 @@ Only one copy of the bot can poll Telegram at a time.
 * [x] **Burns & holder rewards**: the developer burns tokens every 12 hours, and one holder wins daily rewards paid in ETH. Every burn, winner and payout is verifiable onchain, with the full history on the site
 * [x] **Early buyers**: the first 20 buyers after launch, what they did since, and wallets that sent tokens to the same destination
 * [x] **Telegram alerts**: watch up to 3 tokens in the bot and get a message when the verdict, the probably rug projection, the biggest operator or the early buyers change
+* [x] **Flap launchpad** (behind `FLAP_ENABLED`): Flap tokens on Robinhood Chain with bonding curve progress, buy and sell tax, early buyers and the same verdict
 
 ### 🟢 In progress
 

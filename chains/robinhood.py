@@ -41,6 +41,10 @@ INFRA = {  # не холдеры ни для какого токена; крив
     "0x0bd7d308f8e1639fab988df18a8011f41eacad73",  # WETH
     "0x0000000000000000000000000000000000000000",
 }
+LOCKERS = {  # известные сервисы блокировки токенов на сети (любой лаунчпад): перевод туда — не выход, а блокировка
+    "0x548129a58bc230549df7f9e33f27e77f6779ff0f": "Sablier",   # Sablier Lockup (NFT SAB-LOCKUP)
+    "0x37c434ec1c54e360900e3a022247d5e20137c1de": "Sablier",   # Sablier: периферия создания стримов
+}
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 CURVE_BUY  = "0xec36bf571f136799e8dc0b0b8bea4b04d8bd3d43de838aab0d5fc21d4cbfc455"
 CURVE_SELL = "0x8113d738abdcb6b38357e9d53a54a7157861a09031b453651f0fe7fe151f59df"
@@ -896,7 +900,14 @@ def early_buyers(token, n=20, deadline=None):
     launch = hist[0] if hist else get_launch(token)
     if launch is None:
         return None
-    excluded, market = excluded_addresses(launch["curve"]), market_addresses(launch["curve"])
+    return early_buyers_from(token, n, deadline, launch, excluded_addresses(launch["curve"]),
+                             market_addresses(launch["curve"]), classify_entries, hist)
+
+
+def early_buyers_from(token, n, deadline, launch, excluded, market, classify, hist=None):
+    """Ядро early_buyers для лаунчпада Robinhood (Pons, Flap): launch — {"block", "curve", "deployer"},
+    excluded — не покупатели, market — откуда токен приходит покупкой без чека, classify — classify_entries
+    лаунчпада (покупка по чеку), hist — история скана (launch, transfers, supply) или None."""
     head = None if hist else block_number()
     lo, span, trs = launch["block"], EARLY_WINDOW, list(hist[1]) if hist else []
     buyers, checked = [], set()
@@ -922,7 +933,7 @@ def early_buyers(token, n=20, deadline=None):
             # токен пришёл прямо с кривой, роутера Pons или pool manager — покупка без чека;
             # иначе (сторонний бот-роутер, другой кошелёк) — по чеку входа
             unsure = [a for a in wallets if src.get(a) not in market]
-            ent = classify_entries(token, trs, unsure) if unsure else {}
+            ent = classify(token, trs, unsure) if unsure else {}
             buyers += [a for a in wallets if a not in ent or ent[a]["kind"] == "buy"]
         if len(buyers) >= n or hi >= head or (deadline and time.time() > deadline):
             break
@@ -949,13 +960,28 @@ def early_status(token, buyers, deadline=None, launch=None, out_cap=EARLY_OUT_CA
     "burned", "partial"}}}. Все входы и выходы кошельков — из истории скана + хвост после неё (scan_history),
     иначе двумя getLogs по топикам (to / from); баланс — из них.
     Выход на рынок (кривая, роутеры, pool manager) — продажа; на другой адрес — по чеку (CurveSell или токен
-    в pool manager в той же транзакции — продажа через сторонний роутер), иначе перевод; на burn / 0x0 — сожжено.
+    в pool manager в той же транзакции — продажа через сторонний роутер), иначе перевод; на burn / 0x0 — сожжено; в локер (LOCKERS) — заблокировано.
     partial — выходов не на рынок больше out_cap или не успели до deadline."""
     token = token.lower()
     hist = scan_history(token)
+    market = market_addresses(launch["curve"]) if launch and launch.get("curve") else ROUTERS | {V4_POOL_MGR}
+    return early_status_from(token, buyers, deadline, market, _pons_sell, hist, out_cap)
+
+
+def _pons_sell(token, logs):
+    """Чек выхода — продажа Pons: CurveSell или токен ушёл в V4 pool manager в той же транзакции."""
+    return any((l.get("topics") or [""])[0].lower() == CURVE_SELL for l in logs) or any(
+        (p := parse_transfer(l)) and p["token"] == token and p["to"] == V4_POOL_MGR for l in logs)
+
+
+def early_status_from(token, buyers, deadline, market, is_sell, hist=None, out_cap=EARLY_OUT_CAP):
+    """Ядро early_status для лаунчпада Robinhood (Pons, Flap): market — выход туда = продажа,
+    is_sell(token, логи чека) — продажа через сторонний контракт; hist — история скана или None.
+    Перевод в известный локер (LOCKERS: Sablier) — блокировка: "locked" (сколько) и "locked_in" (где), не перевод."""
     supply = hist[2] if hist else token_supply(token)
     ws = [b["wallet"] for b in buyers]
-    out = {w: {"now": 0, "sold": 0, "moved": {}, "burned": 0, "partial": False} for w in ws}
+    out = {w: {"now": 0, "sold": 0, "moved": {}, "burned": 0, "locked": 0, "locked_in": [], "partial": False}
+           for w in ws}
     if not ws:
         return {"supply": supply, "wallets": out}
     if hist:   # история скана + хвост после неё: один getLogs вместо двух по всей истории
@@ -971,7 +997,6 @@ def early_status(token, buyers, deadline=None, launch=None, out_cap=EARLY_OUT_CA
         out[t["to"]]["now"] += t["amount"]
     for t in outs:
         out[t["frm"]]["now"] -= t["amount"]
-    market = market_addresses(launch["curve"]) if launch and launch.get("curve") else ROUTERS | {V4_POOL_MGR}
     check = defaultdict(list)
     for t in outs:
         o = out[t["frm"]]
@@ -979,6 +1004,10 @@ def early_status(token, buyers, deadline=None, launch=None, out_cap=EARLY_OUT_CA
             o["sold"] += t["amount"]
         elif t["to"] in BURN_ADDRS:
             o["burned"] += t["amount"]
+        elif t["to"] in LOCKERS:
+            o["locked"] += t["amount"]
+            if LOCKERS[t["to"]] not in o["locked_in"]:
+                o["locked_in"].append(LOCKERS[t["to"]])
         else:
             check[t["frm"]].append(t)
     pick = []
@@ -993,8 +1022,7 @@ def early_status(token, buyers, deadline=None, launch=None, out_cap=EARLY_OUT_CA
             break
         part = txs[i:i + 50]
         for h, logs in receipt_logs(part).items():
-            if any((l.get("topics") or [""])[0].lower() == CURVE_SELL for l in logs) or any(
-                    (p := parse_transfer(l)) and p["token"] == token and p["to"] == V4_POOL_MGR for l in logs):
+            if is_sell(token, logs):
                 sells.add(h)
         checked |= set(part)
     for t in pick:

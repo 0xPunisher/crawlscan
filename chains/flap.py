@@ -33,10 +33,9 @@ VAULT_PORTAL = "0xe9f7ab7de8fb8756acbb6a1cd13316a43308197b"
 TAX_HELPER = "0xb10bd2672ae63735d677164a54b573a016f0203c"
 V2_FACTORY = "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f"      # Uniswap V2 Factory: пары после выпуска
 SHADOW_FACTORY = "0x0d1ebb179cdbca88d74c923c4255cb2b17474afd"  # «теневые» пары налоговых токенов (зеркало кривой)
-LOCKERS = {  # сторонние локеры/вестинг (своего локера Flap на Robinhood нет, docs.flap.sh); залоченное — в "locked"
-    "0x548129a58bc230549df7f9e33f27e77f6779ff0f",  # Sablier Lockup (NFT SAB-LOCKUP): TasQ — вся покупка дева
-    "0x37c434ec1c54e360900e3a022247d5e20137c1de",  # Sablier: периферия создания стримов (токены идут через неё)
-}
+# сторонние локеры/вестинг сети (своего локера Flap на Robinhood нет, docs.flap.sh): ch.LOCKERS — Sablier
+# (TasQ — вся покупка дева); залоченное — в "locked" результата, в early buyers — статус locked
+LOCKERS = set(ch.LOCKERS)
 INFRA = LOCKERS | {  # не холдеры ни для какого токена Flap (сверх ch.INFRA)
     PORTAL, VAULT_PORTAL, TAX_HELPER, V2_FACTORY, SHADOW_FACTORY,
     "0xd3421b1b616a72bb88993a0cf75709bb8d532cc1",  # Trigger Service
@@ -449,6 +448,17 @@ def history(token, launch_block, supply, excluded, deadline=None):
     return transfers, base, info, {a: v for a, v in bal.items() if a in excluded}
 
 
+def _sets(token, st, launch):
+    """(own, market, excluded) токена: свои контракты (токен, taxProcessor, пара, теневая пара, Flap Vault
+    получателя налога), рынок (Portal, помощники, роутеры, pool manager, свои кроме теневой пары) и все
+    не-холдеры (рынок + свои + инфраструктура Flap и Robinhood)."""
+    own = {token} | {x for x in (st["tax_processor"], st["main_pool"], launch.get("shadow_pair")) if x}
+    if st["tax_recipient"] and st["tax_recipient_vault"]:
+        own.add(st["tax_recipient"])          # Flap Vault — контракт получателя налога, не холдер
+    market = {PORTAL} | PORTAL_HELPERS | ROUTERS | {ch.V4_POOL_MGR} | own - {launch.get("shadow_pair")}
+    return own, market, ch.INFRA | INFRA | market | own
+
+
 def token_facts(token, launch, deadline=None):
     """Факты для движка (общий контракт сетей) + "q_factor" и "flap" (данные лаунчпада для результата).
     Резерв: на кривой — виртуальный h + 1e9 − circulating из состояния Portal; после выпуска — getReserves пары.
@@ -459,11 +469,7 @@ def token_facts(token, launch, deadline=None):
     supply = ch.token_supply(token)
     dex = st["status"] == STATUS_DEX
     pool = st["main_pool"]
-    own = {token} | {x for x in (st["tax_processor"], pool, launch.get("shadow_pair")) if x}
-    if st["tax_recipient"] and st["tax_recipient_vault"]:
-        own.add(st["tax_recipient"])          # Flap Vault — контракт получателя налога, не холдер
-    market = {PORTAL} | PORTAL_HELPERS | ROUTERS | {ch.V4_POOL_MGR} | own - {launch.get("shadow_pair")}
-    excluded = ch.INFRA | INFRA | market | own
+    own, market, excluded = _sets(token, st, launch)
     transfers, base, hist, infra_bal = history(token, launch["block"], supply, excluded, deadline)
     if dex:   # пара не прочиталась — резерв 0: reserve_ok False («liquidity not measured»), а не формула кривой
         reserve, is0 = _pair_reserve(token, pool) if pool else (0, None)
@@ -487,6 +493,9 @@ def token_facts(token, launch, deadline=None):
     info = {"phase": "dex" if dex else "bonding_curve",
             "phase_text": "dex" if dex else f"bonding curve {st['progress'] / 1e16:.0f}%",
             "progress": st["progress"] / 1e18, "version": st["version"],
+            # цена на кривой из Portal (ETH за токен; шапка — × ETH/USD в движке: GeckoTerminal кривую не знает)
+            "price_eth": st["price"] / 1e18 if not dex and st["quote"] == ZERO and st["price"] else None,
+            "reserve_eth": st["reserve"] / 1e18 if not dex and st["quote"] == ZERO else None,   # ETH в кривой
             "tax": {"buy": st["buy_tax"] / 10_000, "sell": st["sell_tax"] / 10_000},
             "tax_recipient": rcp if (st["buy_tax"] or st["sell_tax"]) else None,
             "tax_recipient_is_dev": is_dev and bool(st["buy_tax"] or st["sell_tax"]),
@@ -537,6 +546,37 @@ def classify_entries(token, transfers, wallets, chunk=50):
         out[w] = {"kind": "buy" if buys else "transfer", "tx": t["tx"], "block": t["block"], "via": t["frm"],
                   "eth_in": eth_in}
     return out
+
+
+def early_buyers(token, n=20, deadline=None):
+    """Первые n покупателей после запуска (контракт как у ch.early_buyers) или None (не Flap).
+    Окном после запуска, как у Pons (общее ядро ch.early_buyers_from): покупка без чека — токен пришёл прямо
+    с рынка (Portal на кривой, его помощники, роутеры, пара V2 после выпуска); иначе по чеку входа
+    (classify_entries: TokenBought на Portal или Swap пары). Инфраструктура Flap — не покупатели.
+    Токен с контракта токена или taxProcessor (налоговые ноги) — не покупка без чека."""
+    token = token.lower()
+    st = _STATE.get(token) or detect(token)
+    launch = get_launch(token, st) if st else None
+    if launch is None:
+        return None
+    own, market, excluded = _sets(token, st, launch)
+    direct = market - (own - {st["main_pool"]})
+    return ch.early_buyers_from(token, n, deadline, launch, excluded, direct, classify_entries)
+
+
+def _sell(market):
+    """Чек выхода — продажа: в той же транзакции токен ушёл на рынок (Portal, пара, роутер, налог на продажу)."""
+    return lambda token, logs: any((p := ch.parse_transfer(l)) and p["token"] == token and p["to"] in market
+                                   for l in logs)
+
+
+def early_status(token, buyers, deadline=None, launch=None, out_cap=ch.EARLY_OUT_CAP):
+    """Что ранние покупатели сделали с токеном (контракт как у ch.early_status): выход на рынок — продажа,
+    на другой адрес — по чеку (токен ушёл на рынок в той же транзакции — продажа через сторонний контракт)."""
+    token = token.lower()
+    st = _STATE.get(token) or detect(token)
+    _, market, _ = _sets(token, st, launch or {})
+    return ch.early_status_from(token, buyers, deadline, market, _sell(market), out_cap=out_cap)
 
 
 # общее с Robinhood: вызываются в момент вызова (тесты подменяют функции ch)

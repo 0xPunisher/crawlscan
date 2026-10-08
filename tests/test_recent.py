@@ -31,7 +31,7 @@ class TestStore(unittest.TestCase):
         self.store.record(res("0x" + "33" * 20, band="DANGER", score=10, rug={"drop": 0.6}), ts=150)
         items = self.store.recent(12)
         self.assertEqual([x["token"] for x in items], [SOL, "0x" + "33" * 20, "0x" + "11" * 20])
-        self.assertEqual(items[0], {"token": SOL, "chain": "solana", "ticker": "SOLX", "name": "Alpha",
+        self.assertEqual(items[0], {"token": SOL, "chain": "solana", "launchpad": None, "ticker": "SOLX", "name": "Alpha",
                                     "score": 80, "band": "CLEAN", "rug": False, "ts": 200})
         self.assertTrue(items[1]["rug"])
         self.assertEqual(len(self.store.recent(2)), 2)
@@ -49,6 +49,27 @@ class TestStore(unittest.TestCase):
         e = entry({"token": "0x" + "44" * 20, "chain": "robinhood", "header": None, "score": None,
                    "band": "TOO_EARLY_OR_LATE", "rug": None}, ts=5)
         self.assertEqual((e["score"], e["ticker"], e["name"], e["rug"]), (None, None, None, False))
+
+    def test_flap_launchpad(self):
+        self.store.record(res("0x" + "66" * 20) | {"launchpad": "flap"}, ts=300)
+        self.assertEqual(self.store.recent(1)[0]["launchpad"], "flap")
+
+    def test_old_db_gets_launchpad_column(self):
+        import sqlite3
+        path = os.path.join(self.tmp.name, "old.db")
+        db = sqlite3.connect(path)
+        db.executescript("CREATE TABLE recent_scans (token TEXT PRIMARY KEY, chain TEXT NOT NULL, ticker TEXT, "
+                         "name TEXT, score INTEGER, band TEXT NOT NULL, rug INTEGER NOT NULL, ts INTEGER NOT NULL);"
+                         "INSERT INTO recent_scans VALUES ('0xold', 'robinhood', 'OLD', 'Old', 50, 'OK', 0, 1);")
+        db.commit()
+        db.close()
+        st = RecentStore(path)
+        try:
+            self.assertIsNone(st.recent()[0]["launchpad"])
+            st.record(res("0x" + "77" * 20) | {"launchpad": "flap"}, ts=2)
+            self.assertEqual(st.recent()[0]["launchpad"], "flap")
+        finally:
+            st.close()
 
     def test_no_verdict_not_saved(self):
         for bad in (None, {}, {"token": "0x" + "55" * 20}, {"band": "OK"}, "error"):

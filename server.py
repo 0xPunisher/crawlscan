@@ -8,9 +8,9 @@ Read-only: скан идёт в фоне, браузер опрашивает с
                                             свечи GeckoTerminal [[ts, o, h, l, c, v]] от старых к новым; в скан не входит
   GET  /api/early?token=CA               -> {"token", "chain", "available", "buyers": [...], "summary": {...}[, "stale_at"]}
                                             первые 20 покупателей и их статус сейчас (early.py); в скан не входит
-  GET  /api/recent?limit=12              -> {"items": [{"token", "chain", "ticker", "name", "score", "band", "rug", "ts"}]}
+  GET  /api/recent?limit=12              -> {"items": [{"token", "chain", "launchpad", "ticker", "name", "score", "band", "rug", "ts"}]}
                                             лента «Recently scanned»: последние уникальные токены, новые сверху
-  GET  /api/config                       -> {"solana": bool, "alerts": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
+  GET  /api/config                       -> {"solana": bool, "alerts": bool, "flap": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
                                             шаблоны ссылки Trade on Axiom ({address}), env TRADE_URL_* (trade.py)
   GET  /                                 -> index.html
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
@@ -62,7 +62,7 @@ import alerts
 import alerts_notify
 import alerts_recheck
 import detect
-from chains import priority
+from chains import flap, priority
 import early
 import engine
 import market
@@ -382,7 +382,7 @@ def record_early(body):
         return
     try:
         if body.get("available") and not body.get("error") and not body.get("stale_at") and body.get("summary"):
-            alerts_store().set_early(body["token"], body["summary"]["now_share_supply"])
+            alerts_store().set_early(body["token"], body["summary"].get("held_share_supply", body["summary"]["now_share_supply"]))   # локер — не выход
     except Exception as e:
         print(f"alerts: early share not saved: {type(e).__name__}: {e}", flush=True)
 
@@ -710,7 +710,7 @@ class H(BaseHTTPRequestHandler):
             return self._alerts("GET", u.path, q)
         if u.path == "/api/config":  # фронт и бот: какие сети включены (SOLANA_ENABLED), алерты (ALERTS_ENABLED), Trade on Axiom
             return self._send(200, {"solana": engine.solana_enabled(), "alerts": alerts.enabled(),
-                                    "trade": trade.templates()})
+                                    "flap": flap.enabled(), "trade": trade.templates()})
         if u.path == "/api/chart":
             try:
                 return self._send(200, get_chart((q.get("token") or [""])[0]))

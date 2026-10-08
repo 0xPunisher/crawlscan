@@ -114,6 +114,27 @@ class TestStatus(unittest.TestCase):
         self.assertEqual(S(100, 0, sold=50, moved=50), "sold_all")        # поровну — продажа
         self.assertEqual(S(100, 0), "sold_all")                           # выходы не разобраны (partial)
 
+    def test_locked(self):
+        S = d.early_status
+        self.assertEqual(S(100, 5, locked=95), "locked")                   # почти всё в локере
+        self.assertEqual(S(100, 0, sold=10, locked=90), "locked")
+        self.assertEqual(S(100, 0, moved=70, locked=30), "moved")          # переводов больше
+        self.assertEqual(S(100, 0, sold=60, locked=40), "sold_part")       # продал больше; в локере — как держит
+        self.assertEqual(S(100, 90, locked=10), "holding_all")             # мелкая блокировка — держит всё
+        self.assertEqual(S(100, 0, locked=19, sold=81), "sold_part")
+        rep = d.early_report({"launch": {"block": 1, "ts": 0, "deployer": "w"},
+                              "buyers": [{"wallet": "w", "block": 1, "ts": 0, "bought": 100},
+                                         {"wallet": "v", "block": 2, "ts": 1, "bought": 100}]},
+                             {"supply": 1000, "wallets": {
+                                 "w": {"now": 0, "sold": 0, "moved": {}, "burned": 0, "locked": 100,
+                                       "locked_in": ["Sablier"], "partial": False},
+                                 "v": {"now": 0, "sold": 100, "moved": {}, "burned": 0, "partial": False}}})
+        b = rep["buyers"][0]
+        self.assertEqual((b["status"], b["locked_in"], b["locked_share_supply"]), ("locked", ["Sablier"], 0.1))
+        self.assertEqual(rep["buyers"][1]["locked_share_supply"], 0)       # Solana: полей нет — 0
+        sm = rep["summary"]
+        self.assertEqual((sm["exited"], sm["holding"], sm["now_share_supply"], sm["held_share_supply"]), (1, 1, 0, 0.1))
+
     def test_moved_threshold(self):
         S = d.early_status
         self.assertEqual(d.EARLY_MOVED_MIN, 0.20)
@@ -356,6 +377,28 @@ class TestRobinhoodAdapter(unittest.TestCase):
         self.assertEqual([x for x in c.calls if x[0] == "logs"][-2:],
                          [("logs", LB, None, False, True), ("logs", LB, None, True, False)])   # входы и выходы — 2 getLogs
         self.assertEqual([x for x in c.calls if x[0] == "receipts"], [("receipts", 4)])         # чеки только не-рынка
+
+    def test_pons_lock_in_sablier_is_locked_not_moved(self):
+        sablier, periphery = sorted(rh.LOCKERS)[1], sorted(rh.LOCKERS)[0]
+        c = RChain()
+        c.add(RDEV, periphery, 45_000, LB + 70, "0xlock")             # дев запер 90% покупки в Sablier (через периферию)
+        c.add(RW[1], sablier, 60, LB + 71, "0xlock1")                 # заблокировал часть
+        c.add(RW[1], RSINK, 140, LB + 72, "0xmove1")                  # остальное перевёл — переводов больше
+        with ExitStack() as st:
+            c.patch(st)
+            data = rh.early_buyers(RT, 8)
+            status = rh.early_status(RT, data["buyers"], launch=data["launch"])
+            rep = d.early_report(data, status)
+        ws = status["wallets"]
+        self.assertEqual((ws[RDEV]["locked"], ws[RDEV]["locked_in"], ws[RDEV]["moved"]), (45_000, ["Sablier"], {}))
+        rows = {r["wallet"]: r for r in rep["buyers"]}
+        self.assertEqual(rows[RDEV]["status"], "locked")
+        self.assertEqual(rows[RDEV]["locked_in"], ["Sablier"])
+        self.assertEqual(rows[RW[1]]["status"], "moved")               # переводов больше, чем блокировки
+        self.assertNotIn(periphery, [g["to"] for g in rep["summary"]["same_destination"]])
+        self.assertEqual([x for x in c.calls if x[0] == "receipts"], [("receipts", 2)])   # 0xmove1 и подарок фикстуры; 0xlock — без чека
+        self.assertAlmostEqual(rep["summary"]["held_share_supply"] - rep["summary"]["now_share_supply"],
+                               (45_000 + 60) / 1_000_000)
 
     def test_status_partial_and_deadline(self):
         c = RChain()

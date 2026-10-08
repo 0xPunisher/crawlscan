@@ -81,6 +81,7 @@ def patched(history_fn=history, launch=True):
     p("is_contract", side_effect=lambda addrs: {a: False for a in addrs})
     p("token_meta", return_value={"name": "Synthetic", "symbol": "SYN"})
     stack.enter_context(mock.patch.object(market, "fetch_market", return_value={}))
+    stack.enter_context(mock.patch.object(market, "native_usd", return_value=None))   # ETH/USD (Flap на кривой)
     return stack
 
 

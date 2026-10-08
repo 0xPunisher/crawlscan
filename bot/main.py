@@ -76,6 +76,7 @@ class Bot:
         self.trade_urls = trade_urls or trade.templates()   # {сеть: шаблон} для [Trade on Axiom]
         self.spawn = spawn or (lambda f: threading.Thread(target=f, daemon=True).start())
         self.alerts_seen = None      # (clock(), включены ли алерты на сайте)
+        self.flap_seen = None        # (clock(), включён ли Flap на сайте: строка о площадках в /help)
         self.awaiting = {}           # chat_id -> clock() до которого ждём адрес для подписки ([➕ New])
         self.tickers = {}            # адрес токена -> тикер из последнего скана (сайт тикеры подписок не хранит)
 
@@ -152,8 +153,8 @@ class Bot:
                 return self.alerts_command(chat_id, "new", found[1])
             if cmd == "start":   # проверка алертов (кнопка Watchlist) может сходить на сайт — не в цикле опроса
                 return self.spawn(lambda: self.send_start(chat_id))
-            if cmd == "help":
-                return self.send(chat_id, T.HELP)
+            if cmd == "help":   # флаг Flap может сходить на сайт — не в цикле опроса
+                return self.spawn(lambda: self.send(chat_id, T.help_text(self.flap_on())))
             if cmd == "scan":
                 return self.scan_command(chat_id, user.get("id"), arg, None, private=True)
             if cmd == "rewards":
@@ -191,7 +192,7 @@ class Bot:
         elif data == "scan":
             self.send(chat_id, T.ASK_ADDRESS)
         elif data == "help":
-            self.send(chat_id, T.HELP)
+            self.spawn(lambda: self.send(chat_id, T.help_text(self.flap_on())))
 
     def scan_command(self, chat_id, user_id, arg, reply_to, private=False):
         found = T.find_address(arg) if arg else None
@@ -232,6 +233,19 @@ class Bot:
             self.log(f"api config: {e}")
             on = False
         self.alerts_seen = (now, on)
+        return on
+
+    def flap_on(self):
+        """Flap включён на сайте (/api/config → flap). Помним ALERTS_CHECK_TTL секунд; сайт недоступен — нет."""
+        now = self.clock()
+        if self.flap_seen and now - self.flap_seen[0] < ALERTS_CHECK_TTL:
+            return self.flap_seen[1]
+        try:
+            on = bool(self.api.config().get("flap"))
+        except (ApiError, Rejected, AttributeError) as e:
+            self.log(f"api config: {e}")
+            on = False
+        self.flap_seen = (now, on)
         return on
 
     def awaiting_watch(self, chat_id):

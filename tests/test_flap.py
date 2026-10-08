@@ -598,3 +598,164 @@ class TestNewMainFeaturesOnFlap(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestF2Header(unittest.TestCase):
+    """Шаг F2: шапка токена Flap на кривой — имя и тикер из контракта, цена Portal × ETH/USD, капа, ликвидность."""
+
+    def scan(self, eth=2000.0, gt=None, **kw):
+        self.c = Chain(**kw)
+        with self.c.patched() as st:
+            self.eth = st.enter_context(mock.patch("market.native_usd", return_value=eth))
+            if gt is not None:
+                st.enter_context(mock.patch("market.fetch_market", return_value=gt))
+            return engine.scan(FTOKEN)
+
+    def test_curve_price_from_portal(self):
+        gt = {"name": "GT name", "ticker": "GT", "price_usd": None, "liquidity_usd": 0.0, "vol24h_usd": 0.0,
+              "source": "gt"}
+        r = self.scan(gt=gt)
+        h = r["header"]
+        self.assertEqual((h["name"], h["ticker"]), ("Synthetic", "SYN"))      # из контракта, не из GT
+        self.assertAlmostEqual(h["price_usd"], 5 / E18 * 2000)                 # price Portal (wei за токен) × ETH/USD
+        self.assertAlmostEqual(h["mcap_usd"], 5 / E18 * 2000 * 1e9)            # × весь сапплай
+        self.assertAlmostEqual(h["liquidity_usd"], 3 * 2000)                   # ETH в кривой × ETH/USD
+        self.assertIsNone(h["vol24h_usd"])                                     # объём кривой GT не знает
+        self.assertEqual(r["flap"]["price_eth"], 5 / E18)
+        self.eth.assert_called_once()
+
+    def test_curve_without_eth_price(self):
+        h = self.scan(eth=None)["header"]
+        self.assertIsNone(h["price_usd"])
+        self.assertIsNone(h["mcap_usd"])
+        self.assertEqual(h["ticker"], "SYN")
+
+    def test_dex_header_from_market_as_before(self):
+        gt = {"name": "Tas", "ticker": "TAS", "price_usd": 0.001, "mcap_usd": 1e6, "liquidity_usd": 5e4,
+              "vol24h_usd": 1e5, "source": "gt"}
+        r = self.scan(gt=gt, status=flap.STATUS_DEX, buy_tax=200, sell_tax=200, circ=flap.SUPPLY)
+        self.assertEqual({k: r["header"][k] for k in ("name", "ticker", "price_usd", "mcap_usd", "vol24h_usd")},
+                         {"name": "Tas", "ticker": "TAS", "price_usd": 0.001, "mcap_usd": 1e6, "vol24h_usd": 1e5})
+        self.assertIsNone(r["flap"]["price_eth"])
+        self.eth.assert_not_called()                                           # после выпуска ETH/USD не нужен
+
+
+class TestF2Early(unittest.TestCase):
+    """Шаг F2: early buyers Flap — покупки через Portal (кривая) и пару V2 (после выпуска), инфраструктура исключена."""
+
+    def run_early(self, n=20, **kw):
+        self.c = Chain(**kw)
+        with self.c.patched():
+            data = flap.early_buyers(FTOKEN, n)
+            status = flap.early_status(FTOKEN, data["buyers"], launch=data["launch"])
+        return data, status
+
+    def test_curve_buyers(self):
+        data, _ = self.run_early()
+        ws = [b["wallet"] for b in data["buyers"]]
+        self.assertEqual(ws, [DEV] + W[:11])                 # дев первым; W[11] получил переводом — не покупатель
+        self.assertNotIn(EXEC, ws)                            # исполнитель агрегатора — инфраструктура
+        self.assertEqual(data["launch"]["deployer"], DEV)
+        self.assertEqual(data["buyers"][0]["bought"], 100_000_000 * E18)
+
+    def test_dex_buyers_and_sells(self):
+        data, status = self.run_early(status=flap.STATUS_DEX, buy_tax=300, sell_tax=300, circ=flap.SUPPLY)
+        ws = [b["wallet"] for b in data["buyers"]]
+        for i in (2, 5, 8):                                   # купили свопом в паре V2
+            self.assertIn(W[i], ws)
+        for infra in (FTOKEN, TAXP, PAIR, flap.PORTAL):       # налоговые ноги и рынок — не покупатели
+            self.assertNotIn(infra, ws)
+        s = status["wallets"][W[2]]
+        self.assertEqual(s["sold"], 10_000_000 * E18)         # продажа: налог на токен + пара — рынок
+        self.assertEqual(s["moved"], {})
+
+    def test_sell_through_unknown_contract_by_receipt(self):
+        self.c = Chain(status=flap.STATUS_DEX, buy_tax=0, sell_tax=0, circ=flap.SUPPLY)
+        bot = "0x" + "b0" * 20
+        self.c.tr(W[3], bot, 1_000_000 * E18, "0xbotsell")
+        self.c.tr(bot, PAIR, 1_000_000 * E18, "0xbotsell")
+        self.c.rcs["0xbotsell"] = [tlog(W[3], bot, 1_000_000 * E18, "0xbotsell"),
+                                   tlog(bot, PAIR, 1_000_000 * E18, "0xbotsell")]
+        self.c.tr(W[4], W[11], 2_000_000 * E18, "0xmove")
+        self.c.rcs["0xmove"] = [tlog(W[4], W[11], 2_000_000 * E18, "0xmove")]
+        with self.c.patched():
+            data = flap.early_buyers(FTOKEN, 20)
+            st = flap.early_status(FTOKEN, data["buyers"], launch=data["launch"])["wallets"]
+        self.assertEqual((st[W[3]]["sold"], st[W[3]]["moved"]), (1_000_000 * E18, {}))
+        self.assertEqual(st[W[4]]["moved"], {W[11]: 2_000_000 * E18})
+
+    def test_dev_lock_in_sablier_is_locked(self):
+        self.c = Chain(status=flap.STATUS_DEX, buy_tax=0, sell_tax=0, circ=flap.SUPPLY)
+        periphery = "0x37c434ec1c54e360900e3a022247d5e20137c1de"
+        self.c.tr(DEV, periphery, 95_000_000 * E18, "0xlock")         # как TasQ: дев запер покупку в Sablier
+        with self.c.patched():
+            data = flap.early_buyers(FTOKEN, 20)
+            st = flap.early_status(FTOKEN, data["buyers"], launch=data["launch"])
+        rep = d.early_report(data, st)
+        dev = rep["buyers"][0]
+        self.assertEqual((dev["wallet"], dev["dev"], dev["status"], dev["locked_in"], dev["moved_to"]),
+                         (DEV, True, "locked", ["Sablier"], []))
+        self.assertIn(periphery, flap.LOCKERS)                          # Flap: Sablier — по-прежнему не холдер
+
+    def test_not_flap(self):
+        c = Chain()
+        with c.patched():
+            self.assertIsNone(flap.early_buyers(NOTFLAP, 20))
+
+    def test_api_early_routes_flap_and_keeps_pons(self):
+        import early
+        c = Chain()
+        with c.patched():
+            early.clear_cache()
+            with mock.patch.object(ch, "early_buyers", side_effect=AssertionError("Pons path")):
+                out = early.get(FTOKEN)
+            self.assertTrue(out["available"])
+            self.assertEqual(out["buyers"][0]["wallet"], DEV)
+            self.assertTrue(out["buyers"][0]["dev"])
+            self.assertFalse(early.background("robinhood", FTOKEN))   # у Flap нет истории скана — расчёт живой
+            early.clear_cache()
+            out = early.get(NOTFLAP)                                    # суффикс есть, Portal не знает — путь Pons
+            self.assertEqual(out["reason"], "not a Pons V2 or Flap token")
+        early.clear_cache()
+        with Chain().patched(enabled=False):
+            self.assertEqual(early.get(FTOKEN)["reason"], "not a Pons V2 token")   # выключено — как раньше
+
+
+class TestF2Config(unittest.TestCase):
+
+    def test_config_has_flap_flag(self):
+        import json, server
+        from http.server import ThreadingHTTPServer
+        import urllib.request
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.H)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            for v, want in (("1", True), ("0", False)):
+                with mock.patch.dict(os.environ, {"FLAP_ENABLED": v}):
+                    with urllib.request.urlopen(f"http://127.0.0.1:{srv.server_port}/api/config") as r:
+                        self.assertIs(json.loads(r.read())["flap"], want)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+class TestF2Frontend(unittest.TestCase):
+    """Собранный index.html: правки Flap есть и все — под флагом с сервера (flapOn из /api/config)."""
+
+    def test_built_page(self):
+        import json, re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        src = open(os.path.join(root, "index.html"), encoding="utf-8").read()
+        a = re.search(r'<script type="__bundler/template">', src).end()
+        t = json.loads(src[a:src.find("</script>", a)])
+        self.assertIn("flapOn:!!d.flap", t)                                     # флаг — из /api/config
+        self.assertIn("state={flapOn:false,", t)                                # по умолчанию выключено
+        self.assertIn("chart appears after the token graduates", t)
+        self.assertIn("locked:['locked',G]", t)                                  # early buyers: «locked in Sablier»
+        self.assertIn("' in '+((b.locked_in&&b.locked_in.length)", t)
+        self.assertIn("'https://flap.sh/robinhood/'", t)
+        self.assertIn("flap:!!this.state.flapOn&&x.launchpad==='flap'", t)      # лента: бейдж только при флаге
+        self.assertIn("this.state.flapOn&&this.state.view==='scan'", t)         # шапка: только при флаге
+        for m in re.finditer(r"\(Pons, Flap\)|Flap launchpad</span>", t):       # тексты с площадками — под sc-if
+            self.assertIn('<sc-if value="{{flapOn2}}"', t[max(0, m.start() - 600):m.start()])
