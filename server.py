@@ -76,7 +76,7 @@ from alerts_store import AlertsStore
 from bot.tg import TelegramError
 
 CACHE_TTL = 600            # секунд: кэш результата по токену
-MAX_CONCURRENT = 3         # одновременных сканов
+MAX_CONCURRENT = 3         # одновременных сканов по умолчанию (env MAX_CONCURRENT)
 JOB_TTL = 3600             # секунд: старые задачи удаляются из памяти
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ICONS = {                  # путь -> (файл в static/, content-type); .ico отдаёт тот же PNG
@@ -101,6 +101,17 @@ CHARTS = {}                # token -> {"ok": (ts, удачный ответ) | N
 RECENT = {}                # limit -> (ts, ответ /api/recent)
 BY_TOKEN = {}              # token -> job_id последнего скана
 _lock = threading.Lock()
+
+
+def _env_int(name, default):
+    try:
+        v = int(os.environ.get(name, "").strip())
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+MAX_CONCURRENT = _env_int("MAX_CONCURRENT", MAX_CONCURRENT)
 _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
 
 
@@ -708,8 +719,11 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/early":
             try:
                 token = (q.get("token") or [""])[0]
-                with priority.live():
-                    body = early.get(token, scan_flags(engine.chain_of(token)[1]))
+                chain, ca = engine.chain_of(token)
+                # по истории живого скана — как живой; без неё — фон (уступает сканам, BACKGROUND_RPS)
+                bg = priority.background_rps() > 0 and early.background(chain, ca)
+                with priority.background() if bg else priority.live():
+                    body = early.get(token, scan_flags(ca))
             except engine.ScanError as e:
                 return self._send(400, {"error": str(e)})
             self._send(200, body)

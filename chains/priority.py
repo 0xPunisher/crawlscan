@@ -1,27 +1,43 @@
-"""Приоритет живых сканов над фоновыми перепроверками alerts в общих лимитерах RPS адаптеров.
+"""Приоритет живых сканов над фоновой работой в лимитерах RPS адаптеров.
 
-Фоновая работа узнаётся по имени потока (BG в начале: поток перепроверок и пул кошельков движка,
-который он запускает). Перед каждым запросом в сеть такой поток ждёт (wait_turn), пока идут живые сканы
-пользователей (live() — счётчик в server). Живые потоки не ждут никогда: для них — одна проверка имени потока.
+Фоновая работа — поток с именем на BG (поток перепроверок alerts и пул кошельков, который движок запускает
+из фона) или код внутри background() (планировщик наград, /api/early без истории живого скана).
+Перед каждым запросом в сеть такой поток ждёт (wait_turn), пока идут живые сканы пользователей
+(live() — счётчик в server), и проходит свой отдельный лимит BACKGROUND_RPS (Throttle адаптера).
+Живые потоки не ждут никогда: для них — одна проверка потока.
 RATE_LIMITED в адаптерах — сколько раз нода ответила rate-limit (для паузы перепроверок).
 """
-import threading
+import os, threading, time
 from contextlib import contextmanager
 
 BG = "recheck"
 YIELD_MAX = 60.0          # секунд: дольше одного ожидания фоновый поток не ждёт (дальше — снова проверка)
+BACKGROUND_RPS = 2.0      # по умолчанию env BACKGROUND_RPS: запросов/сек на всю фоновую работу адаптера; 0 — без своего лимита
 _cond = threading.Condition()
 _live = [0]
+_tls = threading.local()
 YIELDS = [0]              # сколько раз фоновые запросы уступили живым сканам
 
 
 def is_background():
-    return threading.current_thread().name.startswith(BG)
+    return getattr(_tls, "bg", False) or threading.current_thread().name.startswith(BG)
+
+
+@contextmanager
+def background():
+    """Фоновая работа в текущем потоке (планировщик наград, /api/early без истории скана).
+    BACKGROUND_RPS=0 — выключатель: такая работа не фоновая, как раньше (перепроверки alerts — фон всегда)."""
+    prev = getattr(_tls, "bg", False)
+    _tls.bg = prev or background_rps() > 0
+    try:
+        yield
+    finally:
+        _tls.bg = prev
 
 
 @contextmanager
 def live():
-    """Живой скан пользователя (или /api/early) идёт: фоновые запросы ждут."""
+    """Живой скан пользователя (или /api/early по его истории) идёт: фоновые запросы ждут."""
     with _cond:
         _live[0] += 1
     try:
@@ -46,3 +62,48 @@ def wait_turn():
             return
         YIELDS[0] += 1
         _cond.wait_for(lambda: _live[0] == 0, timeout=YIELD_MAX)
+
+
+def background_rps():
+    """BACKGROUND_RPS из env (пусто или неверно — дефолт; 0 или меньше — своего лимита у фона нет)."""
+    try:
+        v = float(os.environ.get("BACKGROUND_RPS", "").strip() or BACKGROUND_RPS)
+    except ValueError:
+        return BACKGROUND_RPS
+    return v if v > 0 else 0.0
+
+
+def background_scale(rps):
+    """Во сколько раз фон медленнее живого скана под лимитом адаптера rps: бюджеты фона растягиваются на столько же,
+    чтобы фоновый скан успевал прочитать столько же, сколько живой. Своего лимита нет или он не ниже rps — 1."""
+    bg = background_rps()
+    return rps / bg if 0 < bg < rps else 1.0
+
+
+class Throttle:
+    """Лимит запросов во времени: под замком только резерв слота, сон — вне замка (ждущий не держит остальных).
+    n — вес запроса (провайдеры считают каждый элемент батча). rps <= 0 — без лимита."""
+
+    def __init__(self, rps):
+        self.gap = 1.0 / rps if rps and rps > 0 else 0.0
+        self.lock = threading.Lock()
+        self.next = 0.0
+
+    def wait(self, n=1):
+        if not self.gap:
+            return
+        with self.lock:
+            now = time.time()
+            slot = max(now, self.next)
+            self.next = slot + self.gap * n
+        if slot > now:
+            time.sleep(slot - now)
+
+
+def rate_limit(main, bg, n=1):
+    """Общий путь лимитеров адаптеров: фон уступает живым сканам и проходит свой лимит bg, затем — общий main."""
+    wait_turn()
+    if is_background() and bg.gap:
+        bg.wait(n)
+        wait_turn()      # пока ждали свой слот, мог начаться живой скан
+    main.wait(n)

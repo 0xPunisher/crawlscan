@@ -353,8 +353,94 @@ class TestServerPath(unittest.TestCase):
             while not server.JOBS[jid]["done"] and time.time() - t0 < 5:
                 time.sleep(0.02)
         self.assertEqual(seen, [1])
-        time.sleep(0.1)
+        # done ставится внутри live(): после него поток ещё пишет ленту и снимок alerts (SQLite) — ждём выхода
+        self.assertTrue(wait_live_zero(), priority.live_count())
+
+    def scan_job(self, scan, **patches):
+        """Скан через server.start_scan с подменённым engine.scan; ждёт done; возвращает задачу."""
+        with fakes.patched() as st:
+            st.enter_context(mock.patch.object(server.engine, "scan", side_effect=scan))
+            for name, fn in patches.items():
+                st.enter_context(mock.patch.object(server, name, side_effect=fn))
+            jid = server.start_scan(fakes.TOKEN)
+            t0 = time.time()
+            while not server.JOBS[jid]["done"] and time.time() - t0 < 5:
+                time.sleep(0.02)
+            self.assertTrue(wait_live_zero(), priority.live_count())
+            return server.JOBS[jid]
+
+    def test_live_counter_released_on_every_exit(self):
+        """Счётчик живых сканов возвращается в 0 на любом пути выхода скана."""
+        def raise_(e):
+            def f(t, emit):
+                raise e
+            return f
+
+        def boom(*a, **k):
+            raise RuntimeError("db down")
+
+        paths = {
+            "ok": dict(scan=lambda t, emit: result(t)),
+            "too established": dict(scan=lambda t, emit: result(t, band="TOO_ESTABLISHED", score=None)),
+            "too early": dict(scan=lambda t, emit: result(t, band="TOO_EARLY_OR_LATE", score=None)),
+            "scan error": dict(scan=raise_(server.engine.ScanError("not a Pons V2 token"))),
+            "crash": dict(scan=raise_(RuntimeError("rpc down"))),
+            "record_recent fails": dict(scan=lambda t, emit: result(t), record_recent=boom),
+            "record_snapshot fails": dict(scan=lambda t, emit: result(t), record_snapshot=boom),
+        }
+        for name, kw in paths.items():
+            with self.subTest(name):
+                with server._lock:
+                    server.JOBS.clear(); server.BY_TOKEN.clear()
+                scan = kw.pop("scan")
+                with mock.patch.object(threading, "excepthook"):   # поток с упавшим record_* — ожидаемо
+                    job = self.scan_job(scan, **kw)
+                self.assertTrue(job["done"])
+                self.assertEqual(priority.live_count(), 0)
+
+    def test_cached_result_no_counter(self):
+        """Ответ из 10-минутного кэша результата не запускает поток и счётчик не трогает."""
+        job = self.scan_job(lambda t, emit: result(t))
+        calls = []
+        with mock.patch.object(server.threading, "Thread", side_effect=lambda *a, **k: calls.append(1)):
+            self.assertEqual(server.start_scan(fakes.TOKEN), next(j for j, v in server.JOBS.items() if v is job))
+        self.assertEqual(calls, [])
         self.assertEqual(priority.live_count(), 0)
+
+    def test_early_endpoint_releases_counter(self):
+        """/api/early: живой путь — счётчик 1 во время расчёта и 0 после, в том числе при исключении."""
+        seen = []
+        h = mock.MagicMock()
+        h.path = f"/api/early?token={fakes.TOKEN}"
+        with mock.patch.object(server.early, "background", return_value=False), \
+                mock.patch.object(server, "record_early"):
+            with mock.patch.object(server.early, "get", side_effect=lambda t, f=None: seen.append(priority.live_count())
+                                   or {"token": t, "chain": "robinhood", "available": False}):
+                server.H.do_GET(h)
+            with mock.patch.object(server.early, "get", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    server.H.do_GET(h)
+            h.path = "/api/early?token=bad"                       # 400 до входа в live()
+            server.H.do_GET(h)
+        self.assertEqual(seen, [1])
+        self.assertEqual(priority.live_count(), 0)
+
+    def test_chart_endpoint_no_counter(self):
+        h = mock.MagicMock()
+        h.path = f"/api/chart?token={fakes.TOKEN}"
+        with mock.patch.object(server, "get_chart", side_effect=lambda t: seen.append(priority.live_count()) or {}):
+            seen = []
+            server.H.do_GET(h)
+        self.assertEqual(seen, [0])
+        self.assertEqual(priority.live_count(), 0)
+
+
+def wait_live_zero(timeout=2.0):
+    """Ждёт, пока счётчик живых сканов станет 0 (не дольше timeout). True — дождались."""
+    t0 = time.time()
+    while priority.live_count() and time.time() - t0 < timeout:
+        time.sleep(0.01)
+    return priority.live_count() == 0
 
 
 if __name__ == "__main__":
