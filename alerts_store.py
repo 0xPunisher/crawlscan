@@ -2,7 +2,9 @@
 таблицы alert_snapshots (один токен — одна строка: последний снимок cur и предыдущий prev, JSON) и
 alert_watches (подписки чатов: до WATCH_LIMIT токенов на чат, живут WATCH_DAYS дней).
 """
-import json, os, sqlite3, threading, time
+import json, os, time
+
+import db
 
 from alerts import ROUND, WATCH_DAYS, WATCH_LIMIT
 from draw_store import DEFAULT_PATH
@@ -21,9 +23,8 @@ class AlertsStore:
     def __init__(self, path=None):
         self.path = path or os.environ.get("DRAW_DB_PATH") or DEFAULT_PATH
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-        self._lock = threading.Lock()
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
+        self._lock = db.lock_for(self.path)   # один замок на файл для всех хранилищ
+        self.db = db.connect(self.path)
         with self._lock, self.db:
             self.db.executescript(SCHEMA)
 

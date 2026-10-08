@@ -3,7 +3,9 @@
 Пишется только завершённый скан с вердиктом (ошибки и «not a token address» сюда не попадают).
 launchpad — "flap" у токенов Flap (result["launchpad"]), иначе NULL; колонка добавляется в старую базу при старте.
 """
-import os, sqlite3, threading, time
+import os, time
+
+import db
 
 from draw_store import DEFAULT_PATH
 
@@ -32,9 +34,8 @@ class RecentStore:
     def __init__(self, path=None):
         self.path = path or os.environ.get("DRAW_DB_PATH") or DEFAULT_PATH
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-        self._lock = threading.Lock()
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
+        self._lock = db.lock_for(self.path)   # один замок на файл для всех хранилищ
+        self.db = db.connect(self.path)
         with self._lock, self.db:
             self.db.executescript(SCHEMA)
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(recent_scans)")}

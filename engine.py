@@ -37,6 +37,7 @@ CHAINS = {"robinhood": ch, "solana": sol}
 NATIVE = {"robinhood": ("ETH", 10 ** 18), "solana": ("SOL", 10 ** 9)}   # единица eth_in
 NOT_LAUNCHPAD = {"robinhood": "not a Pons V2 token", "solana": "not a pump.fun token"}
 NOT_LAUNCHPAD_FLAP = "not a Pons V2 or Flap token"   # Robinhood при FLAP_ENABLED
+TOO_LARGE = "token history too large"                  # Pons: больше ch.SCAN_MAX_LOGS переводов
 GT_NETWORK = {"robinhood": "robinhood", "solana": "solana"}
 
 
@@ -284,7 +285,11 @@ def scan(token, emit=lambda e: None):
 
     ev("stage", "transfers")
     # Flap: история большого токена читается окнами в бюджете скана (deadline считается от начала скана)
-    facts = a.token_facts(token, launch, deadline) if a in (flap, bankr) else a.token_facts(token, launch)
+    try:
+        facts = a.token_facts(token, launch, deadline) if a in (flap, bankr) else a.token_facts(token, launch)
+    except ch.HistoryTooLarge as e:
+        print(f"scan: {token} history too large ({e} logs, cap {ch.SCAN_MAX_LOGS})", flush=True)
+        raise ScanError(TOO_LARGE) from None
     transfers, supply, excluded, mkt = facts["transfers"], facts["supply"], facts["excluded"], facts["market"]
     base = facts["base"] or d.supply_base(transfers, supply, excluded)
     holders = d.top_holders(base)

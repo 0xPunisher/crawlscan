@@ -139,7 +139,7 @@ class TestServerFeed(unittest.TestCase):
         x = feed["items"][0]
         self.assertEqual((x["chain"], x["score"], x["band"], x["rug"]),
                          ("robinhood", d["result"]["score"], d["result"]["band"], bool(d["result"]["rug"])))
-        self.assertIn("max-age=20", headers["cache-control"])
+        self.assertIn("max-age=15", headers["cache-control"])
 
     def test_errors_not_recorded(self):
         self.assertEqual(self.scan("not an address"), 400)

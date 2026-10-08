@@ -158,25 +158,37 @@ def _is_window_error(msg):
     """Ошибка размера окна/ответа getLogs: лечится делением окна."""
     return any(k in msg for k in ("range","too large","too many","limited","response","size","exceed","more than"))
 
+def iter_logs(from_block, to_block, address=None, topics=None):
+    """Страницы getLogs по порядку блоков, с адаптивным окном: при 'range too large' или упоре в LOG_CAP
+    (ответ мог быть молча обрезан) окно делится пополам. Вызывающий разбирает страницу и отпускает её —
+    в памяти одна страница сырых логов, а не вся история."""
+    stack = [(from_block, to_block)]
+    while stack:
+        lo, hi = stack.pop()
+        flt = {"fromBlock": hex(lo), "toBlock": hex(hi)}
+        if address: flt["address"] = address
+        if topics:  flt["topics"] = topics
+        try:
+            logs = rpc("eth_getLogs", [flt])
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if _is_window_error(msg) and hi > lo:
+                logs = None
+            else:
+                raise
+        if logs is not None and (len(logs) < LOG_CAP or hi <= lo):
+            yield logs
+            logs = None             # страница отпущена до следующего запроса
+            continue
+        logs = None
+        mid = (lo + hi) // 2
+        stack.append((mid + 1, hi))
+        stack.append((lo, mid))     # левая половина — первой
+
+
 def get_logs(from_block, to_block, address=None, topics=None):
-    """getLogs с адаптивным окном: при 'range too large' или упоре в LOG_CAP
-    (ответ мог быть молча обрезан) делим окно пополам."""
-    flt = {"fromBlock": hex(from_block), "toBlock": hex(to_block)}
-    if address: flt["address"] = address
-    if topics:  flt["topics"] = topics
-    try:
-        logs = rpc("eth_getLogs", [flt])
-    except RuntimeError as e:
-        msg = str(e).lower()
-        if _is_window_error(msg) and to_block > from_block:
-            logs = None
-        else:
-            raise
-    if logs is not None and (len(logs) < LOG_CAP or to_block <= from_block):
-        return logs
-    mid = (from_block + to_block) // 2
-    return (get_logs(from_block, mid, address, topics)
-            + get_logs(mid + 1, to_block, address, topics))
+    """Все логи под фильтр в [from_block, to_block] одним списком (iter_logs)."""
+    return [lg for page in iter_logs(from_block, to_block, address, topics) for lg in page]
 
 def first_log_block(from_block, to_block, address=None, topics=None):
     """Самый ранний блок с логом под фильтр в [from_block, to_block] или None.
@@ -423,12 +435,47 @@ def cached_transfers(token, from_block):
     return e and e["transfers"]
 
 
+# потолок истории скана Pons (SCAN_MAX_LOGS): больше — HistoryTooLarge, движок отвечает "token history too large".
+# Считается при постраничном чтении (get_token_transfers внутри _log_cap) — дальше потолка не читаем и не держим.
+SCAN_MAX_LOGS = 150_000        # ~100 МБ разобранных переводов; 0 — без потолка
+try:
+    SCAN_MAX_LOGS = max(0, int(os.environ.get("SCAN_MAX_LOGS", "").strip() or SCAN_MAX_LOGS))
+except ValueError:
+    pass
+_CAP = threading.local()
+
+
+class HistoryTooLarge(Exception):
+    """История токена длиннее SCAN_MAX_LOGS переводов."""
+
+
+class _log_cap:
+    """Потолок логов для get_token_transfers в этом потоке (0 — без потолка)."""
+    def __init__(self, n):
+        self.n = n
+
+    def __enter__(self):
+        self.prev = getattr(_CAP, "n", 0)
+        _CAP.n = self.n
+
+    def __exit__(self, *exc):
+        _CAP.n = self.prev
+
+
 def load_transfers(token, from_block):
     """(переводы с from_block до головы, totalSupply) для скана. Кэш выключен — как раньше: вся история getLogs.
     Включён и есть проверенная история токена — читается только хвост: с блока head − TRANSFER_CACHE_LAG прошлого
     чтения (у головы нода могла отдать не всё — эти блоки перечитываются) до новой головы. Склейка сверяется
     с totalSupply, не сошлось — полное чтение. Полное чтение, не сошедшееся с totalSupply, в кэш не идёт."""
     token = token.lower()
+    with _log_cap(SCAN_MAX_LOGS):
+        transfers, supply = _load_transfers(token, from_block)
+    if SCAN_MAX_LOGS and len(transfers) > SCAN_MAX_LOGS:
+        raise HistoryTooLarge(len(transfers))
+    return transfers, supply
+
+
+def _load_transfers(token, from_block):
     if not TRANSFER_CACHE_ENABLED:
         transfers = get_token_transfers(token, from_block)
         return transfers, token_supply(token)
@@ -469,15 +516,23 @@ def get_token_transfers(token, from_block, to_block=None, frm=None, to=None):
     hi = block_number() if to_block is None else to_block
     if hi < from_block:
         return out
-    for lg in get_logs(from_block, hi, address=token.lower(), topics=topics):
-        p = parse_transfer(lg)
-        if not p or len(lg["data"]) <= 2:
-            continue
-        t = {"frm": p["frm"], "to": p["to"], "amount": int(lg["data"], 16),
-             "tx": p["tx"], "block": p["block"], "log_index": int(lg["logIndex"], 16)}
-        if lg.get("blockTimestamp"):
-            t["ts"] = int(lg["blockTimestamp"], 16)
-        out.append(t)
+    cap, seen = getattr(_CAP, "n", 0), 0
+    same = {}   # одна строка на адрес и хеш транзакции: у длинной истории они повторяются тысячи раз
+    for page in iter_logs(from_block, hi, address=token.lower(), topics=topics):
+        seen += len(page)
+        if cap and seen > cap:
+            raise HistoryTooLarge(seen)
+        for lg in page:
+            p = parse_transfer(lg)
+            if not p or len(lg["data"]) <= 2:
+                continue
+            t = {"frm": same.setdefault(p["frm"], p["frm"]), "to": same.setdefault(p["to"], p["to"]),
+                 "amount": int(lg["data"], 16), "tx": same.setdefault(p["tx"], p["tx"]), "block": p["block"],
+                 "log_index": int(lg["logIndex"], 16)}
+            if lg.get("blockTimestamp"):
+                t["ts"] = int(lg["blockTimestamp"], 16)
+            out.append(t)
+        page = None
     out.sort(key=lambda t: (t["block"], t["log_index"]))
     return out
 
@@ -843,25 +898,48 @@ EARLY_CANDIDATES = 25    # получателей за раз (не больше
 EARLY_OUT_CAP = 20       # выходов кошелька не на рынок (самые новые) на проверку чеком
 BURN_ADDRS = {"0x000000000000000000000000000000000000dead", "0x" + "0" * 40}
 SCAN_TTL = 600           # секунд: история переводов из скана (= кэш результата скана в server.py)
-SCAN_MAX = 20            # токенов в памяти (у старых токенов история — десятки тысяч переводов)
-_SCAN = {}               # token -> (ts, launch, transfers, supply)
+SCAN_CACHE_MAX_TRANSFERS = 100_000   # переводов во всех токенах _SCAN (LRU по токенам; ~670 байт — до ~65 МБ);
+                                     # токен длиннее лимита не хранится (early buyers читает сам)
+try:
+    SCAN_CACHE_MAX_TRANSFERS = max(0, int(os.environ.get("SCAN_CACHE_MAX_TRANSFERS", "").strip()
+                                          or SCAN_CACHE_MAX_TRANSFERS))
+except ValueError:
+    pass
+_SCAN = {}               # token -> (ts, launch, transfers, supply); порядок вставки = LRU
 _SCAN_LOCK = threading.Lock()
+
+
+def _scan_size():
+    return sum(len(v[2]) for v in _SCAN.values() if v[2] is not None)
 
 
 def remember_scan(token, launch, transfers, supply):
     """Полная история переводов с запуска, которую прочитал скан (token_facts): early buyers берёт
     покупателей, балансы и выходы из неё и дочитывает только хвост после неё.
-    Кэш переводов включён и история в нём — здесь только отметка скана, сама история — из кэша (одна копия)."""
+    Кэш переводов включён и история в нём — здесь только отметка скана, сама история — из кэша (одна копия).
+    Всего не больше SCAN_CACHE_MAX_TRANSFERS переводов: старые вытесняются, токен длиннее лимита не хранится."""
     token = token.lower()
     if TRANSFER_CACHE_ENABLED:
         with _TCACHE_LOCK:
             if (_TCACHE.get(token) or {}).get("transfers") is transfers:
                 transfers = None
+    now = time.time()
     with _SCAN_LOCK:
-        _SCAN[token] = (time.time(), dict(launch), transfers, supply)
-        if len(_SCAN) > SCAN_MAX:
-            for k, _ in sorted(_SCAN.items(), key=lambda kv: kv[1][0])[:len(_SCAN) - SCAN_MAX]:
-                del _SCAN[k]
+        _SCAN.pop(token, None)
+        for k in [k for k, v in _SCAN.items() if now - v[0] >= SCAN_TTL]:
+            del _SCAN[k]
+        if transfers is not None and len(transfers) > SCAN_CACHE_MAX_TRANSFERS:
+            return
+        _SCAN[token] = (now, dict(launch), transfers, supply)
+        while _scan_size() > SCAN_CACHE_MAX_TRANSFERS:
+            del _SCAN[next(iter(_SCAN))]   # самый давний
+
+
+def drop_caches():
+    """Защита по памяти (server): сбросить историю сканов (_SCAN) и кэш истории переводов."""
+    with _SCAN_LOCK:
+        _SCAN.clear()
+    tcache_clear()
 
 
 def scan_history(token):
