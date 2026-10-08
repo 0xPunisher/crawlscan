@@ -95,6 +95,50 @@ class TestRugProjection(unittest.TestCase):
         s.run()
         self.assertIsNone(d.rug_projection(s.holders, signals(s), s.ops, s.base, 1, "DANGER"))
 
+    def test_requires_behavioral_danger(self):
+        # DANGER не от поведенческого жёсткого правила (низкий скор, одиночный кит) — проекции нет
+        s = self.build()
+        sig = signals(s)
+        self.assertIsNone(d.rug_projection(s.holders, sig, s.ops, s.base, s.reserve, "DANGER", behavioral=False))
+        self.assertIsNotNone(d.rug_projection(s.holders, sig, s.ops, s.base, s.reserve, "DANGER", behavioral=True))
+
+    def whale_in_thin_pool(self, linked):
+        """Как $CrawlScan: крупнейший — кит (один кошелёк или два связанных) в тонком пуле, плюс 3 девственных."""
+        s = Scenario()
+        if linked:
+            whale = [s.wallet(500, via=BUNDLER, tx="0xsame", block=101) for _ in range(2)]
+        else:
+            whale = [s.wallet(1000)]
+        virgins = [s.wallet(300, distinct=0) for _ in range(3)]
+        s.normal(14)
+        return s, whale, virgins
+
+    def test_single_whale_thin_pool_not_danger_no_rug(self):
+        s, whale, virgins = self.whale_in_thin_pool(linked=False)
+        s.run()
+        sc = d.score(s.holders, signals(s), s.ops, s.base, 1500)
+        self.assertEqual(s.ops[0]["wallets"], whale)
+        self.assertGreaterEqual(sc["metrics"]["impact"], d.GATE_IMPACT)
+        self.assertNotEqual(sc["band"], "DANGER")                                 # был бы DANGER по старому правилу
+        self.assertTrue(any(g.startswith("soft: one holder could move price") for g in sc["gates"]))
+        behavioral = any(not g.startswith("soft:") for g in sc["gates"])
+        self.assertFalse(behavioral)
+        self.assertIsNone(d.rug_projection(s.holders, signals(s), s.ops, s.base, 1500, sc["band"],
+                                           behavioral=behavioral))
+        reason = engine._reason(sc, s.base)
+        self.assertTrue(reason.startswith("one holder could move price −") and reason.endswith("(thin liquidity)"), reason)
+
+    def test_linked_whale_thin_pool_keeps_danger_and_rug(self):
+        s, whale, virgins = self.whale_in_thin_pool(linked=True)
+        s.run()
+        sc = d.score(s.holders, signals(s), s.ops, s.base, 1500)
+        self.assertEqual(sorted(s.ops[0]["wallets"]), sorted(whale))
+        self.assertEqual(sc["band"], "DANGER")
+        behavioral = any(not g.startswith("soft:") for g in sc["gates"])
+        rug = d.rug_projection(s.holders, signals(s), s.ops, s.base, 1500, sc["band"], behavioral=behavioral)
+        self.assertEqual(rug["parts"][0]["kind"], "linked")
+        self.assertEqual(sorted(rug["parts"][0]["wallets"]), sorted(whale))
+
     def test_launch_bundle_signal(self):
         def entry(block):
             return {"kind": "buy" if block is not None else None, "tx": "t", "block": block, "via": CURVE,
@@ -143,6 +187,18 @@ class TestRugInScan(unittest.TestCase):
         res, _, _ = self.scan()
         self.assertIsNotNone(res["rug"])
         self.assertIsNone(res["rug"]["level_usd"])
+
+    def test_danger_without_behavioral_gate_no_rug(self):
+        # DANGER только по низкому скору / мягким правилам (одиночный кит в тонком пуле) — engine не даёт rug
+        real = d.score
+        def soft_danger(*a, **k):
+            sc = real(*a, **k)
+            return dict(sc, band="DANGER", gates=["soft: one holder could move price −70% (thin liquidity)"])
+        with mock.patch.object(engine.d, "score", side_effect=soft_danger):
+            res, _, _ = self.scan(header={"price_usd": 2.0})
+        self.assertEqual(res["band"], "DANGER")
+        self.assertIsNone(res["rug"])
+        self.assertEqual(res["reason"], "one holder could move price −70% (thin liquidity)")
 
     def test_not_danger_no_rug(self):
         res, events, _ = self.scan(history=fakes.history)

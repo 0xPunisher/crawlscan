@@ -44,10 +44,15 @@ SCALE = {
     "sniper":        (0.01, 0.15),
     "concentration": (0.25, 0.70),
 }
-GATE_IMPACT = 0.50         # стоп: продажа крупнейшего оператора уронит цену на ≥ 50%
+GATE_IMPACT = 0.50         # стоп: продажа крупнейшего оператора уронит цену на ≥ 50% — если он из 2+ связанных
+                           # кошельков или один, но подозрительный (деплоер, virgin, без прочитанной истории, вход
+                           # переводом или не найден); независимый покупатель с историей (тонкий пул) — мягкое
+                           # правило, band не хуже RISKY
 LIQ_MIN_USD = 1_000        # мягкое правило: ликвидность из шапки < $1,000 → band не лучше RISKY
 GATE_VIRGIN = 0.80         # стоп: девственных ≥ 80% топа ...
-GATE_VIRGIN_MIN = 5        # ... минимум 5 холдеров (без деплоера)
+GATE_VIRGIN_MIN = 5        # ... минимум 5 прочитанных холдеров (без деплоера)
+UNREAD_MAX = 0.50          # не прочитано больше половины топа (без деплоера) — доля девственных неизвестна:
+                           # часть virgin — нейтральная половина веса, правило по virgin не применяется, пометка
 GATE_TRANSFER = 0.10       # стоп: полученное переводом ≥ 10% оборота
 SOFT_GATE_SCORE = 59       # мягкое стоп-правило: стая или доказанный оператор из ≥ 3 кошельков
 SOFT_GATE_WALLETS = 3      #   → band не лучше RISKY (score = min(score, 59))
@@ -325,33 +330,55 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
                 f"{big['share'] * 100:.1f}% of float ({big['share_supply'] * 100:.1f}% of supply)"
                 + _impact_phrase(impact, ops) + (limited_note if limited else ""))
     if base["holders_total"] < MIN_HOLDERS:
-        return {"score": None, "band": TOO_EARLY, "parts": {}, "gates": [], "metrics": {}, "headline": headline}
+        return {"score": None, "band": TOO_EARLY, "parts": {}, "gates": [], "metrics": {}, "headline": headline,
+                "notes": []}
 
     share = {a: s for a, _, s in holders}
     non_dev = [a for a in share if not signals[a]["is_deployer"]]
-    virgins = [a for a in non_dev if signals[a]["virgin"]]
+    # девственные — только среди прочитанных: непрочитанный кошелёк не улика и не «чистый»
+    read = [a for a in non_dev if not signals[a]["unread"]]
+    unread_share = 1 - len(read) / len(non_dev) if non_dev else 0.0
+    virgin_known = unread_share <= UNREAD_MAX
+    virgins = [a for a in read if signals[a]["virgin"]]
+    notes = [] if virgin_known else [f"virgin: {len(non_dev) - len(read)} of {len(non_dev)} top wallets unread — "
+                                     f"scored neutral"]
     m = {
         "operator": big["weighted"],
         "impact": impact,
-        "virgin": len(virgins) / len(non_dev) if non_dev else 0.0,
+        "virgin": (len(virgins) / len(read) if read else 0.0) if virgin_known else None,
+        "unread": unread_share,
         "transfer": sum(s for a, s in share.items() if signals[a]["kind"] == "transfer"),
         "sniper": sum(share[a] for a in non_dev if signals[a]["sniper"]),
         "concentration": sum(share.values()),
     }
-    parts = {k: _part(k, m[k]) for k in WEIGHTS if k != "operator"}
+    parts = {k: _part(k, m[k]) for k in WEIGHTS if k not in ("operator", "virgin")}
+    parts["virgin"] = _part("virgin", m["virgin"]) if virgin_known else WEIGHTS["virgin"] / 2   # неизвестно — нейтрально
     parts["operator"] = (_part("operator", impact) if impact is not None
                          else _part("operator", m["operator"], "operator_share"))
     parts = {k: parts[k] for k in WEIGHTS}
     gates = []
-    if impact is not None and impact >= GATE_IMPACT and not limited:
+    thin = impact is not None and impact >= GATE_IMPACT and not limited
+    # один кошелёк: жёстко — только если есть улика (деплоер, вход переводом, прочитан и без истории — virgin);
+    # непрочитанный кошелёк или вход не найден — не улика: мягкое правило, как у независимого покупателя
+    lone = big["wallets"][0] if len(big["wallets"]) == 1 else None
+    s0 = signals.get(lone) if lone else None
+    suspect = bool(s0) and (s0["is_deployer"] or s0["kind"] == "transfer" or s0["virgin"])
+    unknown = bool(s0) and not suspect and (s0["unread"] or s0["kind"] is None)
+    independent = bool(s0) and not suspect and not unknown
+    if thin and not (independent or unknown):
         gates.append(f"biggest operator could move price −{m['impact'] * 100:.0f}% if sold "
                      f"(≥ {GATE_IMPACT * 100:.0f}%; {m['operator'] * 100:.1f}% of float)")
-    if len(non_dev) >= GATE_VIRGIN_MIN and m["virgin"] >= GATE_VIRGIN:
+    if virgin_known and len(read) >= GATE_VIRGIN_MIN and m["virgin"] >= GATE_VIRGIN:
         gates.append(f"{m['virgin'] * 100:.0f}% virgin wallets in top (≥ {GATE_VIRGIN * 100:.0f}%)")
     if m["transfer"] >= GATE_TRANSFER and not limited:
         gates.append(f"{m['transfer'] * 100:.1f}% of float received by transfer (≥ {GATE_TRANSFER * 100:.0f}%)")
     hard = bool(gates)
     total = round(sum(parts.values()))
+    if thin and independent:   # один независимый покупатель с историей в тонком пуле: не DANGER сам по себе
+        gates.append(f"soft: one holder could move price −{m['impact'] * 100:.0f}% (thin liquidity)")
+    if thin and unknown:       # историю не прочитали (бюджет) или вход не найден — не улика
+        gates.append(f"soft: biggest holder couldn't be fully read; could move price −{m['impact'] * 100:.0f}% "
+                     f"(thin liquidity)")
     groups = [o for o in ops if o["level"] == "pack"
               or (o["level"] == "proven" and len(o["wallets"]) >= SOFT_GATE_WALLETS)]
     for o in groups:
@@ -364,10 +391,12 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     band = "DANGER" if hard else next((b for lim, b in BANDS if total >= lim), "DANGER")
     if limited and band == "DANGER":
         band = "RISKY"   # старый токен без данных рынка: сигналы холдеров ограничены, вердикт не ниже RISKY
-    return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline}
+    return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline,
+            "notes": notes}
 
 
-def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, reserve_ok=True, q_factor=1):
+def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, reserve_ok=True, behavioral=True,
+                   q_factor=1):
     """Проекция «probably rug»: куда упадёт цена, если весь подозрительный запас продадут в ликвидность.
     Только при band DANGER (скор и вердикт не меняет); иначе, без запаса или при падении
     < RUG_MIN_DROP — None.
@@ -381,8 +410,11 @@ def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, res
     {"drop", "level_factor" (= 1 − drop), "share", "share_supply", "parts": [{"kind", "wallets",
     "share", "share_supply"}], "wallets"}; доли — от оборота, share_supply — от сапплая.
     reserve_ok=False (резерв не измерен надёжно) — None: падение без ликвидности не считаем.
+    behavioral — DANGER вызван поведенческим жёстким правилом (связанный оператор, virgin, transfer); нет — None:
+    одиночный кит в тонком пуле или низкий скор без сигналов — не rug. Части запаса — только поведенческие
+    (linked, transfer, virgin, bundle/snipers): кит без сигналов в запас не входит.
     q_factor — как в score: до ликвидности доходит q × q_factor."""
-    if band != "DANGER" or not reserve_ok:
+    if band != "DANGER" or not reserve_ok or not behavioral:
         return None
     linked = {w for o in ops if len(o["wallets"]) > 1 for w in o["wallets"]}
     test = {

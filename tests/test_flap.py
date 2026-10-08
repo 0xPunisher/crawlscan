@@ -3,12 +3,12 @@
 Выключатель FLAP_ENABLED: выключен — всё как раньше (токен Flap отклоняется, Pons без изменений);
 включён — суффикс 8888/7777 без RPC, затем одна проверка Portal; исключения, покупки через агрегатор,
 налоговые ноги, резерв кривой и пары, q × (1 − sellTax), дев и запасной путь, поля результата."""
-import os, unittest
+import os, threading, unittest
 from unittest import mock
 
 import fakes
 from fakes import ch, engine, ZERO
-from chains import flap
+from chains import flap, priority
 import detect as d
 
 FTOKEN = "0x" + "f1" * 18 + "7777"        # налоговый токен Flap (суффикс 7777)
@@ -480,7 +480,7 @@ class TestDetectQFactor(unittest.TestCase):
     def setUp(self):
         self.holders = [(f"0x{i:040x}", (10 - i) * E18, (10 - i) / 55) for i in range(10)]
         self.sig = {a: {"is_deployer": False, "virgin": True, "kind": "transfer", "sniper": False, "sold": False,
-                        "launch_bundle": False} for a, _, _ in self.holders}
+                        "launch_bundle": False, "unread": False} for a, _, _ in self.holders}
         self.ops = [{"wallets": [a], "share": s, "share_supply": s, "weighted": s, "level": "single"}
                     for a, _, s in self.holders]
         self.base = {"supply": 55 * E18, "circulating": 55 * E18, "holders_total": 30}
@@ -499,6 +499,86 @@ class TestDetectQFactor(unittest.TestCase):
         rb = d.rug_projection(self.holders, self.sig, self.ops, self.base, 20 * E18, "DANGER", q_factor=0.9)
         self.assertAlmostEqual(rb["drop"], d.dump_impact(55 * E18 * 0.9, 20 * E18))
         self.assertLess(rb["drop"], ra["drop"])
+
+
+class TestMainRulesOnFlap(unittest.TestCase):
+    """Правила вердикта из main (одиночный кит в тонком пуле, probably rug только по поведению) — для налоговых
+    токенов Flap так же, как для Pons, с impact после налога (q × q_factor)."""
+
+    def setUp(self):
+        whale = "0x" + "aa" * 20
+        rest = [f"0x{i:040x}" for i in range(1, 10)]
+        self.holders = [(whale, 50 * E18, 0.5)] + [(a, 50 * E18 // 9, 0.5 / 9) for a in rest]
+        self.sig = {a: {"is_deployer": False, "virgin": False, "kind": "buy", "sniper": False, "sold": False,
+                        "launch_bundle": False, "unread": False, "short_history": False} for a, _, _ in self.holders}
+        self.ops = [{"wallets": [a], "share": s_, "share_supply": s_, "weighted": s_, "level": "single"}
+                    for a, _, s_ in self.holders]
+        self.base = {"supply": 100 * E18, "circulating": 100 * E18, "holders_total": 30}
+
+    def score(self, reserve, q_factor):
+        return d.score(self.holders, self.sig, self.ops, self.base, reserve, q_factor=q_factor)
+
+    def test_independent_whale_thin_pool_is_soft_risky_with_tax(self):
+        sc = self.score(50 * E18, 0.9)
+        self.assertAlmostEqual(sc["metrics"]["impact"], d.dump_impact(50 * E18 * 0.9, 50 * E18))
+        self.assertGreaterEqual(sc["metrics"]["impact"], d.GATE_IMPACT)
+        self.assertEqual(sc["band"], "RISKY")
+        self.assertTrue(sc["gates"] and all(g.startswith("soft:") for g in sc["gates"]), sc["gates"])
+        self.assertLessEqual(sc["score"], d.SOFT_GATE_SCORE)
+        rug = d.rug_projection(self.holders, self.sig, self.ops, self.base, 50 * E18, "DANGER", behavioral=False,
+                               q_factor=0.9)
+        self.assertIsNone(rug)                                       # кит без поведенческих сигналов — не rug
+
+    def test_suspect_whale_is_danger_with_tax(self):
+        self.sig[self.holders[0][0]]["kind"] = "transfer"            # улика: вход переводом
+        sc = self.score(50 * E18, 0.9)
+        self.assertEqual(sc["band"], "DANGER")
+        self.assertTrue(any(g.startswith("biggest operator could move price") for g in sc["gates"]), sc["gates"])
+
+    def test_tax_can_move_impact_below_gate(self):
+        """Порог тонкого пула — по impact после налога: на кривой (q_factor 1) правило есть, после налога 3% — нет."""
+        r = 118 * E18
+        self.assertTrue(any("thin liquidity" in g for g in self.score(r, 1)["gates"]))
+        self.assertFalse(any("thin liquidity" in g for g in self.score(r, 0.97)["gates"]))
+
+
+class TestNewMainFeaturesOnFlap(unittest.TestCase):
+    """Кэш переводов, порядок чтения кошельков и фон (BACKGROUND_RPS) — для сканов Flap."""
+
+    def test_biggest_wallets_first_window(self):
+        widths = []
+        real = engine._RankGate
+        c = Chain()
+        with c.patched(), mock.patch.object(engine, "_RankGate",
+                                            side_effect=lambda w, s=None: widths.append(w) or real(w, s)):
+            engine.scan(FTOKEN)
+        self.assertEqual(flap.HISTORY_PARALLEL, ch.HISTORY_PARALLEL)
+        self.assertEqual(widths, [ch.HISTORY_PARALLEL])
+
+    def test_transfer_cache_not_used_and_same_result(self):
+        keys = ("holders", "operators", "links", "score", "band", "gates", "parts", "rug", "flap")
+        out = {}
+        for on in (False, True):
+            ch.tcache_clear()
+            c = long_chain()
+            with c.patched(), windowed(30), mock.patch.object(ch, "TRANSFER_CACHE_ENABLED", on):
+                r = engine.scan(FTOKEN)
+            out[on] = {k: r[k] for k in keys}
+            out[on]["flap"] = {k: v for k, v in r["flap"].items() if k != "history"}
+            self.assertEqual(ch._TCACHE, {})                         # Flap кэш не пишет и не читает
+        self.assertEqual(out[True], out[False])
+
+    def test_background_scan_requests_are_background(self):
+        """Фоновый скан Flap (окнами, с параллельными выборками): все запросы в сеть — фоновые
+        (уступают живым сканам и идут под BACKGROUND_RPS), бюджет растянут как у Pons."""
+        c = long_chain()
+        flags = []
+        rpc = c.rpc
+        c.rpc = lambda m, p: flags.append(priority.is_background()) or rpc(m, p)
+        with mock.patch.dict(os.environ, {"BACKGROUND_RPS": "2"}), c.patched(), windowed(30):
+            th = threading.Thread(target=lambda: engine.scan(FTOKEN), name=f"{priority.BG}-alerts")
+            th.start(); th.join(30)
+        self.assertTrue(flags and all(flags), flags)
 
 
 if __name__ == "__main__":

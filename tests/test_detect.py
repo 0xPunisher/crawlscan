@@ -198,8 +198,9 @@ class TestDetect(unittest.TestCase):
         self.assertFalse([g for g in s.score["gates"] if "operator" in g])
         self.assertNotIn("could move price", s.score["headline"])            # < 1% и групп нет — фразы нет
 
-    def test_j_operator_20pct_vs_30pct_reserve_danger(self):
-        # оператор держит 20% сапплая, в ликвидности 30%: 1 - (0.3/0.5)^2 = 64% ≥ 50% → DANGER
+    def test_j_single_wallet_impact_is_soft_risky(self):
+        # один независимый кошелёк держит 20% сапплая, в ликвидности 30%: 1 - (0.3/0.5)^2 = 64% ≥ 50%,
+        # но связей нет — тонкий пул, а не оператор: мягкое правило, RISKY, причина «one holder … (thin liquidity)»
         s = Scenario()
         whale = s.wallet(2000)
         s.normal(19, share=50)                                            # 19 кошельков: 50..176
@@ -210,7 +211,114 @@ class TestDetect(unittest.TestCase):
         self.assertEqual(s.reserve, 3000)
         self.assertEqual(s.ops[0]["wallets"], [whale])
         self.assertAlmostEqual(s.score["metrics"]["impact"], 1 - 0.6 ** 2)
-        self.assertEqual(s.score["parts"]["operator"], 0)                 # ≥ 60% → 0 баллов
+        self.assertEqual(s.score["parts"]["operator"], 0)                 # ≥ 60% → 0 баллов (часть — как раньше)
+        self.assertEqual(s.score["band"], "RISKY")
+        self.assertLessEqual(s.score["score"], d.SOFT_GATE_SCORE)
+        self.assertIn("soft: one holder could move price −64% (thin liquidity)", s.score["gates"])
+        self.assertFalse([g for g in s.score["gates"] if not g.startswith("soft:")])   # жёстких правил нет
+
+    def lone_whale(self, **kw):
+        """Как test_j: один кошелёк с 20% сапплая в тонком пуле (падение 64%), свойства кошелька — kw."""
+        s = Scenario()
+        whale = s.wallet(2000, **kw)
+        s.normal(19, share=50)
+        rest = SUPPLY - 2000 - sum(50 + 7 * i for i in range(19))
+        s.move(POOL, 3000)
+        s.move(LOCKER, rest - 3000)
+        s.run()
+        self.assertEqual(s.ops[0]["wallets"], [whale])
+        self.assertAlmostEqual(s.score["metrics"]["impact"], 1 - 0.6 ** 2)
+        return s
+
+    def assert_hard_impact(self, s):
+        self.assertEqual(s.score["band"], "DANGER")
+        self.assertTrue(any(g.startswith("biggest operator could move price −64% if sold") for g in s.score["gates"]))
+        self.assertFalse([g for g in s.score["gates"] if "one holder" in g])
+
+    def test_j_lone_deployer_stays_danger(self):
+        self.assert_hard_impact(self.lone_whale(addr=DEPLOYER))
+
+    def test_j_lone_virgin_stays_danger(self):
+        s = self.lone_whale(distinct=0)
+        self.assertTrue(s.signals[s.ops[0]["wallets"][0]]["virgin"])
+        self.assert_hard_impact(s)
+
+    def test_j_lone_transfer_stays_danger(self):
+        self.assert_hard_impact(self.lone_whale(kind="transfer", via=BUNDLER))
+
+    def assert_unknown_soft(self, s):
+        self.assertEqual(s.score["band"], "RISKY")
+        self.assertIn("soft: biggest holder couldn't be fully read; could move price −64% (thin liquidity)",
+                      s.score["gates"])
+        self.assertFalse([g for g in s.score["gates"] if not g.startswith("soft:")])
+
+    def test_j_lone_unread_history_is_soft(self):
+        # история не прочитана в бюджет — не улика: мягкое правило, причина «couldn't be fully read»
+        self.assert_unknown_soft(self.lone_whale(distinct=None))
+
+    def test_j_lone_entry_not_found_is_soft(self):
+        self.assert_unknown_soft(self.lone_whale(kind=None))
+
+    def test_j_lone_unread_deployer_stays_danger(self):
+        # деплоер — улика и без прочитанной истории
+        self.assert_hard_impact(self.lone_whale(addr=DEPLOYER, distinct=None))
+
+    def test_virgin_share_over_read_wallets(self):
+        # 20 холдеров: 4 непрочитанных, из 16 прочитанных 4 девственных → 25% (а не 4/20 = 20%)
+        s = Scenario()
+        for _ in range(4):
+            s.wallet(100, distinct=None)
+        for _ in range(4):
+            s.wallet(100, distinct=0)
+        s.normal(12)
+        s.run()
+        m = s.score["metrics"]
+        self.assertAlmostEqual(m["unread"], 4 / 20)
+        self.assertAlmostEqual(m["virgin"], 4 / 16)
+        self.assertEqual(s.score["notes"], [])
+
+    def test_virgin_neutral_when_most_unread(self):
+        # 15 из 20 не прочитаны: доля девственных неизвестна — нейтральная половина веса, без правила, пометка
+        s = Scenario()
+        for _ in range(15):
+            s.wallet(100, distinct=None)
+        for _ in range(5):
+            s.wallet(100, distinct=0)                                     # прочитанные — все девственные
+        s.run()
+        self.assertIsNone(s.score["metrics"]["virgin"])
+        self.assertEqual(s.score["parts"]["virgin"], d.WEIGHTS["virgin"] / 2)
+        self.assertFalse([g for g in s.score["gates"] if "virgin" in g])  # 5/5 девственных, но правило молчит
+        self.assertEqual(s.score["notes"], ["virgin: 15 of 20 top wallets unread — scored neutral"])
+
+    def test_virgin_gate_needs_five_read(self):
+        # 4 прочитанных девственных + 3 непрочитанных (≤ 50%): прочитанных < 5 — правила по virgin нет
+        s = Scenario()
+        for _ in range(4):
+            s.wallet(100, distinct=0)
+        for _ in range(3):
+            s.wallet(100, distinct=None)
+        s.normal(3)
+        s.run()
+        self.assertAlmostEqual(s.score["metrics"]["virgin"], 4 / 7)
+        self.assertFalse([g for g in s.score["gates"] if "virgin" in g])
+
+    def test_j_lone_short_history_buyer_is_soft(self):
+        # история короткая (1–3 монеты), но есть, и сам купил — независимый: мягкое правило
+        s = self.lone_whale(distinct=2)
+        self.assertEqual(s.score["band"], "RISKY")
+        self.assertIn("soft: one holder could move price −64% (thin liquidity)", s.score["gates"])
+
+    def test_j2_linked_operator_impact_is_danger(self):
+        # те же 20% сапплая, но у двух кошельков, купивших одной транзакцией (доказанная связь) → DANGER
+        s = Scenario()
+        pair = [s.wallet(1000, kind="buy", via=BUNDLER, tx="0xsame", block=101) for _ in range(2)]
+        s.normal(18, share=50)
+        rest = SUPPLY - 2000 - sum(50 + 7 * i for i in range(18))
+        s.move(POOL, 3000)
+        s.move(LOCKER, rest - 3000)
+        s.run()
+        self.assertEqual(sorted(s.ops[0]["wallets"]), sorted(pair))
+        self.assertAlmostEqual(s.score["metrics"]["impact"], 1 - 0.6 ** 2)
         self.assertEqual(s.score["band"], "DANGER")
         self.assertTrue(any(g.startswith("biggest operator could move price −64% if sold") for g in s.score["gates"]))
 

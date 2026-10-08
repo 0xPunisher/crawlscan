@@ -5,6 +5,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Optional transfer history cache between scans (`TRANSFER_CACHE_ENABLED`, off by default): a repeat scan of a token reads only the new transfers. Scan results are the same with and without the cache.
+- `MAX_CONCURRENT` sets how many scans run at the same time.
+
+### Changed
+
+- Background work (reward checks, alert rechecks, early buyers without a fresh scan) has its own request rate (`BACKGROUND_RPS`) and always waits for live scans.
+- The RPC rate limiter no longer holds its lock while waiting.
+
 ## [1.6.0] - 2026-10-08
 
 ### Added

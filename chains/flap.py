@@ -24,6 +24,8 @@ REQUESTS = ch.REQUESTS            # один счётчик HTTP с адапте
 PACK_WINDOW = ch.PACK_WINDOW
 BUNDLE_WINDOW = ch.BUNDLE_WINDOW
 RUG_SNIPERS = ch.RUG_SNIPERS
+RPS = ch.RPS                      # лимитер общий с Robinhood (фон — тот же BACKGROUND_RPS, chains.priority)
+HISTORY_PARALLEL = ch.HISTORY_PARALLEL   # движок читает кошельки окном этой ширины, крупнейшие первыми (как у Pons)
 
 SUFFIXES = ("8888", "7777")       # vanity-суффиксы реализаций: 8888 — без налога, 7777 — налоговый V3
 PORTAL = "0x26605f322f7ff986f381bb9a6e3f5dab0beaeb09"
@@ -380,7 +382,10 @@ def history(token, launch_block, supply, excluded, deadline=None):
       контрагентов топа (связанные кошельки); вошедшие в топ — их переводы тоже.
     Топ точный (top_exact), если непрочитанный остаток оборота меньше баланса 20-го холдера или порога пыли
     (что больше): ни один невиданный кошелёк не может войти в топ движка; иначе движок помечает скан limited.
-    Время: всё до deadline − HISTORY_RESERVE (deadline — от начала скана)."""
+    Время: всё до deadline − HISTORY_RESERVE (deadline — от начала скана).
+    Кэш истории переводов между сканами (ch.load_transfers, TRANSFER_CACHE_ENABLED) здесь не используется: окнами
+    читается не вся история, а выборка (его «история + хвост» и сверка с totalSupply к ней неприменимы), а целиком —
+    до HISTORY_MAX_LOGS переводов, 1–2 страницы getLogs: хвост сэкономил бы 0–1 запрос. remember_scan у Flap нет."""
     until = (deadline - HISTORY_RESERVE) if deadline is not None else float("inf")
     t_start = time.time()
     head = ch.block_number()
