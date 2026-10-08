@@ -4,7 +4,7 @@
 Сеть — по адресу: 0x + 40 hex → Robinhood (chains/robinhood.py), base58 → Solana
 (chains/solana.py, только при SOLANA_ENABLED=true). Оба адаптера отдают одинаковые факты.
 Запуск из кода: engine.scan("0x...", emit=print) -> result (dict)."""
-import os, re, threading, time
+import math, os, re, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _CFTimeout
 
 from chains import bankr
@@ -43,6 +43,26 @@ GT_NETWORK = {"robinhood": "robinhood", "solana": "solana"}
 
 class ScanError(Exception):
     """Понятная пользователю ошибка скана (плохой адрес, не Pons V2 / pump.fun, Solana выключена)."""
+
+
+PARTIAL_BUILDING = "Partial scan: building the full holder history, check again in {eta}"
+PARTIAL_TOO_LARGE = "Partial scan: the holder history is too large to read in full, top holders are approximate"
+PARTIAL_LATER = "Partial scan: the full holder history is not available right now, check again later"
+
+
+def bankr_partial(token, hist):
+    """Частичный скан Bankr -> {"state", "eta_s", "message"} (state — bankr.index_status: building | too_large |
+    unavailable | none | ready). ready — индекс достроился, пока шёл скан: следующий скан будет полным."""
+    st = bankr.index_status(token)
+    state, eta = st["state"], st["eta_s"]
+    if state in ("building", "ready"):
+        mins = math.ceil((eta or 60) / 60)
+        msg = PARTIAL_BUILDING.format(eta="about a minute" if mins <= 1 or state == "ready" else f"about {mins} minutes")
+    elif state == "too_large":
+        msg = PARTIAL_TOO_LARGE
+    else:
+        msg = PARTIAL_LATER
+    return {"state": state, "eta_s": eta, "message": msg}
 
 
 def not_launchpad(chain):
@@ -392,6 +412,9 @@ def scan(token, emit=lambda e: None):
     partial = hist.get("mode") == "windowed" and not hist.get("top_exact")
     limited_note = d.PARTIAL_NOTE if partial and not limited else d.LIMITED_NOTE
     limited = limited or partial
+    # Bankr: большая история, полный индекс холдеров ещё строится (или недоступен) — частичный скан:
+    # вердикт не лучше RISKY, на сайте и в боте — «Partial scan: …» (Pons и Flap — прежний путь)
+    partial_scan = bankr_partial(token, hist) if "bankr" in facts and partial else None
     # резерв надёжен: адаптер нашёл пул (на кривой — всегда) и он согласуется с ликвидностью GT
     reserve_ok = facts.get("reserve_ok", True) and reserve_seen(facts["reserve"], supply, gt)
     q_factor = facts.get("q_factor", 1)   # Flap после выпуска: налог на продажу токенами (1 − sellTax)
@@ -401,7 +424,7 @@ def scan(token, emit=lambda e: None):
     curve, locked = facts.get("impact_curve"), facts.get("locked")
     sc = d.score(holders, sig, ops, base, facts["reserve"], gt.get("liquidity_usd"), reserve_ok=reserve_ok,
                  limited=limited, q_factor=q_factor, limited_note=limited_note, impact_curve=curve, locked=locked,
-                 dev=facts.get("dev"))
+                 dev=facts.get("dev"), partial=partial_scan is not None)
     reason = _reason(sc, base)
     # probably rug: только вычисления на уже собранных данных, без запросов в сеть
     # и только если DANGER вызван поведенческим жёстким правилом (не одиночным китом в тонком пуле)
@@ -446,7 +469,7 @@ def scan(token, emit=lambda e: None):
         "reserve": facts["reserve"],
         "reserve_ok": reserve_ok, "limited": limited, "market_source": gt.get("source"),
         "market_pool": gt.get("pool"),
-        "rug": rug,
+        "rug": rug, "partial_scan": partial_scan,
         "unread": unread, "use_funding": USE_FUNDING,
         "elapsed_s": elapsed, "rpc_requests": a.REQUESTS[0] - r0,
     }

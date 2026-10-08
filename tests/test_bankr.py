@@ -4,7 +4,7 @@
 включён — суффикс ba3 без RPC, затем один eth_call Airlock; порядок Flap → Bankr → Pons; запуск и PoolKey из чека,
 исключения, покупки через хук (антиснайп) — покупки, вестинг дева — его доля, не перевод и не в q для impact;
 impact и probably rug — по котировкам V4Quoter, не по балансу PoolManager; поля результата."""
-import os, unittest
+import os, threading, time as _t, unittest
 from unittest import mock
 
 import fakes
@@ -532,13 +532,28 @@ class TestHistory(unittest.TestCase):
 
     def test_big_history_windowed_and_index_started(self):
         c = Chain()
-        started = []
+        started, gate = [], threading.Event()
+
+        def build(t, b, ex, est=None):
+            started.append((t, b, est))
+            gate.wait(5)
+            return False, "error"
         with c.patched(), mock.patch.object(bankr, "FULL_MAX_LOGS", 3), \
-                mock.patch.object(bankr, "_index_start", side_effect=lambda t, b, ex: started.append((t, b)) or True):
+                mock.patch.object(bankr, "build_index", side_effect=build), \
+                mock.patch.dict(bankr._INDEX_BUILDING, clear=True), mock.patch.dict(bankr._INDEX_FAILED, clear=True):
             r = engine.scan(BTOKEN)
-        h = r["bankr"]["history"]
-        self.assertEqual((h["index"], h["index_started"]), ("building", True))
-        self.assertEqual(started, [(BTOKEN, LAUNCH_BLOCK)])
+            h = r["bankr"]["history"]
+            self.assertEqual((h["index"], h["index_started"]), ("building", True))
+            self.assertGreater(h["index_eta_s"], 0)
+            self.assertEqual(bankr.index_status(BTOKEN)["state"], "building")
+            gate.set()
+            for _ in range(100):
+                if BTOKEN not in bankr._INDEX_BUILDING:
+                    break
+                _t.sleep(0.01)
+            self.assertEqual(bankr.index_status(BTOKEN)["state"], "unavailable")   # сбой: не повторяем INDEX_RETRY_S
+        self.assertEqual([x[:2] for x in started], [(BTOKEN, LAUNCH_BLOCK)])
+        self.assertGreater(started[0][2], 3)                                     # оценка истории — больше потолка
         self.assertNotIn(BTOKEN, bankr._INDEX)
 
     def test_build_index_balances(self):
@@ -546,7 +561,7 @@ class TestHistory(unittest.TestCase):
         c.page_cap = 5
         a, b = small_pages()
         with c.patched(), a, b:
-            self.assertTrue(bankr.build_index(BTOKEN, LAUNCH_BLOCK, bankr._sets(BTOKEN, bankr.get_launch(BTOKEN))[1]))
+            self.assertEqual(bankr.build_index(BTOKEN, LAUNCH_BLOCK, bankr._sets(BTOKEN, bankr.get_launch(BTOKEN))[1]), (True, None))
             idx = bankr._INDEX[BTOKEN]
         self.assertEqual(idx["head"], c.head)
         for w in W + [DEV, PM, BTOKEN]:
@@ -623,3 +638,273 @@ class TestEarly(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIndexStability(unittest.TestCase):
+    """B2: индекс Bankr под правилами стабильности — LRU по записям, защита по памяти, фон, одно построение."""
+
+    def setUp(self):
+        self.st = mock.patch.multiple(bankr, memory_high=lambda: False)
+        self.st.start()
+        for dct in (bankr._INDEX, bankr._INDEX_BUILDING, bankr._INDEX_FAILED):
+            p = mock.patch.dict(dct, clear=True)
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self.st.stop)
+
+    def ix(self, n):
+        ix = bankr._index_new()
+        ix["n"] = n
+        return ix
+
+    def build(self, c, **kw):
+        a, b = small_pages()
+        with c.patched(), a, b, mock.patch.multiple(bankr, **kw) if kw else mock.patch.multiple(bankr, EDGES_MAX=64):
+            r = bankr.build_index(BTOKEN, LAUNCH_BLOCK, bankr._sets(BTOKEN, bankr.get_launch(BTOKEN))[1])
+            self.after = dict(bankr._INDEX)    # c.patched() восстанавливает _INDEX на выходе
+            return r
+
+    def test_lru_by_entries_not_only_tokens(self):
+        with mock.patch.multiple(bankr, INDEX_MAX_ENTRIES=100, INDEX_MAX=20):
+            self.assertTrue(bankr._index_put("0xa", self.ix(40)))
+            self.assertTrue(bankr._index_put("0xb", self.ix(40)))
+            self.assertTrue(bankr._index_put("0xc", self.ix(40)))      # 120 > 100: вытеснен самый давний
+            self.assertEqual(list(bankr._INDEX), ["0xb", "0xc"])
+            self.assertFalse(bankr._index_put("0xd", self.ix(101)))    # больше лимита — не хранится
+            self.assertNotIn("0xd", bankr._INDEX)
+
+    def test_entries_counted_and_compact(self):
+        ok, why = self.build(Chain())
+        self.assertEqual((ok, why), (True, None))
+        ix = self.after[BTOKEN]
+        n = len(ix["bal"]) + len(ix["first"]) + len(ix["sold"]) + sum(len(e) for e in ix["edges"].values())
+        self.assertEqual(ix["n"], n)
+        self.assertTrue(all(isinstance(v, tuple) for v in ix["first"].values()))   # перевод — кортеж, не словарь
+
+    def test_build_stops_when_too_large(self):
+        self.assertEqual(self.build(Chain(), INDEX_MAX_ENTRIES=3), (False, "too_large"))
+        self.assertNotIn(BTOKEN, self.after)
+
+    def test_build_stops_near_memory_limit(self):
+        with mock.patch.object(bankr, "memory_high", lambda: True):
+            self.assertEqual(self.build(Chain()), (False, "memory"))
+        self.assertNotIn(BTOKEN, self.after)
+
+    def test_drop_caches_clears_and_aborts_running_build(self):
+        c = Chain()
+        orig = c.rpc
+
+        def rpc(m, p):
+            if m == "eth_getLogs":
+                bankr._index_put("0xa", self.ix(1))
+                bankr.drop_caches()        # защита по памяти сработала посреди построения
+            return orig(m, p)
+        with mock.patch.object(c, "rpc", side_effect=rpc):
+            self.assertEqual(self.build(c), (False, "memory"))
+        self.assertEqual(self.after, {})
+
+    def test_memguard_drops_bankr_index(self):
+        import server, memguard
+        self.assertIn(bankr.drop_caches, memguard._droppers)
+        bankr._index_put("0xa", self.ix(1))
+        memguard.relieve()
+        self.assertEqual(bankr._INDEX, {})
+
+    def test_memguard_near(self):
+        import memguard
+        with mock.patch.object(memguard, "soft_limit_mb", return_value=1000):
+            with mock.patch.object(memguard, "rss_mb", return_value=900):
+                self.assertTrue(memguard.near())
+            with mock.patch.object(memguard, "rss_mb", return_value=500):
+                self.assertFalse(memguard.near())
+            with mock.patch.object(memguard, "rss_mb", return_value=None):
+                self.assertFalse(memguard.near())
+        with mock.patch.object(memguard, "soft_limit_mb", return_value=0), \
+                mock.patch.object(memguard, "rss_mb", return_value=10 ** 6):
+            self.assertFalse(memguard.near())
+
+    def test_start_limits(self):
+        gate, seen = threading.Event(), []
+
+        def build(t, b, ex, est=None):
+            from chains import priority
+            seen.append(priority.is_background())
+            gate.wait(5)
+            return True, None
+        with mock.patch.object(bankr, "build_index", side_effect=build):
+            self.assertTrue(bankr._index_start("0xa", 1, set(), 10 ** 6))
+            self.assertFalse(bankr._index_start("0xa", 1, set()))           # уже строится
+            self.assertFalse(bankr._index_start("0xb", 1, set()))           # INDEX_BUILDS_MAX = 1
+            st = bankr.index_status("0xa")
+            self.assertEqual(st["state"], "building")
+            self.assertGreater(st["eta_s"], 60)                              # 1M логов под BACKGROUND_RPS — минуты
+            gate.set()
+            for _ in range(200):
+                if not bankr._INDEX_BUILDING:
+                    break
+                _t.sleep(0.01)
+        self.assertEqual(seen, [True])                                       # поток построения — фоновый
+        with mock.patch.object(bankr, "memory_high", lambda: True):
+            self.assertFalse(bankr._index_start("0xc", 1, set()))           # у порога памяти не стартует
+        bankr._INDEX_FAILED["0xd"] = (_t.time() + 60, "too_large")
+        self.assertFalse(bankr._index_start("0xd", 1, set()))
+        self.assertEqual(bankr.index_status("0xd")["state"], "too_large")
+
+    def test_background_read_uses_fewer_workers(self):
+        from chains import priority
+        sizes = []
+        real = bankr.ThreadPoolExecutor
+
+        def pool(max_workers, thread_name_prefix):
+            sizes.append((max_workers, thread_name_prefix.startswith(priority.BG)))
+            return real(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
+        c = Chain()
+        with c.patched(), mock.patch.object(bankr, "ThreadPoolExecutor", side_effect=pool):
+            bankr._read_all(BTOKEN, LAUNCH_BLOCK, c.head, lambda p: None)
+            th = threading.Thread(target=lambda: bankr._read_all(BTOKEN, LAUNCH_BLOCK, c.head, lambda p: None),
+                                  name=priority.BG + "-test")
+            th.start()
+            th.join()
+        self.assertEqual(sizes, [(bankr.READ_WORKERS, False), (bankr.READ_WORKERS_BG, True)])
+
+
+class TestPartialScan(unittest.TestCase):
+    """B2: большой токен Bankr при первом скане (индекс строится) — вердикт не лучше RISKY и «Partial scan: …»."""
+
+    def test_score_partial_ceiling(self):
+        holders = [("0x" + f"{i:02x}" * 20, 50, 0.05) for i in range(1, 21)]
+        sig = {a: {"is_deployer": False, "unread": False, "virgin": False, "kind": "buy", "sniper": False,
+                   "launch_bundle": False, "sold": False, "short_history": False} for a, _, _ in holders}
+        ops = [{"wallets": [a], "share": s, "share_supply": s, "level": None, "weighted": s} for a, _, s in holders]
+        base = {"supply": 1000, "circulating": 1000, "holders_total": 200}
+        clean = d.score(holders, sig, ops, base, 10 ** 6)
+        self.assertIn(clean["band"], ("CLEAN", "OK"))
+        part = d.score(holders, sig, ops, base, 10 ** 6, partial=True)
+        self.assertEqual(part["band"], "RISKY")
+        self.assertLessEqual(part["score"], d.PARTIAL_SCORE)
+
+    def scan(self, state, eta):
+        c = Chain()
+        orig = bankr.history
+        part = lambda *a, **k: (lambda r: (r[0], r[1], dict(r[2], mode="windowed", top_exact=False), r[3]))(orig(*a, **k))
+        with c.patched(), mock.patch.object(bankr, "history", side_effect=part), \
+                mock.patch.object(bankr, "index_status", return_value={"state": state, "eta_s": eta}):
+            return engine.scan(BTOKEN)
+
+    def test_partial_message_building(self):
+        r = self.scan("building", 50)
+        self.assertEqual(r["partial_scan"]["message"],
+                         "Partial scan: building the full holder history, check again in about a minute")
+        self.assertNotIn(r["band"], ("CLEAN", "OK"))
+        self.assertIn("about 7 minutes", self.scan("building", 400)["partial_scan"]["message"])
+        self.assertIn("too large", self.scan("too_large", None)["partial_scan"]["message"])
+
+    def test_full_scan_has_no_partial(self):
+        _, r = scan()
+        self.assertIsNone(r["partial_scan"])
+
+    def test_pons_unchanged(self):
+        with fakes.patched():
+            r = engine.scan(fakes.TOKEN)
+        self.assertIsNone(r["partial_scan"])
+        self.assertNotIn("launchpad", r)
+
+
+class TestB2Server(unittest.TestCase):
+
+    def test_cache_bypassed_when_index_ready(self):
+        import server
+        jid = "j1"
+        res = {"token": BTOKEN, "partial_scan": {"state": "building"}}
+        with mock.patch.dict(server.JOBS, {jid: {"token": BTOKEN, "done": True, "result": res, "ts": _t.time()}}), \
+                mock.patch.dict(server.BY_TOKEN, {BTOKEN: jid}):
+            with mock.patch.object(bankr, "index_status", return_value={"state": "building", "eta_s": 60}):
+                self.assertEqual(server._reuse(BTOKEN, _t.time()), jid)
+            with mock.patch.object(bankr, "index_status", return_value={"state": "ready", "eta_s": 0}):
+                self.assertIsNone(server._reuse(BTOKEN, _t.time()))       # индекс готов — новый, полный скан
+
+    def test_config_and_index_endpoint(self):
+        import json, server, urllib.request, urllib.error
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{srv.server_port}"
+        try:
+            for v, want in (("1", True), ("0", False)):
+                with mock.patch.dict(os.environ, {"BANKR_ENABLED": v}):
+                    with urllib.request.urlopen(url + "/api/config") as r:
+                        self.assertIs(json.loads(r.read())["bankr"], want)
+            with mock.patch.dict(os.environ, {"BANKR_ENABLED": "1"}), \
+                    mock.patch.object(bankr, "index_status", return_value={"state": "building", "eta_s": 90}):
+                with urllib.request.urlopen(url + "/api/index?token=" + BTOKEN) as r:
+                    self.assertEqual(json.loads(r.read()), {"token": BTOKEN, "state": "building", "eta_s": 90})
+            with mock.patch.dict(os.environ, {"BANKR_ENABLED": "0"}):
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(url + "/api/index?token=" + BTOKEN)
+                self.assertEqual(cm.exception.code, 404)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_partial_not_snapshotted(self):
+        import server
+        with mock.patch.object(server.alerts, "enabled", return_value=True), \
+                mock.patch.object(server, "alerts_store") as st:
+            server.record_snapshot({"token": BTOKEN, "partial_scan": {"state": "building"}})
+        st.assert_not_called()
+
+
+class TestB2Bot(unittest.TestCase):
+
+    def res(self, **kw):
+        r = {"token": BTOKEN, "chain": "robinhood", "header": {"ticker": "CHOP"}, "band": "RISKY", "score": 55,
+             "holders": [], "operators": [], "metrics": {}, "gates": [], "launchpad": "bankr",
+             "bankr": {"pair": {"kind": "eth", "symbol": "ETH"},
+                       "vesting": {"total_share_supply": 0.15, "unlocked_share_supply": 0.0}}}
+        r.update(kw)
+        return r
+
+    def test_bankr_line(self):
+        from bot import text as T
+        self.assertEqual(T.bankr_line(self.res()), "Bankr · ETH pair · dev vesting 15%")
+        r = self.res(bankr={"pair": {"kind": "token", "symbol": "META"},
+                            "vesting": {"total_share_supply": 0.3, "unlocked_share_supply": 0.15}})
+        self.assertEqual(T.bankr_line(r), "Bankr · META pair · dev vesting 30% (15% unlocked)")
+        self.assertEqual(T.bankr_line(self.res(bankr={"pair": {"kind": "eth"}, "vesting": {}})), "Bankr · ETH pair")
+        self.assertIsNone(T.bankr_line({"launchpad": None}))
+        self.assertIn("Bankr · ETH pair · dev vesting 15%", T.verdict(self.res()).split("\n")[1])
+
+    def test_partial_line(self):
+        from bot import text as T
+        msg = "Partial scan: building the full holder history, check again in about a minute"
+        v = T.verdict(self.res(partial_scan={"state": "building", "message": msg}))
+        self.assertIn("⏳ " + msg, v)
+        self.assertNotIn("Partial", T.verdict(self.res()))
+
+    def test_help_with_bankr(self):
+        from bot import text as T
+        self.assertIn("Pons V2, Flap and Bankr on Robinhood Chain", T.help_text(True, True))
+        self.assertIn("Pons V2 and Bankr on Robinhood Chain", T.help_text(False, True))
+        self.assertEqual(T.help_text(True), T.help_text(True, False))
+        self.assertEqual(T.help_text(False, False), T.HELP)
+
+
+class TestB2Frontend(unittest.TestCase):
+    """Собранный index.html: правки Bankr есть и все — под флагом с сервера (bankrOn из /api/config)."""
+
+    def test_built_page(self):
+        import json, re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        src = open(os.path.join(root, "index.html"), encoding="utf-8").read()
+        a = re.search(r'<script type="__bundler/template">', src).end()
+        t = json.loads(src[a:src.find("</script>", a)])
+        self.assertIn("bankrOn:!!d.bankr", t)
+        self.assertIn("state={bankrOn:false,", t)
+        self.assertIn("bankrOf(r)?'Bankr · Uniswap V4'", t)
+        self.assertIn("this.state.bankrOn&&this.state.view==='scan'", t)
+        self.assertIn("bankr:!!this.state.bankrOn&&x.launchpad==='bankr'", t)
+        self.assertIn("'/api/index?token='", t)
+        self.assertIn("dev vesting: ${bankrPct(v.total_share_supply)} (${bankrPct(v.unlocked_share_supply)} unlocked)", t)
+        self.assertIn('<sc-if value="{{partialOn}}"', t)
+        m = t.index("Bankr launchpad</span>")
+        self.assertIn('<sc-if value="{{bankrOn2}}"', t[m - 600:m])

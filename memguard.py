@@ -64,6 +64,12 @@ def _trim():
         pass
 
 
+def trim():
+    """gc и возврат освобождённой памяти ОС (после фонового построения индекса Bankr: страницы getLogs)."""
+    gc.collect()
+    _trim()
+
+
 def relieve():
     for fn in _droppers:
         try:
@@ -72,6 +78,17 @@ def relieve():
             print(f"memory: cache drop failed: {type(e).__name__}: {e}", flush=True)
     gc.collect()
     _trim()
+
+
+NEAR_SHARE = 0.85         # near(): доля порога, выше которой фоновые построения (индекс Bankr) не идут
+
+
+def near(share=NEAR_SHARE):
+    """True — память процесса выше share × порога (без сброса кэшей): фоновое построение индекса прерывается
+    и не стартует, чтобы не довести до отказа живым сканам. Нет /proc или порог выключен — False."""
+    limit = soft_limit_mb()
+    rss = rss_mb()
+    return bool(limit) and rss is not None and rss >= limit * share
 
 
 def over(live=0):

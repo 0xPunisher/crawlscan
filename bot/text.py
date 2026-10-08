@@ -105,14 +105,18 @@ HELP = (
 )
 
 LAUNCHPADS_FLAP = "<b>Launchpads</b>: Pons V2 and Flap on Robinhood Chain, pump.fun on Solana.\n\n"
+LAUNCHPADS = "<b>Launchpads</b>: {pads} on Robinhood Chain, pump.fun on Solana.\n\n"
 
 
-def help_text(flap=False):
-    """/help; Flap включён на сайте — строка о площадках перед последней строкой."""
-    if not flap:
+def help_text(flap=False, bankr=False):
+    """/help; Flap или Bankr включены на сайте — строка о площадках перед последней строкой."""
+    if not flap and not bankr:
         return HELP
     tail = "Send a token address to scan it."
-    return HELP[:-len(tail)] + LAUNCHPADS_FLAP + tail
+    pads = ["Pons V2"] + (["Flap"] if flap else []) + (["Bankr"] if bankr else [])
+    line = LAUNCHPADS_FLAP if pads == ["Pons V2", "Flap"] else \
+        LAUNCHPADS.format(pads=", ".join(pads[:-1]) + " and " + pads[-1])
+    return HELP[:-len(tail)] + line + tail
 
 
 ASK_ADDRESS = "Send me a token address from Robinhood Chain or Solana"
@@ -210,9 +214,25 @@ def flap_line(res):
     return " · ".join(parts)
 
 
+def bankr_line(res):
+    """Токен Bankr: "Bankr · ETH pair · dev vesting 15%" (пара — ETH или тикер stock token; вестинг — доля сапплая,
+    разблокированное — в скобках, если есть); не Bankr — None."""
+    b = res.get("bankr") if res.get("launchpad") == "bankr" else None
+    if not isinstance(b, dict):
+        return None
+    pair = b.get("pair") or {}
+    parts = ["Bankr", f"{e(pair.get('symbol') or ('ETH' if pair.get('kind') == 'eth' else 'token'))} pair"]
+    v = b.get("vesting") or {}
+    if v.get("total_share_supply"):
+        unl = v.get("unlocked_share_supply") or 0
+        parts.append(f"dev vesting {_tax(v['total_share_supply'])}" + (f" ({_tax(unl)} unlocked)" if unl >= 0.0005 else ""))
+    return " · ".join(parts)
+
+
 def verdict(res):
     """Результат скана сайта → HTML-текст вердикта."""
-    lines = [title(res)] + ([fl] if (fl := flap_line(res)) else []) + [""]
+    lp = flap_line(res) or bankr_line(res)
+    lines = [title(res)] + ([lp] if lp else []) + [""]
     holders = len(res.get("holders") or [])
     ops = res.get("operators") or []
     if res.get("band") == TOO_ESTABLISHED:     # полный скан не запускался: без скора
@@ -226,6 +246,8 @@ def verdict(res):
 
     band = res.get("band", "")
     lines.append(f"{BAND_ICON.get(band, '⚪️')} <b>Score {res.get('score')}/100 · {e(band)}</b>")
+    if (ps := res.get("partial_scan")) and ps.get("message"):   # Bankr: полный индекс холдеров ещё строится
+        lines.append(f"⏳ {e(ps['message'])}")
     lines.append(f"{holders} top holders → {len(ops)} operator{'' if len(ops) == 1 else 's'}")
     m = res.get("metrics") or {}
     if ops and "impact" in m:

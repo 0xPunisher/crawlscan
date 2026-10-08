@@ -64,6 +64,7 @@ TOO_ESTABLISHED = "TOO_ESTABLISHED"
 ESTABLISHED = {"min_age_days": 30.0, "min_liquidity_usd": 750_000.0, "min_mcap_usd": 10_000_000.0}
 ESTABLISHED_HEADLINE = "This token is too established for CrawlScan."
 LIMITED_NOTE = " — market data unavailable, older token: holder signals are limited"
+PARTIAL_SCORE = 59   # частичный скан Bankr (score partial=True): score не выше, band не лучше RISKY
 PARTIAL_NOTE = " — long history, top holders partially read: holder signals are limited"   # Flap: история окнами
 ESTABLISHED_TEXT = ("CrawlScan is built for fresh memecoins. On large, older tokens the top holders are mostly "
                     "exchanges and big liquidity pools: tokens reach exchange wallets by transfer, not by buying, "
@@ -329,7 +330,7 @@ def _sold_into_pool(q, q_factor):
 
 
 def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True, limited=False, q_factor=1,
-          limited_note=LIMITED_NOTE, impact_curve=None, locked=None, dev=None):
+          limited_note=LIMITED_NOTE, impact_curve=None, locked=None, dev=None, partial=False):
     """Скор 0–100 (100 = чисто): {"score", "band", "parts", "gates", "metrics", "headline"}.
     reserve — резерв токенов ликвидности (сырые единицы): баланс пула после миграции или кривой до.
     Часть "operator" и её стоп-правило — от dump_impact крупнейшего оператора (q = взвешенная доля
@@ -352,7 +353,9 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     dev — доля дева, точно известная из контрактов (Bankr: кошелёк деплоера через balanceOf + вестинг):
     {"wallet", "sellable" (что может продать сейчас: кошелёк + доступное в вестинге), "share_supply" (кошелёк + весь
     вестинг)}. Его продажа уронит цену на ≥ GATE_IMPACT — жёсткое правило, в том числе при limited (числа не зависят
-    от неполного топа); metrics["dev_impact"]. None — правила нет (Pons, Flap: прежний путь)."""
+    от неполного топа); metrics["dev_impact"]. None — правила нет (Pons, Flap: прежний путь).
+    partial=True — частичный скан (Bankr: большая история, полный индекс холдеров ещё строится): вердикт не лучше
+    RISKY и score не выше PARTIAL_SCORE (CLEAN/OK по неполному топу не показываем). False — прежний путь."""
     n = len(holders)
     big = ops[0] if ops else {"share": 0.0, "share_supply": 0.0, "weighted": 0.0, "wallets": []}
     q = _unlocked(big["weighted"] * base["circulating"], big["wallets"], locked,
@@ -432,6 +435,8 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     if limited and band == "DANGER" and not dev_gate:
         band = "RISKY"   # старый токен без данных рынка: сигналы холдеров ограничены, вердикт не ниже RISKY
                          # (кроме правила по деву: его доля известна точно из контрактов)
+    if partial and band in ("CLEAN", "OK"):
+        band, total = "RISKY", min(total, PARTIAL_SCORE)   # неполный топ: «чисто» не утверждаем
     return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline,
             "notes": notes}
 
