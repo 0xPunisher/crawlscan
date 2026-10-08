@@ -44,7 +44,10 @@ SCALE = {
     "sniper":        (0.01, 0.15),
     "concentration": (0.25, 0.70),
 }
-GATE_IMPACT = 0.50         # стоп: продажа крупнейшего оператора уронит цену на ≥ 50%
+GATE_IMPACT = 0.50         # стоп: продажа крупнейшего оператора уронит цену на ≥ 50% — если он из 2+ связанных
+                           # кошельков или один, но подозрительный (деплоер, virgin, без прочитанной истории, вход
+                           # переводом или не найден); независимый покупатель с историей (тонкий пул) — мягкое
+                           # правило, band не хуже RISKY
 LIQ_MIN_USD = 1_000        # мягкое правило: ликвидность из шапки < $1,000 → band не лучше RISKY
 GATE_VIRGIN = 0.80         # стоп: девственных ≥ 80% топа ...
 GATE_VIRGIN_MIN = 5        # ... минимум 5 холдеров (без деплоера)
@@ -333,7 +336,13 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
                          else _part("operator", m["operator"], "operator_share"))
     parts = {k: parts[k] for k in WEIGHTS}
     gates = []
-    if impact is not None and impact >= GATE_IMPACT and not limited:
+    thin = impact is not None and impact >= GATE_IMPACT and not limited
+    # смягчаем только независимого покупателя с историей: один кошелёк, сам купил, история прочитана и не пуста,
+    # не деплоер; связанные кошельки или подозрительный одиночка — жёсткое правило, как раньше
+    lone = big["wallets"][0] if len(big["wallets"]) == 1 else None
+    s0 = signals.get(lone) if lone else None
+    independent = bool(s0) and s0["kind"] == "buy" and not s0["is_deployer"] and not s0["virgin"] and not s0["unread"]
+    if thin and not independent:
         gates.append(f"biggest operator could move price −{m['impact'] * 100:.0f}% if sold "
                      f"(≥ {GATE_IMPACT * 100:.0f}%; {m['operator'] * 100:.1f}% of float)")
     if len(non_dev) >= GATE_VIRGIN_MIN and m["virgin"] >= GATE_VIRGIN:
@@ -342,6 +351,8 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
         gates.append(f"{m['transfer'] * 100:.1f}% of float received by transfer (≥ {GATE_TRANSFER * 100:.0f}%)")
     hard = bool(gates)
     total = round(sum(parts.values()))
+    if thin and independent:   # один независимый покупатель с историей в тонком пуле: не DANGER сам по себе
+        gates.append(f"soft: one holder could move price −{m['impact'] * 100:.0f}% (thin liquidity)")
     groups = [o for o in ops if o["level"] == "pack"
               or (o["level"] == "proven" and len(o["wallets"]) >= SOFT_GATE_WALLETS)]
     for o in groups:
@@ -357,7 +368,7 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline}
 
 
-def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, reserve_ok=True):
+def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, reserve_ok=True, behavioral=True):
     """Проекция «probably rug»: куда упадёт цена, если весь подозрительный запас продадут в ликвидность.
     Только при band DANGER (скор и вердикт не меняет); иначе, без запаса или при падении
     < RUG_MIN_DROP — None.
@@ -370,8 +381,11 @@ def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, res
     складываются в share. drop = dump_impact(q, reserve), q — все токены запаса без весов.
     {"drop", "level_factor" (= 1 − drop), "share", "share_supply", "parts": [{"kind", "wallets",
     "share", "share_supply"}], "wallets"}; доли — от оборота, share_supply — от сапплая.
-    reserve_ok=False (резерв не измерен надёжно) — None: падение без ликвидности не считаем."""
-    if band != "DANGER" or not reserve_ok:
+    reserve_ok=False (резерв не измерен надёжно) — None: падение без ликвидности не считаем.
+    behavioral — DANGER вызван поведенческим жёстким правилом (связанный оператор, virgin, transfer); нет — None:
+    одиночный кит в тонком пуле или низкий скор без сигналов — не rug. Части запаса — только поведенческие
+    (linked, transfer, virgin, bundle/snipers): кит без сигналов в запас не входит."""
+    if band != "DANGER" or not reserve_ok or not behavioral:
         return None
     linked = {w for o in ops if len(o["wallets"]) > 1 for w in o["wallets"]}
     test = {

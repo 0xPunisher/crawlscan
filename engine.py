@@ -306,8 +306,10 @@ def scan(token, emit=lambda e: None):
                  limited=limited)
     reason = _reason(sc, base)
     # probably rug: только вычисления на уже собранных данных, без запросов в сеть
+    # и только если DANGER вызван поведенческим жёстким правилом (не одиночным китом в тонком пуле)
+    behavioral = any(not g.startswith("soft:") for g in sc["gates"])
     rug = None if limited else d.rug_projection(holders, sig, ops, base, facts["reserve"], sc["band"],
-                                                snipers=a.RUG_SNIPERS, reserve_ok=reserve_ok)
+                                                snipers=a.RUG_SNIPERS, reserve_ok=reserve_ok, behavioral=behavioral)
     if rug:
         rug["level_usd"] = gt["price_usd"] * rug["level_factor"] if gt.get("price_usd") else None
     meta = {}
