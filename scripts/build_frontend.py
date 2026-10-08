@@ -15,8 +15,9 @@
   - ссылки X и GitHub -> реальные адреса, в новой вкладке (target="_blank" rel="noopener");
     иконка Telegram-бота (t.me/CrawlScanBot) сразу после X в шапке и футере;
   - роадмап: «Solana support (pump.fun)», «Telegram bot», «Burns & holder rewards»,
-    «Price chart and probably rug projection», «Recently scanned feed», «Too established state» — в SHIPPED; в NEXT первым «Early buyers crawl», за ним
-    «All-chain support» (больше EVM-сетей и не только); Launch radar — в конец LATER;
+    «Price chart and probably rug projection», «Recently scanned feed», «Too established state», «Early buyers»,
+    «Telegram alerts» — в SHIPPED; в NEXT первым «All-chain support» (больше EVM-сетей и не только);
+    Launch radar — в конец LATER, «Watchlists and alerts» из LATER убран;
   - герой: обе сети — бейдж «memecoin holder scanner · Robinhood and Solana», заголовок «for Robinhood and
     Solana memecoins», подпись под полем «… · Robinhood and Solana»; Solana — цветом Solana (#9945FF);
   - токен проекта: PONS -> страница токена, секция «the token» (чарт, Trade $CrawlScan, тексты наград
@@ -275,6 +276,15 @@ recent_card = (ITEM + TITLE + 'Recently scanned feed</span>' + DESC
 established_card = (ITEM + TITLE + 'Too established state</span>' + DESC
                     + 'Tokens older than 30 days with high liquidity and market cap get token stats instead of a full scan.</span></div>\n')
 rep(operator_card, operator_card + solana_card + telegram_card + rewards_card + chart_card + recent_card + established_card)
+# v1.6.0: Early buyers (из NEXT) и Telegram alerts — в конец SHIPPED; награды — в ETH
+early_shipped = (ITEM + TITLE + 'Early buyers</span>' + DESC
+                 + 'The first 20 buyers after launch, what they did since, and wallets that sent tokens to the same place.</span></div>\n')
+alerts_card = (ITEM + TITLE + 'Telegram alerts</span>' + DESC
+               + 'Watch up to 3 tokens in @CrawlScanBot and get a message when the verdict, the rug risk or the biggest operator changes.</span></div>\n')
+rep(early_card, '')
+rep(ITEM + TITLE + 'Watchlists and alerts</span>' + DESC + 'Get pinged when a tracked operator enters or dumps.</span></div>\n', '')
+rep(established_card,established_card + early_shipped + alerts_card)
+rep('one holder wins daily rewards, all verifiable onchain.', 'one holder wins daily rewards in ETH, all verifiable onchain.')
 
 # герой: «for Robinhood and Solana memecoins», «and» — цветом заголовка, Solana — фиолетовым Solana
 rep('<span data-grip="1" style="color:#00c805">Robinhood</span><span data-grip="1" style="color:#00c805">memecoins</span>',

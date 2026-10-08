@@ -303,6 +303,9 @@ Only one copy of the bot can poll Telegram at a time.
 * [x] **Price chart and probably rug projection**
 * [x] **Recently scanned feed** on the homepage
 * [x] **Too established state**: tokens older than 30 days with high liquidity and market cap get an explanation and token stats instead of a full scan
+* [x] **Burns & holder rewards**: the developer burns tokens every 12 hours, and one holder wins daily rewards paid in ETH. Every burn, winner and payout is verifiable onchain, with the full history on the site
+* [x] **Early buyers**: the first 20 buyers after launch, what they did since, and wallets that sent tokens to the same destination
+* [x] **Telegram alerts**: watch up to 3 tokens in the bot and get a message when the verdict, the probably rug projection, the biggest operator or the early buyers change
 
 ### 🟢 In progress
 
@@ -310,9 +313,6 @@ Only one copy of the bot can poll Telegram at a time.
   Bring CRAWLSCAN into the places where users discover and trade tokens, so a token can be checked without leaving the page.
 
 ### 🔜 Next
-
-* [ ] **Early buyers crawl**
-  See how much supply was bundled at launch, even after the bundlers exit.
 
 * [ ] **All-chain support**
   More EVM chains and beyond: the same methodology, adapted to each chain's infrastructure.
@@ -324,9 +324,6 @@ Only one copy of the bot can poll Telegram at a time.
   Paste a wallet and see its trading history, behaviour and the operators it belongs to.
 
 ### 🧠 Intelligence layer
-
-* [ ] **Watchlists & alerts**
-  Follow tokens, wallets and operators and get alerts on new concentration, coordinated buying or large operator moves.
 
 * [ ] **Track record**
   A public log of verdicts compared with what happened to each token afterwards.

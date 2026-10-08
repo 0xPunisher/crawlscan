@@ -5,14 +5,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-08
+
 ### Added
 
-- Full burn and winner history on the site: "All burns" and "All winners" lists with Show more, per-day Verify, and direct links `#burns` / `#winners`.
+- Early buyers on scan results: the first 20 buyers after launch, what each of them did since (holding, added, sold part, sold everything, moved or burned the tokens), and groups of early buyers that sent tokens to the same destination wallet.
+- Telegram alerts in [@CrawlScanBot](https://t.me/CrawlScanBot): a Watch button under every result, a Watchlist menu with New and Remove, and the `/watch`, `/watchlist` and `/unwatch` commands. Up to 3 tokens per person, each watched for 7 days.
+- Alert notifications when the verdict moves into or out of `DANGER` (other verdict changes only when the score moves by 8+ points), a probably rug projection appears or disappears, the biggest operator sells 30%+ of their position, or early buyers exit (their share of supply drops by 30%+). Alerts come from live scans on the site and from scheduled rechecks (every 15 minutes per watched token, with a site-wide hourly cap). Anti-spam: at most one alert per token per person every 15 minutes, with later changes sent as one summary.
+- Full burn and reward history on the site: "All burns" and "All winners" lists with Show more, a Verify link for every draw, and direct links [crawlscan.fun/#burns](https://crawlscan.fun/#burns) and [crawlscan.fun/#winners](https://crawlscan.fun/#winners).
 - `GET /api/rewards/history?kind=burns|draws` with pages of up to 50 and a time cursor (`before`).
+- Token card on the homepage: daily rewards and burns explained, with a Trade $CrawlScan button.
 
-### Planned
+### Changed
 
-- Early buyers crawl: see how much supply was bundled at launch, even after bundlers exit.
+- Holder rewards are paid in ETH. ETH payouts from the developer wallets are detected on the site automatically; past payouts in $CrawlScan are shown as they were.
+- New Help text in the Telegram bot and a cleaner "too established" message.
+
+### Fixed
+
+- The page is served with `no-cache`, so visitors get the new version right after a deploy.
+- `HEAD` requests are answered like `GET`, without a body.
 
 ## [1.5.0] - 2026-10-07
 
@@ -97,7 +109,8 @@ First public release.
 - Token header from GeckoTerminal: name, ticker, price, market cap, liquidity, volume, age.
 - Python standard library only, read-only, no keys.
 
-[Unreleased]: https://github.com/0xPunisher/crawlscan/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/0xPunisher/crawlscan/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/0xPunisher/crawlscan/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/0xPunisher/crawlscan/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/0xPunisher/crawlscan/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/0xPunisher/crawlscan/compare/v1.2.0...v1.3.0
