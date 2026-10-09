@@ -6,7 +6,7 @@ import json, os, time
 
 import db
 
-from alerts import ROUND, WATCH_DAYS, WATCH_LIMIT
+from alerts import NO_EXPIRY, ROUND, WATCH_DAYS, WATCH_LIMIT
 from draw_store import DEFAULT_PATH
 
 SCHEMA = """
@@ -71,9 +71,10 @@ class AlertsStore:
         return [dict(r) for r in rows]
 
     def watch(self, chat_id, token, chain, now=None, limit=WATCH_LIMIT, days=WATCH_DAYS):
-        """Подписать чат на токен на days дней. Уже подписан — продлить (created_at прежний).
+        """Подписать чат на токен на days дней (None — без срока, Premium). Уже подписан — продлить (created_at прежний).
         → ("ok" | "renewed", подписка, все подписки чата) или ("limit", None, все подписки чата)."""
         now = int(now if now is not None else time.time())
+        expires = now + days * 86400 if days else NO_EXPIRY
         with self._lock, self.db:
             items = self._watches(chat_id, now)
             renewed = any(w["token"] == token for w in items)
@@ -81,7 +82,7 @@ class AlertsStore:
                 return "limit", None, items
             self.db.execute("INSERT INTO alert_watches(chat_id, token, chain, created_at, expires_at) "
                             "VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_id, token) DO UPDATE SET expires_at = excluded.expires_at",
-                            (chat_id, token, chain, now, now + days * 86400))
+                            (chat_id, token, chain, now, expires))
             items = self._watches(chat_id, now)
         return ("renewed" if renewed else "ok"), next(w for w in items if w["token"] == token), items
 
@@ -146,3 +147,23 @@ class AlertsStore:
         """Удалить все подписки чата (заблокировал бота). → сколько удалено."""
         with self._lock, self.db:
             return self.db.execute("DELETE FROM alert_watches WHERE chat_id = ?", (chat_id,)).rowcount
+
+    def make_permanent(self, chat_id, now=None):
+        """Premium: действующие подписки чата — без срока. → сколько обновлено."""
+        now = int(now if now is not None else time.time())
+        with self._lock, self.db:
+            return self.db.execute("UPDATE alert_watches SET expires_at = ? WHERE chat_id = ? AND expires_at > ?",
+                                   (NO_EXPIRY, chat_id, now)).rowcount
+
+    def downgrade(self, chat_id, now=None, limit=WATCH_LIMIT, days=WATCH_DAYS):
+        """Premium закончился: остаются limit самых старых подписок, срок — не дольше days дней от сейчас;
+        остальные снимаются. → снятые подписки [{"token", "chain", ...}]."""
+        now = int(now if now is not None else time.time())
+        with self._lock, self.db:
+            items = self._watches(chat_id, now)
+            removed = items[limit:]
+            self.db.executemany("DELETE FROM alert_watches WHERE chat_id = ? AND token = ?",
+                                [(chat_id, w["token"]) for w in removed])
+            self.db.execute("UPDATE alert_watches SET expires_at = ? WHERE chat_id = ? AND expires_at > ?",
+                            (now + days * 86400, chat_id, now + days * 86400))
+        return removed

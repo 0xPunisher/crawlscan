@@ -48,6 +48,16 @@ Alerts, подписки для бота (только при ALERTS_ENABLED=tru
   POST /api/alerts/test {"chat_id", "token"}    -> пробное уведомление в chat_id сразу (без cooldown и подписки) по
                                                    последнему снимку токена, нет снимка — по свежему скану;
                                                    {"ok", "source": "snapshot" | "scan"}; 502 — Telegram отказал
+  У премиума (PREMIUM_ENABLED) лимит и срок подписок — по Telegram ID: до premium.WATCH_LIMIT токенов, без срока.
+
+Premium для бота (только при PREMIUM_ENABLED=true, иначе 404; тот же X-Alerts-Secret, иначе 403; premium*.py):
+  POST /api/premium/reserve {"user_id", "wallet"} -> {"state": reserved|pending|yours, "wallet", "expires_at", "minutes"};
+                                                   409 taken — кошелёк забронирован или привязан к другому аккаунту;
+                                                   429 — больше premium.ATTEMPTS_PER_HOUR броней в час; 400 — не адрес
+  GET  /api/premium/status?user_id=N              -> {"linked", "premium", "wallet", "balance_tokens", "min_tokens",
+                                                   "next_check_at", "grace_until", "reservation", "watch_limit", ...}
+  POST /api/premium/unlink {"user_id"}            -> {"ok", "wallet" | null, "removed": [токены, снятые с Watchlist]}
+  POST /api/premium/admin_unlink {"wallet"}       -> {"ok", "found", "removed"} (бот пускает только PREMIUM_ADMIN_ID)
 
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
@@ -86,6 +96,8 @@ import engine
 import market
 import memguard
 import opmem
+import premium
+import premium_service
 import replay
 import trade
 import draw_service as ds
@@ -94,6 +106,7 @@ from draw_store import Store
 from rewards_store import RewardsStore
 from recent_store import RecentStore
 from alerts_store import AlertsStore
+from premium_store import PremiumStore
 from bot.tg import TelegramError
 
 CACHE_TTL = 600            # секунд: кэш результата по токену
@@ -519,7 +532,7 @@ def record_early(body):
 WATCH_MARKET_BUDGET = 3.0  # секунд на проверку «too established» при подписке на токен, который ещё не сканировали
 TOO_ESTABLISHED_WATCH = "This token is too established for CrawlScan, so it can't be watched."
 TOO_ACTIVE_WATCH = "This token has too many trades for a full scan right now, so it can't be watched."
-WATCH_LIMIT_TEXT = f"You can watch up to {alerts.WATCH_LIMIT} tokens. Unwatch one first."
+WATCH_LIMIT_TEXT = "You can watch up to {} tokens. Unwatch one first."
 
 
 def too_established(chain, token):
@@ -613,7 +626,8 @@ def alerts_api(method, path, body, q):
     except (ValueError, TypeError, AttributeError):
         return 400, {"error": "need chat_id"}
     store, now = alerts_store(), int(time.time())
-    meta = {"limit": alerts.WATCH_LIMIT, "days": alerts.WATCH_DAYS}
+    limit, days = premium_terms(chat_id, now)   # без PREMIUM_ENABLED — всегда обычные (3, 7), база премиума не открывается
+    meta = {"limit": limit, "days": days}
     if method == "GET" and path == "/api/alerts/list":
         return 200, {"chat_id": chat_id, "items": store.watches(chat_id, now)} | meta
     if method != "POST" or path not in ("/api/alerts/watch", "/api/alerts/unwatch", "/api/alerts/test"):
@@ -631,10 +645,119 @@ def alerts_api(method, path, body, q):
         return 422, {"error": "too active", "message": TOO_ACTIVE_WATCH, "token": token}
     if too_established(chain, token):
         return 422, {"error": "too established", "message": TOO_ESTABLISHED_WATCH, "token": token}
-    status, w, items = store.watch(chat_id, token, chain, now)
+    status, w, items = store.watch(chat_id, token, chain, now, limit=limit, days=days)
     if status == "limit":
-        return 409, {"error": "watch limit", "message": WATCH_LIMIT_TEXT, "items": items} | meta
+        return 409, {"error": "watch limit", "message": WATCH_LIMIT_TEXT.format(limit), "items": items} | meta
     return 200, {"ok": True, "renewed": status == "renewed", **w, "items": items} | meta
+
+
+_premium = {"store": {}, "svc": None}
+PREMIUM_ATTEMPTS = premium.Attempts()
+PREMIUM_TAKEN = "This wallet is already linked to another account."
+
+
+def premium_store():
+    """Хранилище премиума (своя база premium.db, не draw.db), одно на путь."""
+    path = premium.db_path()
+    with _stores_lock:
+        if path not in _premium["store"]:
+            _premium["store"][path] = PremiumStore(path)
+        return _premium["store"][path]
+
+
+def premium_terms(chat_id, now):
+    """(лимит, дней | None) подписок чата: премиум — (10, None), иначе обычные. Выключено или сбой базы — обычные."""
+    if not premium.enabled():
+        return alerts.WATCH_LIMIT, alerts.WATCH_DAYS
+    try:
+        return premium_store().watch_terms(chat_id, now)
+    except Exception as e:
+        print(f"premium: terms not read: {type(e).__name__}: {e}", flush=True)
+        return alerts.WATCH_LIMIT, alerts.WATCH_DAYS
+
+
+def premium_upgrade(user_id):
+    """Стал премиумом: подписки — без срока (только при ALERTS_ENABLED)."""
+    if alerts.enabled():
+        alerts_store().make_permanent(user_id)
+
+
+def premium_downgrade(user_id):
+    """Премиум закончился: Watchlist как у обычных (3 самых старых, 7 дней). → снятые токены."""
+    if not alerts.enabled():
+        return []
+    return [w["token"] for w in alerts_store().downgrade(user_id)]
+
+
+def premium_svc():
+    """Сервис премиума (поток стартует start_premium); здесь — для decimals токена в статусе."""
+    with _stores_lock:
+        if _premium["svc"] is None:
+            from chains import robinhood
+            _premium["svc"] = premium_service.Service(premium_store(), notify_message, premium_upgrade,
+                                                      premium_downgrade, robinhood)
+        return _premium["svc"]
+
+
+def premium_status(user_id, now):
+    st = premium_store()
+    link, res = st.link_of(user_id), st.reservation_of(user_id)
+    limit, days = premium.watch_terms(link, now)
+    out = {"user_id": user_id, "linked": bool(link), "premium": bool(link and link["premium"]),
+           "min_tokens": premium.min_tokens(), "watch_limit": limit, "watch_days": days,
+           "reservation": {"wallet": res["wallet"], "expires_at": res["expires_at"]} if res else None}
+    if link:
+        out |= {"wallet": link["wallet"], "balance_tokens": link["balance"] // 10 ** premium_svc().decimals(),
+                "linked_at": link["linked_at"], "checked_at": link["checked_at"], "next_check_at": link["next_check_at"],
+                "grace_until": link["below_since"] + premium.GRACE_DAYS * 86400 if premium.in_grace(link, now) else None}
+    return out
+
+
+def premium_api(method, path, body, q):
+    """/api/premium/* → (код, тело). Выключатель и секрет проверяет вызывающий."""
+    now = int(time.time())
+    if path == "/api/premium/admin_unlink" and method == "POST":
+        wallet = premium.wallet_of(body.get("wallet"))
+        if not wallet:
+            return 400, {"error": "not a wallet address"}
+        link = premium_store().unlink_wallet(wallet)
+        removed = premium_downgrade(link["user_id"]) if link else []
+        if link:
+            print(f"premium: admin unlinked {premium.short(wallet)} {premium.log_user(link['user_id'])}", flush=True)
+            notify_message(link["user_id"], premium.admin_unlinked_message(wallet, removed))
+        return 200, {"ok": True, "found": bool(link), "wallet": wallet, "removed": len(removed)}
+    try:
+        user_id = _chat_id((q.get("user_id") or [None])[0] if method == "GET" else body.get("user_id"))
+    except (ValueError, TypeError, AttributeError):
+        return 400, {"error": "need user_id"}
+    if method == "GET" and path == "/api/premium/status":
+        return 200, premium_status(user_id, now)
+    if method != "POST" or path not in ("/api/premium/reserve", "/api/premium/unlink"):
+        return 404, {"error": "not found"}
+    st = premium_store()
+    if path == "/api/premium/unlink":
+        link = st.unlink(user_id)
+        removed = premium_downgrade(user_id) if link else []
+        if link:
+            print(f"premium: unlinked {premium.short(link['wallet'])} {premium.log_user(user_id)}", flush=True)
+        return 200, {"ok": True, "wallet": link["wallet"] if link else None, "removed": removed,
+                     "watch_limit": alerts.WATCH_LIMIT, "watch_days": alerts.WATCH_DAYS}
+    wallet = premium.wallet_of(body.get("wallet"))
+    from chains import robinhood
+    if not wallet or wallet in robinhood.INFRA or wallet in robinhood.ROUTERS or wallet == premium.token():
+        return 400, {"error": "not a wallet address"}
+    res, link = st.reservation_of(user_id), st.link_of(user_id)
+    again = (res and res["wallet"] == wallet) or (link and link["wallet"] == wallet)
+    if not again and not PREMIUM_ATTEMPTS.take(user_id, now):
+        return 429, {"error": "too many attempts", "message": "Too many verification attempts. Try again later."}
+    state, row = st.reserve(user_id, wallet, now)
+    if state == "taken":
+        return 409, {"error": "taken", "message": PREMIUM_TAKEN, "wallet": wallet}
+    if state == "reserved":
+        print(f"premium: reserved {premium.short(wallet)} {premium.log_user(user_id)}", flush=True)
+    out = {"ok": True, "state": state, "wallet": wallet, "minutes": premium.RESERVE_MIN,
+           "min_tokens": premium.min_tokens()}
+    return 200, out | ({"expires_at": row["expires_at"]} if state in ("reserved", "pending") else {})
 
 
 _RESP = {}                 # ключ -> (ts, тело): статусы и конфиг для опросов страницы
@@ -859,10 +982,32 @@ class H(BaseHTTPRequestHandler):
             print(f"alerts: {path} failed: {type(e).__name__}: {e}", flush=True)
             return self._send(500, {"error": "alerts temporarily unavailable"})
 
+    def _premium(self, method, path, q):
+        if not premium.enabled():
+            return self._send(404, {"error": "not found"})
+        if not alerts_secret_ok(self.headers.get("X-Alerts-Secret")):
+            return self._send(403, {"error": "forbidden"})
+        body = {}
+        if method == "POST":
+            try:
+                n = int(self.headers.get("content-length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError
+            except ValueError:
+                return self._send(400, {"error": "bad json"})
+        try:
+            return self._send(*premium_api(method, path, body, q))
+        except Exception as e:   # сбой базы и т.п.: бот покажет «недоступно»
+            print(f"premium: {path} failed: {type(e).__name__}: {e}", flush=True)
+            return self._send(500, {"error": "premium temporarily unavailable"})
+
     def do_POST(self):
         u = urlparse(self.path)
         if u.path.startswith("/api/alerts/"):
             return self._alerts("POST", u.path, parse_qs(u.query))
+        if u.path.startswith("/api/premium/"):
+            return self._premium("POST", u.path, parse_qs(u.query))
         m = DRAW_PATH.match(urlparse(self.path).path)
         if m and m.group(2) == "payout":
             return self._db_guard(u.path, self._draw_payout, m.group(1))
@@ -897,12 +1042,16 @@ class H(BaseHTTPRequestHandler):
             return self._db_guard(u.path, self._rewards_get, u.path, q)
         if u.path.startswith("/api/alerts/"):
             return self._alerts("GET", u.path, q)
+        if u.path.startswith("/api/premium/"):
+            return self._premium("GET", u.path, q)
         if u.path == "/api/config":  # фронт и бот: какие сети включены (SOLANA_ENABLED), алерты (ALERTS_ENABLED), Trade on Axiom
             env = tuple(os.environ.get(k) for k in ("SOLANA_ENABLED", "ALERTS_ENABLED", "FLAP_ENABLED", "BANKR_ENABLED",
-                                                    "REPLAY_ENABLED", "TRADE_URL_ROBINHOOD", "TRADE_URL_SOLANA"))
+                                                    "REPLAY_ENABLED", "TRADE_URL_ROBINHOOD", "TRADE_URL_SOLANA",
+                                                    "PREMIUM_ENABLED"))
             body = cached_response(("config",) + env, STATUS_TTL, lambda: {
                 "solana": engine.solana_enabled(), "alerts": alerts.enabled(), "flap": flap.enabled(),
-                "bankr": bankr.enabled(), "replay": replay.enabled(), "trade": trade.templates()})
+                "bankr": bankr.enabled(), "replay": replay.enabled(), "trade": trade.templates()}
+                | ({"premium": True} if premium.enabled() else {}))   # выключен — ответ как раньше, без поля
             return self._send(200, body, cache=STATUS_CACHE)
         if u.path == "/api/index":   # Bankr: готов ли полный индекс холдеров (сайт перескан делает, когда ready)
             token = (q.get("token") or [""])[0]
@@ -1029,6 +1178,14 @@ def start_alerts_rechecker():
         memory_high=lambda: memguard.over(live=1)).start()
 
 
+def start_premium():
+    """Premium: поток броней и проверки балансов — только при PREMIUM_ENABLED=true."""
+    if not premium.enabled():
+        return None
+    print(f"premium: on, min {premium.min_tokens():,} tokens, db {premium.db_path()}", flush=True)
+    return premium_svc().start()
+
+
 def start_replay_checker():
     """Rug Replay: фоновая проверка исхода DANGER-токенов — только при REPLAY_ENABLED=true."""
     if not replay.enabled():
@@ -1051,4 +1208,5 @@ if __name__ == "__main__":
     start_rewards_scheduler()
     start_alerts_rechecker()
     start_replay_checker()
+    start_premium()
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()

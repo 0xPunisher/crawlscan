@@ -417,9 +417,14 @@ def watch_button(addr):
     return [{"text": "🔔 Watch", "callback_data": f"watch:{addr}"}]
 
 
+NO_EXPIRY_AFTER = 3650 * 86400   # подписка дольше этого — без срока (Premium, alerts.NO_EXPIRY)
+
+
 def expires_in(ts, now):
-    """Сколько осталось подписке: "6d 23h", "5h", "<1h"."""
+    """Сколько осталось подписке: "6d 23h", "5h", "<1h"; Premium — "no expiry"."""
     s = int(ts - now)
+    if s > NO_EXPIRY_AFTER:
+        return "no expiry"
     d, h = s // 86400, s // 3600 % 24
     if d:
         return f"{d}d {h}h" if h else f"{d}d"
@@ -427,15 +432,19 @@ def expires_in(ts, now):
 
 
 def _watch_line(w, now):
+    left = expires_in(w['expires_at'], now)
     return (f"• <code>{e(w['token'])}</code>\n  {CHAIN_NAME.get(w.get('chain'), e(w.get('chain', '')))} · "
-            f"expires in {expires_in(w['expires_at'], now)}")
+            + (left if left == "no expiry" else f"expires in {left}"))
 
 
 def watching(r):
     """Ответ /api/alerts/watch (200) → HTML, полный адрес."""
     addr = f"<code>{e(r['token'])}</code>"
-    head = (f"🔔 Still watching {addr}, extended to {r['days']} days." if r.get("renewed")
-            else f"🔔 Watching {addr} for {r['days']} days.")
+    if not r.get("days"):     # Premium: без срока
+        head = f"🔔 {'Still watching' if r.get('renewed') else 'Watching'} {addr}, no expiry with Premium."
+    else:
+        head = (f"🔔 Still watching {addr}, extended to {r['days']} days." if r.get("renewed")
+                else f"🔔 Watching {addr} for {r['days']} days.")
     return f"{head}\n\n{WATCH_WHAT}\n\nWatching {len(r.get('items') or [])}/{r['limit']} tokens for now."
 
 
@@ -462,6 +471,8 @@ def unwatched(r):
 def days_left(ts, now):
     """Сколько дней осталось подписке, вверх: "7 days left", "1 day left"; меньше часа — "<1 hour left"."""
     s = ts - now
+    if s > NO_EXPIRY_AFTER:
+        return "⭐ no expiry"
     if s < 3600:
         return "<1 hour left"
     d = -(-int(s) // 86400)
@@ -492,3 +503,90 @@ def watch_limit_view(r, now, tickers=None):
     """409 из [➕ New]: лимит — сообщение и список с кнопками Remove."""
     head = f"You're already watching {r['limit']} tokens, the maximum. Remove one to add another:"
     return watchlist_view(r, now, tickers, head=head)
+
+
+# ---------- Premium: /verify, /premium, /unlink, /admin_unlink ----------
+PREMIUM_BADGE = "⭐ Premium"
+ASK_WALLET = "Send me the Robinhood Chain wallet address that holds your $CrawlScan."
+ASK_WALLET_AGAIN = "That's not a wallet address. Send me a Robinhood Chain wallet address (0x…)."
+WALLET_TAKEN = "This wallet is already linked to another account."
+TOO_MANY_VERIFY = "Too many verification attempts. Try again later."
+NO_WALLET = "You don't have a linked wallet. Send /verify to link one."
+ADMIN_UNLINK_USAGE = "Usage: /admin_unlink &lt;wallet&gt;"
+NORMAL_WATCHLIST = "Your watchlist is back to 3 tokens, 7 days each."
+BUY_BUTTONS = {"inline_keyboard": [[{"text": "Buy $CrawlScan", "url": BUY_URL}]]}
+
+
+def _hm(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M UTC")
+
+
+def _day(ts):
+    d = datetime.fromtimestamp(ts, timezone.utc)
+    return f"{d:%b} {d.day}, {d:%H:%M} UTC"
+
+
+def reserved(r):
+    """Ответ /api/premium/reserve (200) → HTML."""
+    w = f"<code>{e(r['wallet'])}</code>"
+    if r.get("state") == "yours":
+        return f"✅ {w} is already linked to your account. /premium shows your status."
+    if r.get("state") == "pending":
+        return (f"⭐ You're already verifying {w}.\n\nBuy any amount of $CrawlScan to this wallet by "
+                f"{_hm(r['expires_at'])} to verify it.")
+    return (f"⭐ <b>Verify your wallet</b>\n{w}\n\n"
+            f"Buy any amount of $CrawlScan to this wallet within {r.get('minutes', 15)} minutes to verify it.\n\n"
+            "Only buys count: tokens sent from another wallet don't. "
+            f"I'll message you as soon as I see the buy (until {_hm(r['expires_at'])}).")
+
+
+def premium_view(st, now):
+    """/premium: ответ /api/premium/status → (html, кнопки)."""
+    need = f"{st.get('min_tokens', 0):,}"
+    res = st.get("reservation")
+    if not st.get("linked"):
+        text = (f"⭐ <b>Premium for $CrawlScan holders</b>\n\nHold at least {need} $CrawlScan and get:\n"
+                "- Watchlist up to 10 tokens instead of 3\n- No 7-day limit on watched tokens\n"
+                "- Premium badge on your scans\n\n")
+        if res:
+            text += (f"Verifying <code>{e(res['wallet'])}</code> until {_hm(res['expires_at'])}: "
+                     "buy any amount of $CrawlScan to it.")
+        else:
+            text += "Send /verify to link your wallet."
+        return text, BUY_BUTTONS
+    grace = st.get("grace_until")
+    status = "active" if st.get("premium") else ("paused" if grace else "not active")
+    nxt = st.get("next_check_at")
+    lines = [f"⭐ <b>Premium</b> · {status}", f"Wallet: <code>{e(st['wallet'])}</code>",
+             f"Balance: {st.get('balance_tokens', 0):,} $CrawlScan", f"Required: {need} $CrawlScan"]
+    if nxt:
+        lines.append(f"Next balance check: {_hm(nxt)} ({until(nxt, now)})")
+    lines.append("")
+    if st.get("premium"):
+        lines.append("Watchlist: up to 10 tokens, no expiry.")
+    elif grace:
+        lines.append(f"Your watchlist stays as it is until {_day(grace)}, then goes back to 3 tokens, 7 days each.")
+    else:
+        lines.append(f"Hold at least {need} $CrawlScan in this wallet to turn it on.")
+    lines.append("/unlink unlinks the wallet.")
+    return "\n".join(lines), (None if st.get("premium") else BUY_BUTTONS)
+
+
+def _removed(tokens):
+    return ("\n\nStopped watching:\n" + "\n".join(f"<code>{e(t)}</code>" for t in tokens)) if tokens else ""
+
+
+def unlinked(r):
+    """Ответ /api/premium/unlink → HTML."""
+    if not r.get("wallet"):
+        return NO_WALLET
+    return (f"🔓 Wallet <code>{e(r['wallet'])}</code> unlinked, Premium is off.\n\n{NORMAL_WATCHLIST}"
+            + _removed(r.get("removed")))
+
+
+def admin_unlinked(r):
+    """Ответ /api/premium/admin_unlink → HTML."""
+    w = f"<code>{e(r['wallet'])}</code>"
+    if not r.get("found"):
+        return f"No account is linked to {w}."
+    return f"🔓 Unlinked {w}. The account was told, {r.get('removed', 0)} watched tokens removed."

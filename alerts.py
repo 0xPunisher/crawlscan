@@ -17,6 +17,7 @@ EARLY_MIN_SHARE = 0.005      # ... если была ≥ 0.5% сапплая
 ROUND = 6                    # знаков у долей в снимке
 WATCH_LIMIT = 3              # токенов в подписке на один чат
 WATCH_DAYS = 7               # подписка живёт столько дней (повторный watch продлевает)
+NO_EXPIRY = 253402300799     # expires_at подписки без срока (Premium, premium.py): 9999-12-31
 WEBSITE = "https://crawlscan.fun"
 CHAIN_NAME = {"robinhood": "Robinhood Chain", "solana": "Solana"}
 BAND_ICON = {"CLEAN": "🟢", "OK": "🟡", "RISKY": "🟠", "DANGER": "🔴"}

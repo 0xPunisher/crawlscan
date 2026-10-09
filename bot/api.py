@@ -1,6 +1,6 @@
 """Клиент API сайта CrawlScan: POST /api/scan → job, GET /api/result?job= → результат,
 GET /api/rewards/status → награды и сжигания (/rewards), GET /api/config → включены ли алерты,
-/api/alerts/* → подписки (заголовок X-Alerts-Secret).
+/api/alerts/* → подписки, /api/premium/* → Premium (заголовок X-Alerts-Secret).
 Бот сам в блокчейн не ходит. Кэш (10 минут) и очередь сканов — на стороне сайта."""
 import json, urllib.error, urllib.parse, urllib.request
 
@@ -21,6 +21,10 @@ class Rejected(Exception):
 
 class AlertsOff(Exception):
     """Алерты на сайте выключены (404 на /api/alerts/*)."""
+
+
+class PremiumOff(Exception):
+    """Premium на сайте выключен (404 на /api/premium/*)."""
 
 
 class CrawlScan:
@@ -52,6 +56,8 @@ class CrawlScan:
                 return {"status": e.code} | payload
             if e.code == 404 and path.startswith("/api/alerts/"):
                 raise AlertsOff() from None
+            if e.code == 404 and path.startswith("/api/premium/"):
+                raise PremiumOff() from None
             raise ApiError(f"HTTP {e.code} {path}") from None
         except (OSError, ValueError) as e:
             raise ApiError(f"{path}: {e}") from None
@@ -91,3 +97,20 @@ class CrawlScan:
 
     def watch_list(self, chat_id):
         return self._alerts("/api/alerts/list?chat_id=" + urllib.parse.quote(str(chat_id)))
+
+    def _premium(self, path, body=None):
+        return self._req(path, body, headers={"X-Alerts-Secret": self.alerts_secret}, ok=(409, 429))
+
+    def premium_reserve(self, user_id, wallet):
+        """Бронь кошелька: {"state": reserved|pending|yours, "wallet", "expires_at", "minutes"} |
+        {"status": 409, "error": "taken"} | {"status": 429}. Не адрес — Rejected, выключено — PremiumOff."""
+        return self._premium("/api/premium/reserve", {"user_id": user_id, "wallet": wallet})
+
+    def premium_status(self, user_id):
+        return self._premium("/api/premium/status?user_id=" + urllib.parse.quote(str(user_id)))
+
+    def premium_unlink(self, user_id):
+        return self._premium("/api/premium/unlink", {"user_id": user_id})
+
+    def premium_admin_unlink(self, wallet):
+        return self._premium("/api/premium/admin_unlink", {"wallet": wallet})

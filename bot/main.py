@@ -4,13 +4,16 @@
 
 env: TG_BOT_TOKEN (обязателен, из .env через env.py; нигде не печатается), CRAWLSCAN_API (по умолчанию
 https://crawlscan.fun), TRADE_URL_ROBINHOOD / TRADE_URL_SOLANA — шаблоны кнопки Trade on Axiom (trade.py),
-ALERTS_API_SECRET — секрет API подписок сайта (нет — алертов в боте нет; нигде не печатается). Long polling getUpdates (timeout=30): одновременно может работать только один
+ALERTS_API_SECRET — секрет API подписок сайта (нет — алертов и Premium в боте нет; нигде не печатается),
+PREMIUM_ADMIN_ID — Telegram ID админов Premium через запятую (/admin_unlink). Long polling getUpdates (timeout=30): одновременно может работать только один
 экземпляр бота, второй получает 409 Conflict.
 
 Личка: адрес токена (или /scan <адрес>) → скан; /start, /help, /rewards. Группы: только /scan <адрес>
 и /rewards (и /scan@имябота, /rewards@имябота). Алерты (только личка, если на сайте /api/config → alerts и задан
 ALERTS_API_SECRET): /watch <адрес>, /watchlist, /unwatch <адрес>, кнопка [Watch] под вердиктом, [Unwatch] под
-уведомлением (уведомления шлёт сайт); иначе — «coming soon». /rewards — статус наград и сжиганий с сайта (/api/rewards/status). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
+уведомлением (уведомления шлёт сайт); иначе — «coming soon». Premium (только личка, если /api/config → premium):
+/verify [кошелёк] — бронь кошелька на 15 минут (покупку ищет и сообщение шлёт сайт), /premium, /unlink,
+/admin_unlink <кошелёк> (только PREMIUM_ADMIN_ID); значок ⭐ Premium под вердиктом. Выключен — как раньше (подсказка). /rewards — статус наград и сжиганий с сайта (/api/rewards/status). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
 Лимиты: 1 скан на пользователя в USER_COOLDOWN секунд, не больше WORKERS сканов одновременно (остальные — в очереди).
 """
 import math, os, queue, sys, threading, time, traceback
@@ -22,7 +25,7 @@ if ROOT not in sys.path:
 import env                                          # noqa: E402
 import trade                                        # noqa: E402
 from bot import text as T                           # noqa: E402
-from bot.api import AlertsOff, ApiError, Busy, CrawlScan, Rejected   # noqa: E402
+from bot.api import AlertsOff, ApiError, Busy, CrawlScan, PremiumOff, Rejected   # noqa: E402
 from bot.tg import Telegram, TelegramError          # noqa: E402
 
 WORKERS = 3            # сканов одновременно на весь бот
@@ -39,7 +42,12 @@ COMMANDS = [{"command": "start", "description": "What this bot does"},
 WATCH_COMMANDS = [{"command": "watch", "description": "Get alerts for a token: /watch <address>"},
                   {"command": "watchlist", "description": "Tokens you watch"},
                   {"command": "unwatch", "description": "Stop alerts: /unwatch <address>"}]
+PREMIUM_COMMANDS = [{"command": "verify", "description": "Link your $CrawlScan wallet for Premium"},
+                    {"command": "premium", "description": "Your Premium status"},
+                    {"command": "unlink", "description": "Unlink your wallet"}]
+PREMIUM_CMDS = ("verify", "premium", "unlink", "admin_unlink")
 ALERTS_CHECK_TTL = 60  # секунд: сколько помнить, включены ли алерты на сайте
+PREMIUM_TTL = 300      # секунд: сколько помнить, премиум ли пользователь (значок под вердиктом)
 AWAIT_WATCH = 300      # секунд: после [➕ New] следующий адрес от чата — подписка, а не скан
 TICKERS_MAX = 2000     # тикеров из сканов в памяти (для списка подписок)
 
@@ -62,7 +70,8 @@ def parse_command(text):
 
 class Bot:
     def __init__(self, tg, api, username="", workers=WORKERS, cooldown=USER_COOLDOWN, scan_timeout=SCAN_TIMEOUT,
-                 poll_every=POLL_EVERY, clock=time.monotonic, sleep=time.sleep, log=log, banner=BANNER, spawn=None, trade_urls=None):
+                 poll_every=POLL_EVERY, clock=time.monotonic, sleep=time.sleep, log=log, banner=BANNER, spawn=None, trade_urls=None,
+                 admin_ids=None):
         self.tg, self.api, self.username = tg, api, username
         self.workers, self.cooldown, self.scan_timeout, self.poll_every = workers, cooldown, scan_timeout, poll_every
         self.clock, self.sleep, self.log = clock, sleep, log
@@ -79,6 +88,10 @@ class Bot:
         self.flap_seen = None        # (clock(), (Flap, Bankr) включены на сайте: строка о площадках в /help)
         self.awaiting = {}           # chat_id -> clock() до которого ждём адрес для подписки ([➕ New])
         self.tickers = {}            # адрес токена -> тикер из последнего скана (сайт тикеры подписок не хранит)
+        self.premium_seen = None     # (clock(), включён ли Premium на сайте) — вместе с alerts_seen
+        self.premium_users = {}      # user_id -> (clock(), премиум ли): значок под вердиктом
+        self.awaiting_wallet = {}    # chat_id -> clock() до которого ждём адрес кошелька после /verify
+        self.admin_ids = admin_ids if admin_ids is not None else admin_ids_env()
 
     # --- Telegram ---------------------------------------------------------------------------------
 
@@ -145,6 +158,10 @@ class Bot:
             return                               # команда другому боту
         chat_id, mid = chat.get("id"), m.get("message_id")
         if chat.get("type") == "private":
+            if cmd is None and self.awaiting_verify(chat_id):     # после /verify: адрес — кошелёк, не скан
+                return self.premium_command(chat_id, user.get("id"), "verify", txt)
+            if cmd in PREMIUM_CMDS:
+                return self.premium_command(chat_id, user.get("id"), cmd, arg)
             if cmd is None and self.awaiting_watch(chat_id):       # после [➕ New]: адрес — подписка, не скан
                 found = T.find_address(txt)
                 if not found:
@@ -188,6 +205,7 @@ class Bot:
             self.alerts_command(chat_id, "watchlist", "")
         elif data == "new" and private:
             self.awaiting[chat_id] = self.clock() + AWAIT_WATCH    # сразу: адрес может прийти раньше ответа сайта
+            self.awaiting_wallet.pop(chat_id, None)
             self.alerts_command(chat_id, "ask", "")
         elif data == "scan":
             self.send(chat_id, T.ASK_ADDRESS)
@@ -228,11 +246,12 @@ class Bot:
         if seen and now - seen[0] < ALERTS_CHECK_TTL:
             return seen[1]
         try:
-            on = bool(self.api.config().get("alerts"))
+            cfg = self.api.config()
+            on, prem = bool(cfg.get("alerts")), bool(cfg.get("premium"))
         except (ApiError, Rejected, AttributeError) as e:
             self.log(f"api config: {e}")
-            on = False
-        self.alerts_seen = (now, on)
+            on = prem = False
+        self.alerts_seen, self.premium_seen = (now, on), (now, prem)
         return on
 
     def launchpads(self):
@@ -323,6 +342,105 @@ class Bot:
             self.log(f"{cmd} text:\n" + self.tg.redact(traceback.format_exc()))
             return T.UNREACHABLE, None
 
+    # --- Premium (сайт хранит брони и привязки, ищет покупку и шлёт сообщения; бот только просит) ---------
+
+    def premium_on(self):
+        """Premium включён: у бота есть секрет и сайт отвечает /api/config → premium. Тот же запрос и кэш, что у
+        alerts_on (ALERTS_CHECK_TTL)."""
+        if not getattr(self.api, "alerts_secret", ""):
+            return False
+        seen = self.premium_seen
+        if not (seen and self.clock() - seen[0] < ALERTS_CHECK_TTL):
+            self.alerts_seen = None
+            self.alerts_on()
+        return bool(self.premium_seen and self.premium_seen[1])
+
+    def is_premium(self, user_id):
+        """Премиум ли пользователь (значок под вердиктом): /api/premium/status, помним PREMIUM_TTL секунд.
+        Выключено, сбой — нет."""
+        if user_id is None or not self.premium_on():
+            return False
+        now = self.clock()
+        seen = self.premium_users.get(user_id)
+        if seen and now - seen[0] < PREMIUM_TTL:
+            return seen[1]
+        try:
+            on = bool(self.api.premium_status(user_id).get("premium"))
+        except (ApiError, Rejected, PremiumOff, AttributeError) as e:
+            self.log(f"api premium status: {e}")
+            on = False
+        if len(self.premium_users) > 10000:
+            self.premium_users.clear()
+        self.premium_users[user_id] = (now, on)
+        return on
+
+    def awaiting_verify(self, chat_id):
+        """Ждём ли от чата адрес кошелька после /verify (AWAIT_WATCH секунд); истекло — сбрасываем."""
+        until = self.awaiting_wallet.get(chat_id)
+        if until is None:
+            return False
+        if self.clock() >= until:
+            self.awaiting_wallet.pop(chat_id, None)
+            return False
+        return True
+
+    def premium_command(self, chat_id, user_id, cmd, arg):
+        """/verify, /premium, /unlink, /admin_unlink — запрос к сайту в отдельном потоке."""
+        def run():
+            html, markup = self.premium_text(chat_id, user_id, cmd, arg)
+            self.send(chat_id, html, markup)
+        self.spawn(run)
+
+    def premium_text(self, chat_id, user_id, cmd, arg, now=None):
+        """→ (html, кнопки). Premium выключен или /admin_unlink не от админа — подсказка, как раньше."""
+        if cmd == "admin_unlink" and user_id not in self.admin_ids:
+            return T.HINT, None
+        if not self.premium_on():
+            self.awaiting_wallet.pop(chat_id, None)
+            return T.HINT, None
+        now = time.time() if now is None else now
+        wallet = (arg or "").strip()
+        valid = bool(T.ADDR_RE.match(wallet))
+        try:
+            if cmd == "verify":
+                if not valid:
+                    self.awaiting_wallet[chat_id] = self.clock() + AWAIT_WATCH
+                    self.awaiting.pop(chat_id, None)
+                    return (T.ASK_WALLET_AGAIN if wallet else T.ASK_WALLET), None
+                self.awaiting_wallet.pop(chat_id, None)
+                r = self.api.premium_reserve(user_id, wallet)
+                if r.get("status") == 409:
+                    return T.WALLET_TAKEN, None
+                if r.get("status") == 429:
+                    return T.TOO_MANY_VERIFY, None
+                self.log(f"verify {T.short(wallet)} {r.get('state')}")
+                return T.reserved(r), (None if r.get("state") == "yours" else T.BUY_BUTTONS)
+            if cmd == "premium":
+                st = self.api.premium_status(user_id)
+                self.premium_users[user_id] = (self.clock(), bool(st.get("premium")))
+                return T.premium_view(st, now)
+            if cmd == "unlink":
+                r = self.api.premium_unlink(user_id)
+                self.premium_users.pop(user_id, None)
+                return T.unlinked(r), None
+            if not valid:
+                return T.ADMIN_UNLINK_USAGE, None
+            r = self.api.premium_admin_unlink(wallet)
+            self.log(f"admin_unlink {T.short(wallet)} found {r.get('found')}")
+            return T.admin_unlinked(r), None
+        except Rejected:
+            return T.ASK_WALLET_AGAIN, None
+        except PremiumOff:
+            self.alerts_seen = self.premium_seen = None
+            self.awaiting_wallet.pop(chat_id, None)
+            return T.HINT, None
+        except ApiError as e:
+            self.log(f"api {cmd}: {e}")
+            return T.UNREACHABLE, None
+        except Exception:
+            self.log(f"{cmd} text:\n" + self.tg.redact(traceback.format_exc()))
+            return T.UNREACHABLE, None
+
     # --- сканы ------------------------------------------------------------------------------------
 
     def request_scan(self, chat_id, user_id, addr, reply_to, private=False):
@@ -347,7 +465,7 @@ class Bot:
         mid = self.send(chat_id, T.queued(addr) if waiting else T.crawling(addr), reply_to=reply_to)
         if mid is None:
             return
-        self.jobs.put((chat_id, mid, addr, waiting, private))
+        self.jobs.put((chat_id, mid, addr, waiting, private, user_id))
 
     def worker(self):
         while True:
@@ -363,10 +481,12 @@ class Bot:
                     self.busy -= 1
                 self.jobs.task_done()
 
-    def run_scan(self, chat_id, mid, addr, was_queued, private=False):
+    def run_scan(self, chat_id, mid, addr, was_queued, private=False, user_id=None):
         if was_queued:
             self.edit(chat_id, mid, T.crawling(addr))
         html, markup = self.scan_text(addr, watch=private)
+        if markup is not None and self.is_premium(user_id):     # вердикт (не ошибка) премиум-пользователю
+            html += "\n\n" + T.PREMIUM_BADGE
         self.edit(chat_id, mid, html, markup)
 
     def scan_text(self, addr, watch=False):
@@ -429,7 +549,8 @@ class Bot:
                 self.username = me.get("username") or ""
             else:
                 self.sleep(5)
-        self.call("setMyCommands", commands=COMMANDS + (WATCH_COMMANDS if self.alerts_on() else []))
+        self.call("setMyCommands", commands=COMMANDS + (WATCH_COMMANDS if self.alerts_on() else [])
+                  + (PREMIUM_COMMANDS if self.premium_on() else []))
         self.start_workers()
         self.log(f"@{self.username} polling, site {self.api.base}")
         offset, backoff = None, 1
@@ -449,6 +570,17 @@ class Bot:
                 self.log("poll loop:\n" + self.tg.redact(traceback.format_exc()))
                 self.sleep(backoff)
                 backoff = min(30, backoff * 2)
+
+
+def admin_ids_env():
+    """PREMIUM_ADMIN_ID: Telegram ID через запятую; неверные — пропускаются."""
+    out = set()
+    for x in os.environ.get("PREMIUM_ADMIN_ID", "").split(","):
+        try:
+            out.add(int(x.strip()))
+        except ValueError:
+            pass
+    return out
 
 
 def main():
