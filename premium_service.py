@@ -8,7 +8,8 @@
     (а) от пула или роутера токена (ch.market_addresses: кривая, роутеры Pons, V4 PoolManager) или от известного
         роутера сети из адаптеров Flap / Bankr (bankr.ROUTERS) — без лишних запросов;
     (б) от любого другого адреса (приложение, агрегатор), если в той же транзакции есть Transfer токена от пула
-        (кривая или V4 PoolManager: токены вышли из пула) — по чеку: один HTTP-батч eth_getTransactionReceipt на
+        (кривая или V4 PoolManager: токены вышли из пула) и своп в пуле (V4 Swap PoolManager или CurveBuy кривой;
+        выход из пула без свопа — вывод ликвидности — не покупка) — по чеку: один HTTP-батч eth_getTransactionReceipt на
         такие переводы за проход (ch.receipt_logs, кэш); чека ещё нет — перевод перечитается в следующем проходе;
     перевод с обычного кошелька (из пула в транзакции ничего не выходило) не засчитывается;
   - нашли — balanceOf кошелька (1 eth_call), привязка, сообщение; бронь прошла (и прочитан блок после её конца) —
@@ -39,7 +40,7 @@ class Service:
         self.log = log or (lambda m: print(m, flush=True))
         self.threshold = threshold or premium.min_tokens()
         self.token = (token or premium.token()).lower()
-        self._senders, self._pools, self._decimals = None, None, None
+        self._senders, self._pools, self._swaps, self._decimals = None, None, None, None
         self.balance_at = 0.0
         self.thread = None
 
@@ -53,12 +54,19 @@ class Service:
             self._senders = (self.ch.market_addresses(curve) if curve
                              else set(self.ch.ROUTERS) | {self.ch.V4_POOL_MGR}) | bankr.ROUTERS
             self._pools = {self.ch.V4_POOL_MGR} | ({curve.lower()} if curve else set())
+            self._swaps = {(self.ch.V4_POOL_MGR, self.ch.V4_SWAP_TOPIC)} | (
+                {(curve.lower(), self.ch.CURVE_BUY)} if curve else set())
         return self._senders
 
     def pools(self):
         """Пул токена (кривая и V4 PoolManager): Transfer токена от него в транзакции — токены вышли из пула."""
         self.senders()
         return self._pools
+
+    def swaps(self):
+        """Своп в пуле: {(адрес, topic0)} — V4 Swap PoolManager, CurveBuy кривой."""
+        self.senders()
+        return self._swaps
 
     def decimals(self):
         if self._decimals is None:
@@ -139,7 +147,7 @@ class Service:
                     continue
                 if not logs.get(t["tx"]):          # чека ещё нет: перечитать в следующем проходе
                     retry.add(r["wallet"])
-                elif premium.counts_as_buy(t, r, senders, premium.pool_out(logs[t["tx"]], self.token, self.pools())):
+                elif premium.counts_as_buy(t, r, senders, premium.pool_out(logs[t["tx"]], self.token, self.pools(), self.swaps())):
                     done.add(r["wallet"])
                     self.verified(r, t, now)
         left = [w for w in by_wallet if w not in done]

@@ -3,7 +3,7 @@
 Всё за выключателем PREMIUM_ENABLED (по умолчанию выключено). Верификация — только покупкой: пользователь бронирует
 кошелёк в боте (/verify) на RESERVE_MIN минут за свой Telegram ID, и если за это время на кошелёк пришёл $CrawlScan
 от пула или известного роутера — или от любого приложения / агрегатора, если в той же транзакции токен вышел из пула
-(Transfer токена от пула), — кошелёк привязан. Кто первый, того и кошелёк: один
+(Transfer токена от пула) и в ней есть своп в пуле (V4 Swap или CurveBuy), — кошелёк привязан. Кто первый, того и кошелёк: один
 кошелёк — один Telegram-аккаунт, один аккаунт — один кошелёк.
 Premium = баланс привязанного кошелька ≥ PREMIUM_MIN_TOKENS (проверка при верификации и раз в сутки). Ниже порога —
 GRACE_DAYS дней Watchlist остаётся как был, потом обрезается до обычного (alerts.WATCH_LIMIT, WATCH_DAYS).
@@ -78,19 +78,26 @@ def in_window(transfer, reservation):
 
 def counts_as_buy(transfer, reservation, senders, from_pool=False):
     """Перевод токена засчитывает бронь (in_window) и это покупка: отправитель — пул / известный роутер (senders)
-    или from_pool — в той же транзакции токен вышел из пула (pool_out по чеку: покупка через любое приложение
+    или from_pool — в той же транзакции токен вышел из пула свопом (pool_out по чеку: покупка через любое приложение
     или агрегатор). Перевод с обычного кошелька (из пула в транзакции ничего не выходило) — не покупка."""
     return in_window(transfer, reservation) and (transfer["frm"] in senders or from_pool)
 
 
-def pool_out(logs, token, pools):
-    """В логах чека транзакции есть Transfer токена token от адреса из pools (токены вышли из пула)."""
+def pool_out(logs, token, pools, swaps):
+    """В логах чека транзакции есть Transfer токена token от адреса из pools (токены вышли из пула) и своп в пуле —
+    лог из swaps = {(адрес, topic0)}: V4 Swap PoolManager или CurveBuy кривой. Выход из пула без свопа (вывод
+    ликвидности: ModifyLiquidity) — не покупка."""
+    out = swap = False
     for l in logs:
         tp = l.get("topics") or []
-        if (len(tp) >= 3 and (l.get("address") or "").lower() == token and tp[0].lower() == TRANSFER_TOPIC
-                and "0x" + tp[1][-40:].lower() in pools):
-            return True
-    return False
+        if not tp:
+            continue
+        addr, t0 = (l.get("address") or "").lower(), tp[0].lower()
+        if len(tp) >= 3 and addr == token and t0 == TRANSFER_TOPIC and "0x" + tp[1][-40:].lower() in pools:
+            out = True
+        if (addr, t0) in swaps:
+            swap = True
+    return out and swap
 
 
 def balance_event(link, balance, threshold, now):
