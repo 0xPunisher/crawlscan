@@ -55,6 +55,8 @@ user agent crawlscan-bot — SCAN_RATE_BOT_PER_MIN, верный X-Alerts-Secret
 При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан;
 изменился важный показатель — уведомление подписчикам в Telegram (alerts_notify.py, свой поток, TG_BOT_TOKEN);
 плановые перепроверки отслеживаемых токенов — alerts_recheck.py (свой поток, уступает живым сканам).
+При OPMEM_ENABLED=true результат скана и перепроверки — в очередь памяти операторов (opmem.py: своя база
+memory.db, свой поток записи, токен не чаще раза в OPMEM_MIN_INTERVAL_H); скан запись не ждёт.
 Не больше 3 сканов одновременно (остальные ждут слота), в очереди — не больше SCAN_QUEUE_MAX; сверх очереди — 503 busy
 с Retry-After (кэш и уже идущий скан того же токена отдаются как раньше). Память процесса (memguard.py) выше мягкого
 порога после сброса кэшей — сканы до MAX_CONCURRENT без очереди, выше жёсткого — 503 busy. Раз в минуту в лог
@@ -76,6 +78,7 @@ import early
 import engine
 import market
 import memguard
+import opmem
 import trade
 import draw_service as ds
 import rewards_service as rs
@@ -205,6 +208,7 @@ def _run_job(job_id, token):
                                       "chain": job["chain"]})
             job["done"] = True
     if not err:
+        opmem.record(res)       # только в очередь (OPMEM_ENABLED), запись — в своём потоке
         record_recent(res)
         record_snapshot(res)
 
@@ -965,6 +969,12 @@ def recheck_scan(token):
     return engine.scan(token)
 
 
+def recheck_done(result):
+    """Принятая перепроверка: снимок alerts и память операторов (та же дедупликация по токену, что у живых)."""
+    opmem.record(result)
+    record_snapshot(result)
+
+
 def start_alerts_rechecker():
     """Плановые перепроверки отслеживаемых токенов — только при ALERTS_ENABLED=true."""
     if not alerts.enabled():
@@ -972,7 +982,7 @@ def start_alerts_rechecker():
     cfg = alerts_recheck.config()
     print(f"alerts: rechecks every {cfg['recheck_min']} min, max {cfg['max_per_hour']}/hour", flush=True)
     return alerts_recheck.Rechecker(
-        alerts_store, recheck_scan, record_snapshot, notify_message,
+        alerts_store, recheck_scan, recheck_done, notify_message,
         rate_limited=lambda: sum(a.RATE_LIMITED[0] for a in engine.CHAINS.values()), cfg=cfg,
         memory_high=lambda: memguard.over(live=1)).start()
 
