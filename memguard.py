@@ -99,6 +99,12 @@ def _mb(v):
     return "?" if v is None else f"{v:.0f}"
 
 
+def trim():
+    """gc и возврат освобождённой памяти ОС (после фонового построения индекса Bankr: страницы getLogs)."""
+    gc.collect()
+    _trim()
+
+
 def relieve():
     """Сбросить кэши, gc, malloc_trim; в лог — память до и после каждого шага. Возвращает RSS после (или None)."""
     before = rss_mb()
@@ -114,6 +120,17 @@ def relieve():
     print(f"memory: relieve {_mb(before)} MB -> caches+gc {_mb(dropped)} MB -> "
           f"malloc_trim {_mb(after) if trimmed else 'n/a'}{' MB' if trimmed else ''}", flush=True)
     return after
+
+
+NEAR_SHARE = 0.85         # near(): доля порога, выше которой фоновые построения (индекс Bankr) не идут
+
+
+def near(share=NEAR_SHARE):
+    """True — память процесса выше share × порога (без сброса кэшей): фоновое построение индекса прерывается
+    и не стартует, чтобы не довести до отказа живым сканам. Нет /proc или порог выключен — False."""
+    limit = soft_limit_mb()
+    rss = rss_mb()
+    return bool(limit) and rss is not None and rss >= limit * share
 
 
 def over(live=0, cap=0):

@@ -64,11 +64,19 @@ TOO_ESTABLISHED = "TOO_ESTABLISHED"
 ESTABLISHED = {"min_age_days": 30.0, "min_liquidity_usd": 750_000.0, "min_mcap_usd": 10_000_000.0}
 ESTABLISHED_HEADLINE = "This token is too established for CrawlScan."
 LIMITED_NOTE = " — market data unavailable, older token: holder signals are limited"
+PARTIAL_SCORE = 59   # частичный скан Bankr (score partial=True): score не выше, band не лучше RISKY
 PARTIAL_NOTE = " — long history, top holders partially read: holder signals are limited"   # Flap: история окнами
 ESTABLISHED_TEXT = ("CrawlScan is built for fresh memecoins. On large, older tokens the top holders are mostly "
                     "exchanges and big liquidity pools: tokens reach exchange wallets by transfer, not by buying, "
                     "and liquidity is spread across many pools, so holder patterns don't mean what they mean "
                     "on a fresh launch.")
+
+# --- Too active: история токена Bankr не помещается в обычный скан, фоновый индекс выключен — без вердикта ---
+TOO_ACTIVE = "TOO_ACTIVE"
+ACTIVE_HEADLINE = "This token has too many trades for a full scan right now."
+ACTIVE_TEXT = ("CrawlScan reads the whole transfer history to find who really holds a token. This one has more "
+               "trades than a scan can read, so there is no verdict or score. The dev vesting, price, liquidity and "
+               "market cap shown here are exact.")
 
 # --- Probably rug (README «Probably rug») ---
 RUG_MIN_DROP = 0.40        # проекция показывается, если продажа подозрительного запаса уронит цену на ≥ 40%
@@ -274,6 +282,29 @@ def dump_impact(q, reserve):
     return 1.0 - (reserve / (reserve + q)) ** 2
 
 
+def curve_impact(q, curve):
+    """Падение цены после продажи q по кривой котировок [(q_i, падение_i)] (по возрастанию q; Bankr — V4Quoter):
+    между точками — линейно; меньше первой — пропорционально от нуля; больше последней — как у последней."""
+    if q <= 0:
+        return 0.0
+    if q <= curve[0][0]:
+        return curve[0][1] * q / curve[0][0]
+    for (q0, i0), (q1, i1) in zip(curve, curve[1:]):
+        if q <= q1:
+            return i0 + (i1 - i0) * (q - q0) / (q1 - q0)
+    return curve[-1][1]
+
+
+def _impact(q, reserve, curve=None):
+    """dump_impact по резерву x*y=k или, если есть кривая котировок (curve не пустая), по ней."""
+    return curve_impact(q, curve) if curve else dump_impact(q, reserve)
+
+
+def _unlocked(q, wallets, locked, k=1.0):
+    """q минус ещё не разблокированное у этих кошельков (вестинг дева: в доле есть, продать сейчас нельзя), × k."""
+    return max(0, q - k * sum(locked.get(w, 0) for w in wallets)) if locked else q
+
+
 def _part(name, x, scale=None):
     good, bad = SCALE[scale or name]
     k = 1.0 if x <= good else 0.0 if x >= bad else (bad - x) / (bad - good)
@@ -306,7 +337,7 @@ def _sold_into_pool(q, q_factor):
 
 
 def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=True, limited=False, q_factor=1,
-          limited_note=LIMITED_NOTE):
+          limited_note=LIMITED_NOTE, impact_curve=None, locked=None, dev=None, partial=False):
     """Скор 0–100 (100 = чисто): {"score", "band", "parts", "gates", "metrics", "headline"}.
     reserve — резерв токенов ликвидности (сырые единицы): баланс пула после миграции или кривой до.
     Часть "operator" и её стоп-правило — от dump_impact крупнейшего оператора (q = взвешенная доля
@@ -322,10 +353,21 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     жёсткие правила по impact и transfer не применяются, band не ниже RISKY, к headline добавляется LIMITED_NOTE.
     Меньше MIN_HOLDERS холдеров (base["holders_total"]) → score None, band TOO_EARLY_OR_LATE.
     q_factor — доля продажи, которая дойдёт до ликвидности (1 − налог на продажу, если налог берётся токенами).
-    limited_note — пояснение к limited в headline (по умолчанию LIMITED_NOTE; Flap с неполным топом — PARTIAL_NOTE)."""
+    limited_note — пояснение к limited в headline (по умолчанию LIMITED_NOTE; Flap с неполным топом — PARTIAL_NOTE).
+    impact_curve — кривая котировок [(q, падение)] (Bankr: V4Quoter): impact по ней, а не по резерву; None — по резерву.
+    locked — {кошелёк: токенов}, которые в доле кошелька, но продать сейчас нельзя (вестинг дева Bankr): из q для
+    impact вычитаются (с весом оператора); None — q без изменений.
+    dev — доля дева, точно известная из контрактов (Bankr: кошелёк деплоера через balanceOf + вестинг):
+    {"wallet", "sellable" (что может продать сейчас: кошелёк + доступное в вестинге), "share_supply" (кошелёк + весь
+    вестинг)}. Его продажа уронит цену на ≥ GATE_IMPACT — жёсткое правило, в том числе при limited (числа не зависят
+    от неполного топа); metrics["dev_impact"]. None — правила нет (Pons, Flap: прежний путь).
+    partial=True — частичный скан (Bankr: большая история, полный индекс холдеров ещё строится): вердикт не лучше
+    RISKY и score не выше PARTIAL_SCORE (CLEAN/OK по неполному топу не показываем). False — прежний путь."""
     n = len(holders)
     big = ops[0] if ops else {"share": 0.0, "share_supply": 0.0, "weighted": 0.0, "wallets": []}
-    impact = dump_impact(_sold_into_pool(big["weighted"] * base["circulating"], q_factor), reserve) if reserve_ok else None
+    q = _unlocked(big["weighted"] * base["circulating"], big["wallets"], locked,
+                  big["weighted"] / big["share"] if locked and big["share"] else 1.0)
+    impact = _impact(_sold_into_pool(q, q_factor), reserve, impact_curve) if reserve_ok else None
     headline = (f"{n} wallets → {len(ops)} operators, biggest holds "
                 f"{big['share'] * 100:.1f}% of float ({big['share_supply'] * 100:.1f}% of supply)"
                 + _impact_phrase(impact, ops) + (limited_note if limited else ""))
@@ -372,6 +414,14 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
         gates.append(f"{m['virgin'] * 100:.0f}% virgin wallets in top (≥ {GATE_VIRGIN * 100:.0f}%)")
     if m["transfer"] >= GATE_TRANSFER and not limited:
         gates.append(f"{m['transfer'] * 100:.1f}% of float received by transfer (≥ {GATE_TRANSFER * 100:.0f}%)")
+    dev_gate = False
+    if dev is not None and reserve_ok:
+        m["dev_impact"] = _impact(_sold_into_pool(dev["sellable"], q_factor), reserve, impact_curve)
+        same = gates and gates[0].startswith("biggest operator") and dev["wallet"] in big["wallets"]
+        if m["dev_impact"] >= GATE_IMPACT and not same:
+            gates.append(f"deployer could move price −{m['dev_impact'] * 100:.0f}% if sold "
+                         f"(≥ {GATE_IMPACT * 100:.0f}%; {dev['share_supply'] * 100:.1f}% of supply with vesting)")
+            dev_gate = True
     hard = bool(gates)
     total = round(sum(parts.values()))
     if thin and independent:   # один независимый покупатель с историей в тонком пуле: не DANGER сам по себе
@@ -389,14 +439,17 @@ def score(holders, signals, ops, base, reserve, liquidity_usd=None, reserve_ok=T
     if any(g.startswith("soft:") for g in gates):
         total = min(total, SOFT_GATE_SCORE)
     band = "DANGER" if hard else next((b for lim, b in BANDS if total >= lim), "DANGER")
-    if limited and band == "DANGER":
+    if limited and band == "DANGER" and not dev_gate:
         band = "RISKY"   # старый токен без данных рынка: сигналы холдеров ограничены, вердикт не ниже RISKY
+                         # (кроме правила по деву: его доля известна точно из контрактов)
+    if partial and band in ("CLEAN", "OK"):
+        band, total = "RISKY", min(total, PARTIAL_SCORE)   # неполный топ: «чисто» не утверждаем
     return {"score": total, "band": band, "parts": parts, "gates": gates, "metrics": m, "headline": headline,
             "notes": notes}
 
 
 def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, reserve_ok=True, behavioral=True,
-                   q_factor=1):
+                   q_factor=1, impact_curve=None, locked=None):
     """Проекция «probably rug»: куда упадёт цена, если весь подозрительный запас продадут в ликвидность.
     Только при band DANGER (скор и вердикт не меняет); иначе, без запаса или при падении
     < RUG_MIN_DROP — None.
@@ -413,7 +466,7 @@ def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, res
     behavioral — DANGER вызван поведенческим жёстким правилом (связанный оператор, virgin, transfer); нет — None:
     одиночный кит в тонком пуле или низкий скор без сигналов — не rug. Части запаса — только поведенческие
     (linked, transfer, virgin, bundle/snipers): кит без сигналов в запас не входит.
-    q_factor — как в score: до ликвидности доходит q × q_factor."""
+    q_factor — как в score: до ликвидности доходит q × q_factor. impact_curve и locked — как в score."""
     if band != "DANGER" or not reserve_ok or not behavioral:
         return None
     linked = {w for o in ops if len(o["wallets"]) > 1 for w in o["wallets"]}
@@ -435,7 +488,7 @@ def rug_projection(holders, signals, ops, base, reserve, band, snipers=True, res
         q += sum(r[1] for r in rows)
     if not taken:
         return None
-    drop = dump_impact(_sold_into_pool(q, q_factor), reserve)
+    drop = _impact(_sold_into_pool(_unlocked(q, taken, locked), q_factor), reserve, impact_curve)
     if drop < RUG_MIN_DROP:
         return None
     share = sum(p["share"] for p in parts)

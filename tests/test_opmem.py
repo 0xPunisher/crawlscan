@@ -160,6 +160,60 @@ class TestWriter(Base):
         self.assertEqual([s["token"] for s in self.table("scans")], [T2])
 
 
+class TestBankr(Base):
+    """Bankr: launchpad, вестинг дева как роль dev, частичный скан не закрывает интервал для полного."""
+    VEST = "0x" + "77" * 20
+
+    def bankr(self, **kw):
+        return result(launchpad="bankr", bankr={
+            "dev": DEV, "vesting": {"total": 150, "beneficiaries": {DEV: 100, self.VEST: 50}},
+            "dev_holding": {"wallet": DEV, "share_supply": 0.293}}, **kw)
+
+    def test_rows(self):
+        scan, _, wal = opmem.rows(self.bankr(partial_scan={"state": "building"}), 1)
+        self.assertEqual((scan["launchpad"], scan["partial"], scan["deployer"]), ("bankr", 1, DEV))
+        by = {w["wallet"]: w for w in wal}
+        self.assertEqual((by[DEV]["roles"], by[DEV]["share_supply"]), ("dev", 0.293))
+        self.assertEqual((by[self.VEST]["roles"], by[self.VEST]["share_supply"]), ("dev", None))
+
+    def test_dev_in_top_keeps_holder_share(self):
+        r = self.bankr()
+        r["holders"][0]["signals"]["is_deployer"] = True
+        r["bankr"]["dev_holding"]["wallet"] = A
+        by = {w["wallet"]: w for w in opmem.rows(r, 1)[2]}
+        self.assertEqual((by[A]["roles"], by[A]["share_supply"]), ("top_holder,dev,early_buyer,virgin,linked", 0.05))
+
+    def test_vesting_entry_is_not_a_buy(self):
+        r = self.bankr()
+        r["holders"][0]["signals"] = sig(kind="vesting", is_deployer=True, sniper=True, launch_bundle=True, virgin=True)
+        by = {w["wallet"]: w for w in opmem.rows(r, 1)[2]}
+        self.assertEqual(by[A]["roles"], "top_holder,dev,virgin,linked")
+
+    def test_partial_then_full(self):
+        clock = [1000.0]
+        w = opmem.Writer(self.path, interval=6 * 3600, clock=lambda: clock[0]).start()
+        self.assertTrue(w.push(self.bankr(partial_scan={"state": "building"}, score=59)))
+        self.assertFalse(w.push(self.bankr(partial_scan={"state": "building"})))   # частичный после частичного
+        clock[0] += 60
+        self.assertTrue(w.push(self.bankr(score=44)))                               # полный после частичного
+        self.assertFalse(w.push(self.bankr(score=40)))                              # после полного — окно
+        self.assertFalse(w.push(self.bankr(partial_scan={"state": "building"})))
+        wait(w)
+        self.assertEqual([(s["score"], s["partial"]) for s in self.table("scans")], [(59, 1), (44, 0)])
+
+    def test_partial_then_full_after_restart(self):
+        first = opmem.Writer(self.path, interval=3600, clock=lambda: 1000.0)
+        first.write(self.bankr(partial_scan={"state": "building"}), 1000)
+        first.store.close()
+        w = opmem.Writer(self.path, interval=3600, clock=lambda: 1100.0).start()
+        self.assertTrue(w.push(self.bankr(partial_scan={"state": "building"})))     # память пуста, база отсечёт
+        wait(w)
+        w._seen.clear()
+        self.assertTrue(w.push(self.bankr(score=44)))
+        wait(w)
+        self.assertEqual([s["partial"] for s in self.table("scans")], [1, 0])
+
+
 class TestServer(Base):
     """Через server._run_job на подставном адаптере, как живой скан."""
 

@@ -485,6 +485,18 @@ class TestWatchAPI(unittest.TestCase):
         self.assertEqual(self.req("/api/alerts/list?chat_id=42")[1]["items"], [])
         self.assertEqual(self.watch(RH2)[0], 200)      # рынок не ответил ({}) — подписываем
 
+    def test_too_active(self):
+        from chains import bankr
+        with mock.patch.dict(bankr._ACTIVE, clear=True):
+            bankr.mark_active(RH3)                    # скан дал TOO ACTIVE (Bankr, индекс выключен)
+            code, d = self.watch(RH3)
+            self.assertEqual((code, d["error"]), (422, "too active"))
+            self.assertEqual(d["message"], "This token has too many trades for a full scan right now, so it can't be watched.")
+            self.assertEqual(self.watch(RH2)[0], 200)
+        st = server.alerts_store()
+        server.record_snapshot(res(token=RH4, band="TOO_ACTIVE", score=None, ops=[], holders=[]))
+        self.assertEqual(st.get(RH4), (None, None))   # снимка нет: вердикта нет
+
     def test_bad_input(self):
         self.assertEqual(self.watch("not an address"), (400, {"error": "not a token address"}))
         for chat in (None, "abc", True, 1.5, [1]):

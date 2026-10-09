@@ -7,7 +7,8 @@
 чаще раза в минуту). Любая ошибка записи — только строка в лог. Новых запросов в сеть нет: всё из результата скана.
 
 Один токен — не чаще раза в OPMEM_MIN_INTERVAL_H часов (по умолчанию 6), откуда бы ни пришёл скан (живой или
-перепроверка alerts). TOO_ESTABLISHED не пишется; limited / частичный скан — с пометкой.
+перепроверка alerts). TOO_ESTABLISHED и TOO_ACTIVE не пишутся; limited / частичный скан — с пометкой. Частичный скан (Bankr:
+индекс холдеров строится) не закрывает интервал для полного: полный скан того же токена после него пишется.
 
 Таблицы:
   scans(token, chain, launchpad, ts, band, score, limited, partial, holders_total, unread, deployer)
@@ -16,6 +17,7 @@
 operator_id — sha1 отсортированных кошельков (первые 16 hex): тот же набор кошельков в другом токене — тот же id.
 roles — через запятую: top_holder, dev, early_buyer (вход в окне бандла запуска), sniper, virgin,
 transfer_received, linked (в операторе из ≥ 2 кошельков или раздатчик токена такого оператора).
+Bankr: dev — деплоер (получатель комиссий LP) и бенефициары вестинга; доля дева вне топа — из dev_holding.
 Доли: share — от оборота, share_supply — от сапплая.
 """
 import hashlib, json, os, queue, sqlite3, threading, time
@@ -26,7 +28,7 @@ from draw_store import DEFAULT_PATH as DRAW_DEFAULT_PATH
 QUEUE_MAX = 500            # результатов ждут записи; больше — отбрасываются
 DROP_LOG_EVERY = 60        # секунд: строка о переполнении не чаще
 MIN_INTERVAL_H = 6.0       # часов между записями одного токена (env OPMEM_MIN_INTERVAL_H)
-SKIP_BANDS = ("TOO_ESTABLISHED",)
+SKIP_BANDS = ("TOO_ESTABLISHED", "TOO_ACTIVE")   # без вердикта: холдеров и операторов нет
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
@@ -71,7 +73,7 @@ def log(msg):
 
 
 def worth(result):
-    """Писать ли результат: есть токен и вердикт, не TOO_ESTABLISHED."""
+    """Писать ли результат: есть токен и вердикт, не TOO_ESTABLISHED / TOO_ACTIVE."""
     return isinstance(result, dict) and bool(result.get("token")) and bool(result.get("band")) \
         and result["band"] not in SKIP_BANDS
 
@@ -129,15 +131,22 @@ def rows(result, ts):
         add(w, "top_holder", h.get("share"), h.get("share_supply"))
         if s.get("is_deployer"):
             add(w, "dev")
-        if s.get("launch_bundle"):
+        bought = s.get("kind") not in ("vesting", "fees")   # Bankr: выделение вестинга / комиссии LP — не покупка
+        if s.get("launch_bundle") and bought:
             add(w, "early_buyer")
-        if s.get("sniper"):
+        if s.get("sniper") and bought:
             add(w, "sniper")
         if s.get("virgin"):
             add(w, "virgin")
         if s.get("kind") == "transfer":
             add(w, "transfer_received")
     add(dev, "dev")
+    bk = result.get("bankr") or {}
+    for b in sorted((bk.get("vesting") or {}).get("beneficiaries") or {}):
+        add(b, "dev")   # бенефициар вестинга дева на контракте токена
+    dh = bk.get("dev_holding") or {}
+    if dh.get("wallet") in wal and wal[dh["wallet"]]["share_supply"] is None:
+        wal[dh["wallet"]]["share_supply"] = _f(dh.get("share_supply"))   # кошелёк + вестинг, дев не в топе
     for w in op_of:
         add(w, "linked")
     for e in wal.values():
@@ -158,13 +167,15 @@ class Store:
     def close(self):
         self.db.close()
 
-    def last_ts(self, token):
-        r = self.db.execute("SELECT MAX(ts) FROM scans WHERE token = ?", (token,)).fetchone()
-        return r[0]
+    def last_ts(self, token, full_only=False):
+        """Время последней записи токена; full_only — только полных сканов (не partial)."""
+        q = "SELECT MAX(ts) FROM scans WHERE token = ?" + (" AND partial = 0" if full_only else "")
+        return self.db.execute(q, (token,)).fetchone()[0]
 
     def write(self, result, ts, interval):
-        """Записать скан; токен уже писали меньше interval секунд назад — False."""
-        last = self.last_ts(result["token"])
+        """Записать скан; токен уже писали меньше interval секунд назад — False (полный скан после частичного
+        пишется: частичный интервал не закрывает)."""
+        last = self.last_ts(result["token"], full_only=not result.get("partial_scan"))
         if last is not None and ts - last < interval:
             return False
         scan, ops, wal = rows(result, ts)
@@ -186,7 +197,7 @@ class Writer:
         self.interval = min_interval_s() if interval is None else interval
         self.q = queue.Queue(maxsize=qmax)
         self._lock = threading.Lock()
-        self._seen = {}               # token -> время последней постановки в очередь (дедупликация до базы)
+        self._seen = {}               # token -> (время последней постановки в очередь, частичный) — дедупликация до базы
         self.dropped, self._drop_logged = 0, 0.0
         self.written = 0
         self.store = None
@@ -203,11 +214,11 @@ class Writer:
         try:
             if not worth(result):
                 return False
-            now, token = self.clock(), result["token"]
+            now, token, partial = self.clock(), result["token"], bool(result.get("partial_scan"))
             with self._lock:
                 last = self._seen.get(token)
-                if last is not None and now - last < self.interval:
-                    return False
+                if last is not None and now - last[0] < self.interval and (partial or not last[1]):
+                    return False      # частичный после частичного или любой после полного
                 try:
                     self.q.put_nowait((result, int(now)))
                 except queue.Full:
@@ -216,9 +227,9 @@ class Writer:
                         self._drop_logged = now
                         log(f"opmem: queue full ({self.q.maxsize}), dropped {self.dropped} so far")
                     return False
-                self._seen[token] = now
+                self._seen[token] = (now, partial)
                 if len(self._seen) > 50_000:
-                    self._seen = {t: v for t, v in self._seen.items() if now - v < self.interval}
+                    self._seen = {t: v for t, v in self._seen.items() if now - v[0] < self.interval}
             return True
         except Exception as e:
             log(f"opmem: push failed: {type(e).__name__}: {e}")

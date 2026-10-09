@@ -631,6 +631,22 @@ class TestAlerts(unittest.TestCase):
     def keyboard(self, tg):
         return tg.of("editMessageText")[-1]["reply_markup"]["inline_keyboard"]
 
+    def test_too_active_no_watch_button(self):
+        res = {"token": RH.lower(), "chain": "robinhood", "header": {"name": "Chop", "ticker": "CHOP", "price_usd": 0.0000123,
+               "mcap_usd": 1.23e6, "liquidity_usd": 45300}, "launchpad": "bankr",
+               "bankr": {"pair": {"kind": "eth", "symbol": "ETH"}, "vesting": {"total_share_supply": 0.3,
+                                                                               "unlocked_share_supply": 0.15}},
+               "band": "TOO_ACTIVE", "score": None, "headline": T.ACTIVE_HEADLINE, "holders": [], "operators": [],
+               "metrics": {}, "gates": []}
+        bot, tg, _ = self.make(res=res)
+        bot.handle_update(private(RH)); drain(bot)
+        self.assertEqual(len(self.keyboard(tg)), 1)                     # без «Watch»
+        text = tg.of("editMessageText")[-1]["text"]
+        self.assertIn("Bankr · ETH pair · dev vesting 30% (15% unlocked)", text)
+        self.assertIn("🌊 <b>This token has too many trades for a full scan right now.</b>", text)
+        self.assertIn("price $1.23e-05 · mcap $1.2M · liquidity $45.3K", text)
+        self.assertNotIn("Score", text)
+
     def test_watch_button_in_private(self):
         bot, tg, _ = self.make()
         bot.handle_update(private(RH)); drain(bot)

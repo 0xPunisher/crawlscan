@@ -10,8 +10,10 @@ Read-only: скан идёт в фоне, браузер опрашивает с
                                             первые 20 покупателей и их статус сейчас (early.py); в скан не входит
   GET  /api/recent?limit=12              -> {"items": [{"token", "chain", "launchpad", "ticker", "name", "score", "band", "rug", "ts"}]}
                                             лента «Recently scanned»: последние уникальные токены, новые сверху
-  GET  /api/config                       -> {"solana": bool, "alerts": bool, "flap": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
+  GET  /api/config                       -> {"solana": bool, "alerts": bool, "flap": bool, "bankr": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
                                             шаблоны ссылки Trade on Axiom ({address}), env TRADE_URL_* (trade.py)
+  GET  /api/index?token=CA               -> {"token", "state": ready|building|queued|queue_full|too_large|unavailable|none, "eta_s"[, "position"]} (BANKR_ENABLED)
+                                            полный индекс холдеров Bankr готов? (сайт перескан делает, когда ready)
   GET  /                                 -> index.html
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
   GET  /health
@@ -73,7 +75,7 @@ import alerts
 import alerts_notify
 import alerts_recheck
 import detect
-from chains import flap, priority
+from chains import bankr, flap, priority
 import early
 import engine
 import market
@@ -147,6 +149,9 @@ _RATE = {}                 # client -> [время новых сканов за 
 for _a in engine.CHAINS.values():       # выше порога памяти memguard сбрасывает историю сканов и кэш переводов
     if hasattr(_a, "drop_caches"):
         memguard.on_relieve(_a.drop_caches)
+memguard.on_relieve(bankr.drop_caches)  # ... и индексы Bankr (идущее построение прерывается)
+bankr.memory_high = memguard.near       # построение индекса Bankr не идёт у порога памяти
+bankr.after_build = memguard.trim       # ... а после него память страниц возвращается ОС
 
 
 class Busy(Exception):
@@ -217,9 +222,15 @@ def _reuse(token, now):
     """job_id свежего кэша или идущего скана токена, иначе None (под _lock)."""
     jid = BY_TOKEN.get(token)
     job = JOBS.get(jid)
-    if job and (not job["done"] or (job["result"] and now - job["ts"] < CACHE_TTL)):
+    if job and (not job["done"] or (job["result"] and now - job["ts"] < CACHE_TTL and not _index_ready(job["result"]))):
         return jid
     return None
+
+
+def _index_ready(result):
+    """Частичный скан Bankr (индекс холдеров строился), а индекс уже готов — кэш устарел: новый скан будет полным."""
+    ps = result.get("partial_scan")
+    return bool(ps) and bankr.index_status(result["token"])["state"] == "ready"
 
 
 def _busy(why):
@@ -463,8 +474,8 @@ def record_snapshot(result):
     Вызывается после done, как лента: клиент уже получил вердикт; сбой базы только логируется.
     diff со старым снимком не пуст — событие в очередь уведомлений (подписчиков ищет и шлёт фоновый поток;
     здесь — без сети и ожидания). TOO_ESTABLISHED — авто-отписка всех подписчиков токена с одним сообщением."""
-    if not alerts.enabled():
-        return
+    if not alerts.enabled() or result.get("partial_scan") or result.get("band") == detect.TOO_ACTIVE:
+        return   # частичный скан Bankr: diff с полным был бы ложным; TOO ACTIVE — без вердикта, сравнивать нечего
     try:
         snap = alerts.snapshot(result, early.known_share(result.get("chain"), result.get("token")))
         if not snap:
@@ -500,6 +511,7 @@ def record_early(body):
 
 WATCH_MARKET_BUDGET = 3.0  # секунд на проверку «too established» при подписке на токен, который ещё не сканировали
 TOO_ESTABLISHED_WATCH = "This token is too established for CrawlScan, so it can't be watched."
+TOO_ACTIVE_WATCH = "This token has too many trades for a full scan right now, so it can't be watched."
 WATCH_LIMIT_TEXT = f"You can watch up to {alerts.WATCH_LIMIT} tokens. Unwatch one first."
 
 
@@ -608,6 +620,8 @@ def alerts_api(method, path, body, q):
     if path == "/api/alerts/unwatch":
         removed = store.unwatch(chat_id, token)
         return 200, {"ok": True, "token": token, "removed": removed, "items": store.watches(chat_id, now)} | meta
+    if chain == "robinhood" and bankr.recently_active(token):   # TOO ACTIVE: вердикта нет — следить не за чем
+        return 422, {"error": "too active", "message": TOO_ACTIVE_WATCH, "token": token}
     if too_established(chain, token):
         return 422, {"error": "too established", "message": TOO_ESTABLISHED_WATCH, "token": token}
     status, w, items = store.watch(chat_id, token, chain, now)
@@ -877,12 +891,22 @@ class H(BaseHTTPRequestHandler):
         if u.path.startswith("/api/alerts/"):
             return self._alerts("GET", u.path, q)
         if u.path == "/api/config":  # фронт и бот: какие сети включены (SOLANA_ENABLED), алерты (ALERTS_ENABLED), Trade on Axiom
-            env = tuple(os.environ.get(k) for k in ("SOLANA_ENABLED", "ALERTS_ENABLED", "FLAP_ENABLED",
+            env = tuple(os.environ.get(k) for k in ("SOLANA_ENABLED", "ALERTS_ENABLED", "FLAP_ENABLED", "BANKR_ENABLED",
                                                     "TRADE_URL_ROBINHOOD", "TRADE_URL_SOLANA"))
             body = cached_response(("config",) + env, STATUS_TTL, lambda: {
                 "solana": engine.solana_enabled(), "alerts": alerts.enabled(), "flap": flap.enabled(),
-                "trade": trade.templates()})
+                "bankr": bankr.enabled(), "trade": trade.templates()})
             return self._send(200, body, cache=STATUS_CACHE)
+        if u.path == "/api/index":   # Bankr: готов ли полный индекс холдеров (сайт перескан делает, когда ready)
+            token = (q.get("token") or [""])[0]
+            if not bankr.enabled() or not bankr.index_enabled():   # фоновый индекс выключен — его нет
+                return self._send(404, {"error": "not found"})
+            try:
+                chain, ca = engine.chain_of(token)
+            except engine.ScanError as e:
+                return self._send(400, {"error": str(e)})
+            return self._send(200, {"token": ca, **bankr.index_status(ca)} if chain == "robinhood" else
+                              {"token": ca, "state": "none", "eta_s": None})
         if u.path == "/api/chart":
             try:
                 return self._send(200, get_chart((q.get("token") or [""])[0]))

@@ -409,6 +409,27 @@ class TestBackground(unittest.TestCase):
                         self.assertGreaterEqual(time.time() - t0, 0.25)   # фон уступил живому скану
                 cw.assert_called_once()
 
+    def test_strict_background_waits_past_yield_max(self):
+        """Строгий фон (индекс Bankr) ждёт конца живого скана без потолка YIELD_MAX; обычный фон — до потолка."""
+        done = {}
+
+        def run(strict):
+            with priority.background(strict=strict):
+                priority.wait_turn()
+            done[strict] = time.time()
+        with mock.patch.object(priority, "YIELD_MAX", 0.1), mock.patch.dict(os.environ, {"BACKGROUND_RPS": "2"}):
+            with priority.live():
+                t0 = time.time()
+                ths = [threading.Thread(target=run, args=(s,), name="w") for s in (False, True)]
+                for th in ths:
+                    th.start()
+                time.sleep(0.5)
+                self.assertLess(done[False] - t0, 0.3)
+                self.assertNotIn(True, done)
+            for th in ths:
+                th.join(2)
+        self.assertIn(True, done)
+
     def test_critical_rps_env(self):
         with mock.patch.dict(os.environ, {"CRITICAL_RPS": ""}):
             self.assertEqual(priority.critical_rps(), 2.0)

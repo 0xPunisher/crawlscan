@@ -750,12 +750,15 @@ class TestF2Frontend(unittest.TestCase):
         a = re.search(r'<script type="__bundler/template">', src).end()
         t = json.loads(src[a:src.find("</script>", a)])
         self.assertIn("flapOn:!!d.flap", t)                                     # флаг — из /api/config
-        self.assertIn("state={flapOn:false,", t)                                # по умолчанию выключено
+        self.assertIn("flapOn:false,recent:[]", t)                               # по умолчанию выключено
         self.assertIn("chart appears after the token graduates", t)
         self.assertIn("locked:['locked',G]", t)                                  # early buyers: «locked in Sablier»
         self.assertIn("' in '+((b.locked_in&&b.locked_in.length)", t)
         self.assertIn("'https://flap.sh/robinhood/'", t)
         self.assertIn("flap:!!this.state.flapOn&&x.launchpad==='flap'", t)      # лента: бейдж только при флаге
         self.assertIn("this.state.flapOn&&this.state.view==='scan'", t)         # шапка: только при флаге
-        for m in re.finditer(r"\(Pons, Flap\)|Flap launchpad</span>", t):       # тексты с площадками — под sc-if
+        for m in re.finditer(r"Flap launchpad</span>", t):                      # карточка роадмапа — под sc-if
             self.assertIn('<sc-if value="{{flapOn2}}"', t[max(0, m.start() - 600):m.start()])
+        self.assertEqual(t.count('<sc-if value="{{padsOn}}" hint-placeholder-val="{{false}}"><span data-launchpads="1">'
+                                 '({{padsText}}) </span></sc-if>'), 2)        # «(Pons, Flap)» — только при флагах
+        self.assertIn("this.state.flapOn?['Flap']:[]", t)

@@ -26,7 +26,9 @@
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
     переносы в логах, отступы 16 px;
   - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора; TOO ESTABLISHED (TOO_ESTABLISHED) — без скора,
-    таблицы холдеров и критериев: шапка, чарт, карточка вердикта с пояснением, Trade on Axiom;
+    таблицы холдеров и критериев: шапка, чарт, карточка вердикта с пояснением, Trade on Axiom; TOO ACTIVE
+    (TOO_ACTIVE, Bankr: история больше скана, индекс выключен) — так же, в token stats — цена, капа, ликвидность,
+    вестинг дева; чарт — обычный (/api/chart), early buyers не запрашиваются;
   - цвета частей скора и критериев: больше баллов = чище = зелёный, мало = красный;
   - две сети: сеть по адресу (0x + 40 hex — Robinhood, base58 32–44 — Solana, регистр Solana
     не меняется), переключатель «Robinhood | Solana» над полем (плейсхолдер и sample сети),
@@ -63,6 +65,9 @@
   - Flap (только при /api/config → flap и только у токенов Flap): бейдж Flap у сети, фаза, налог,
     «tax goes to the dev», flap.sh в шапке; факт pool; карточка «chart appears after the token graduates»
     у токена на кривой; бейдж в ленте; «Robinhood (Pons, Flap) and Solana» и карточка роадмапа.
+  - Bankr (только при /api/config → bankr и только у токенов Bankr): бейдж и пара в шапке, факт pool, вестинг дева
+    у критерия операторов, сообщение частичного скана и перескан по готовому индексу (/api/index), бейдж в ленте,
+    Bankr в тексте площадок и карточка роадмапа.
 
 Если дизайн поменялся так, что якорь правки не найден, скрипт падает с понятной ошибкой
 и index.html не перезаписывает.
@@ -108,7 +113,7 @@ rep('<meta name="viewport" content="width=device-width, initial-scale=1">\n<scri
 
 # полоса TOO EARLY
 rep("const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD};",
-    "const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD,'TOO EARLY':'#8a959c','TOO ESTABLISHED':'#8a959c'};")
+    "const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD,'TOO EARLY':'#8a959c','TOO ESTABLISHED':'#8a959c','TOO ACTIVE':'#8a959c'};")
 
 # нормализация API -> формат дизайна (перед классом)
 rep("class Component extends DCLogic {", r'''// ---- live API (rh-crawler server.py) -> design format ----
@@ -146,7 +151,7 @@ function normalizeEvent(e){
       break;
     }
     case 'done':
-      o.band=e.band==='TOO_EARLY_OR_LATE'?'TOO EARLY':e.band==='TOO_ESTABLISHED'?'TOO ESTABLISHED':e.band; break;
+      o.band=e.band==='TOO_EARLY_OR_LATE'?'TOO EARLY':e.band==='TOO_ESTABLISHED'?'TOO ESTABLISHED':e.band==='TOO_ACTIVE'?'TOO ACTIVE':e.band; break;
     case 'error': o.detail=e.detail||'error'; break;
   }
   return o;
@@ -1378,12 +1383,13 @@ rep("  blank(ca){return {", r"""  loadRecent(){   // лента «recently scann
     const items=this.state.recent||[], now=Date.now()/1000;
     const ago=ts=>{const s=Math.max(0,Math.floor(now-ts)); return s<60?'just now':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago';};
     const rows=items.map(x=>{
-      const early=x.band==='TOO_EARLY_OR_LATE', est=x.band==='TOO_ESTABLISHED', band=early?'TOO EARLY':est?'TOO ESTABLISHED':x.band,
+      const early=x.band==='TOO_EARLY_OR_LATE', act=x.band==='TOO_ACTIVE', est=x.band==='TOO_ESTABLISHED'||act,
+        band=early?'TOO EARLY':act?'TOO ACTIVE':est?'TOO ESTABLISHED':x.band,
         col=BANDS[band]||'#8a959c', sol=x.chain==='solana';
       return {ticker:x.ticker?'$'+x.ticker:(x.name||x.token.slice(0,6)+'…'+x.token.slice(-4)),
         chain:sol?'Solana':'Robinhood', chainColor:sol?'#9945FF':'#00c805',
         addr:x.token.slice(0,6)+'…'+x.token.slice(-4), full:x.token,
-        score:est?'':x.score!=null&&!early?String(x.score):'—', band:early?'too early':est?'too established':band, color:col,
+        score:est?'':x.score!=null&&!early?String(x.score):'—', band:early?'too early':act?'too active':est?'too established':band, color:col,
         rug:!!x.rug, ago:ago(x.ts), href:'/?ca='+encodeURIComponent(x.token),
         go:e=>{e.preventDefault(); this.startScan(x.token);},
         copy:e=>{e.preventDefault(); e.stopPropagation(); this.copyCa('r:'+x.token,x.token);},
@@ -1549,13 +1555,19 @@ rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:no
     "\n[data-est=\"1\"] aside>div{flex:1}"
     "\n@media (max-width:640px){[data-est=\"1\"] aside,.cs-est-stats{flex:1 1 100%!important}}\n")
 rep("  blank(ca){return {", """  estVals(){   // too established: полный скан не запускался; карточка token stats — числа GT (нет числа — нет строки)
-    const dn=this.state.view==='scan'&&this.m&&this.m.done, on=!!dn&&dn.band==='TOO ESTABLISHED';
+    const dn=this.state.view==='scan'&&this.m&&this.m.done, act=!!dn&&dn.band==='TOO ACTIVE';
+    const on=!!dn&&(dn.band==='TOO ESTABLISHED'||act);
     const raw=on&&this.m.result&&this.m.result.raw||{}, est=raw.established||{}, h=raw.header||{};
     const num=v=>typeof v==='number'&&isFinite(v), age=est.age_days, mcap=num(est.mcap_usd)?est.mcap_usd:h.mcap_usd;
     const liq=num(est.liquidity_usd)?est.liquidity_usd:h.liquidity_usd;
-    const stats=[['age',num(age)?Math.floor(age).toLocaleString('en-US')+(Math.floor(age)===1?' day':' days'):null],
+    // TOO ACTIVE (Bankr): точное без полной истории — цена, капа, ликвидность, вестинг дева
+    const pr=h.price_usd, vest=act?bankrVesting(bankrOf(raw)):null;
+    const stats=(act?[['price',num(pr)?'$'+(pr>=1?pr.toFixed(2):pr.toPrecision(3)):null],
+      ['market cap',num(mcap)?fmtUsd(mcap):null],['liquidity',num(liq)?fmtUsd(liq):null],
+      ['dev vesting',vest?vest.replace('dev vesting: ',''):null]]:
+      [['age',num(age)?Math.floor(age).toLocaleString('en-US')+(Math.floor(age)===1?' day':' days'):null],
       ['market cap',num(mcap)?fmtUsd(mcap):null],['liquidity · all pools',num(liq)?fmtUsd(liq):null],
-      ['24h volume',num(h.vol24h_usd)?fmtUsd(h.vol24h_usd):null]].filter(x=>x[1]).map(([label,value])=>({label,value}));
+      ['24h volume',num(h.vol24h_usd)?fmtUsd(h.vol24h_usd):null]]).filter(x=>x[1]).map(([label,value])=>({label,value}));
     return {estFlag:on?'1':'0', estStatsOn:on&&!!this.m.result&&stats.length>0, estStats:stats,
       estSrc:raw.market_source==='dexscreener'?'DexScreener':'GeckoTerminal'};
   }
@@ -1644,7 +1656,7 @@ rep("  handleResult(r){this.m.result=r; this.loadChart(); this.bump();}",
     "  handleResult(r){this.m.result=r; this.loadChart(); this.loadEarly(); this.bump();}\n"
     "  loadEarly(){   // early buyers — отдельным запросом после вердикта; TOO ESTABLISHED — не запрашиваем\n"
     "    const m=this.m, raw=(m.result&&m.result.raw)||{};\n"
-    "    if(raw.band==='TOO_ESTABLISHED'){m.early=null; return;}\n"
+    "    if(raw.band==='TOO_ESTABLISHED'||raw.band==='TOO_ACTIVE'){m.early=null; return;}\n"
     "    m.early={status:'loading'};\n"
     "    fetch('/api/early?token='+encodeURIComponent(m.ca)).then(r=>r.ok?r.json():null).catch(()=>null)\n"
     "      .then(d=>{if(this.m!==m) return;\n"
@@ -1761,6 +1773,96 @@ rep("      ...this.flapVals(),", "      ...this.flapVals(),\n      flapOn2:!!thi
 flap_card = (f'<sc-if value="{{{{flapOn2}}}}" hint-placeholder-val="{{{{false}}}}">' + ITEM + TITLE + 'Flap launchpad</span>' + DESC
              + 'Flap tokens on Robinhood Chain: bonding curve progress, buy and sell tax, early buyers, same verdict.</span></div></sc-if>\n')
 rep(alerts_card, alerts_card + flap_card)
+
+# ---------------------------------------------------------------------------
+# Bankr (лаунчпад Robinhood, только при BANKR_ENABLED: /api/config → bankr). Всё — только у токенов Bankr
+# (result.launchpad === 'bankr') и только когда флаг включён; Pons, Flap и Solana выглядят как раньше.
+#   - шапка результата: бейдж Bankr рядом с сетью; строкой ниже — пара («ETH pair» / «META pair» у stock token);
+#   - факт pool: «Bankr · Uniswap V4»;
+#   - критерий Operator clustering: «· dev vesting: 15% (X% unlocked)» (доли сапплая);
+#   - частичный скан (result.partial_scan: большая история, полный индекс холдеров строится): сообщение под
+#     headline цветом RISKY; пока индекс строится — опрос /api/index раз в 15 с, готов — один автоматический перескан;
+#   - лента recently scanned: бейдж Bankr рядом с сетью;
+#   - тексты с площадками («Robinhood (Pons, Flap, Bankr) and Solana») и карточка роадмапа — только при флаге.
+# ---------------------------------------------------------------------------
+BANKR_COLOR = "#ff8a3d"
+BANKR_JS = r"""// ---- Bankr launchpad (BANKR_ENABLED) ----
+const BANKR_COLOR='__BANKR_COLOR__';
+const bankrOf=r=>r&&r.launchpad==='bankr'&&r.bankr&&typeof r.bankr==='object'?r.bankr:null;
+const bankrPair=b=>{const p=(b&&b.pair)||{}; return (p.symbol||(p.kind==='eth'?'ETH':'token'))+' pair';};
+const bankrPct=x=>{const v=Math.round((x||0)*1000)/10; return (v%1?v.toFixed(1):String(v))+'%';};   // 0.15 -> 15%
+const bankrVesting=b=>{const v=(b&&b.vesting)||{}; return v.total_share_supply?`dev vesting: ${bankrPct(v.total_share_supply)} (${bankrPct(v.unlocked_share_supply)} unlocked)`:null;};
+const INDEX_POLL_MS=15000, INDEX_POLL_MAX=240;   // ~60 минут опроса /api/index (очередь построений)
+const ixAbout=s=>{const n=Math.ceil((s||60)/60); return n<=1?'about a minute':`about ${n} minutes`;};
+const ixOrd=n=>n+((n%100>=10&&n%100<=20)?'th':({1:'st',2:'nd',3:'rd'}[n%10]||'th'));
+const partialEta=d=>d.state==='queued'?`Partial scan: full holder history queued: ${ixOrd(d.position)} in line, check again in ${ixAbout(d.eta_s)}`:
+  'Partial scan: building the full holder history, check again in '+ixAbout(d.eta_s);   // = engine.PARTIAL_BUILDING / PARTIAL_QUEUED
+
+"""
+rep("class Component extends DCLogic {", BANKR_JS.replace("__BANKR_COLOR__", BANKR_COLOR) + "class Component extends DCLogic {")
+# флаг с сервера
+rep(".then(d=>this.setState({solanaOn:!!d.solana,trade:d.trade||null,flapOn:!!d.flap}))",
+    ".then(d=>this.setState({solanaOn:!!d.solana,trade:d.trade||null,flapOn:!!d.flap,bankrOn:!!d.bankr}))")
+rep("  state={flapOn:false,", "  state={bankrOn:false,flapOn:false,")
+# факт pool
+rep(":flapOf(r)?'Flap · '+flapPhase(flapOf(r)):'Pons V2',", ":flapOf(r)?'Flap · '+flapPhase(flapOf(r)):bankrOf(r)?'Bankr · Uniswap V4':'Pons V2',")
+# шапка, частичный скан, перескан по готовому индексу
+rep("  blank(ca){return {", """  bankrVals(){   // токен Bankr и флаг включён: бейдж, пара; частичный скан — сообщение под headline
+    const m=this.m, raw=m&&m.result&&m.result.raw, ok=this.state.bankrOn&&this.state.view==='scan'&&!m.error;
+    const b=ok&&bankrOf(raw), ps=ok&&m.done&&raw&&raw.partial_scan;
+    return {bankrOn:!!b,bankrPair:b?bankrPair(b):'',partialOn:!!(ps&&ps.message),
+      partialText:ps&&ps.message?(this.state.rescanning?'Full holder history is ready, rescanning…':
+        ['building','queued'].includes(ps.state)&&this.state.ixEta&&this.state.ixEta.ca===m.ca?partialEta(this.state.ixEta.d):ps.message):''};
+  }
+  watchIndex(r){   // частичный скан Bankr: индекс строится — опрос /api/index; готов — один перескан этого токена
+    clearTimeout(this._ixT); const raw=r&&r.raw, ps=raw&&raw.partial_scan, ca=this.m&&this.m.ca;
+    if(!this.state.bankrOn||!ps||!['building','queued','ready'].includes(ps.state)||!ca) return;
+    this._rescanned=this._rescanned||{}; if(this._rescanned[ca]) return;
+    let n=0;
+    const poll=async()=>{
+      if(!this.m||this.m.ca!==ca||this.state.view!=='scan'||++n>INDEX_POLL_MAX) return;
+      try{
+        const d=await fetch('/api/index?token='+encodeURIComponent(ca),NO_STORE).then(x=>x.ok?x.json():null);
+        if(!this.m||this.m.ca!==ca||this.state.view!=='scan') return;
+        if(d&&d.state==='ready'){this._rescanned[ca]=true; this.setState({rescanning:true}); setTimeout(()=>{if(this.m&&this.m.ca===ca&&this.state.view==='scan'){this.setState({rescanning:false}); this.startScan(ca,true);}},1200); return;}
+        if(d&&!['building','queued','none'].includes(d.state)) return;   // too_large / unavailable / queue_full — ждать нечего
+        if(d&&['building','queued'].includes(d.state)&&d.eta_s) this.setState({ixEta:{ca,d}});   // очередь и ETA по ходу
+      }catch(e){}
+      this._ixT=setTimeout(poll,INDEX_POLL_MS);
+    };
+    this._ixT=setTimeout(poll,ps.state==='ready'?500:2000);   // первый опрос сразу: у кэшированного результата ETA устарел
+  }
+  blank(ca){return {""")
+rep("      ...this.flapVals(),\n", "      ...this.flapVals(),\n      ...this.bankrVals(),\n")
+rep("  handleResult(r){this.m.result=r; this.loadChart(); this.loadEarly(); this.bump();}",
+    "  handleResult(r){this.m.result=r; this.loadChart(); this.loadEarly(); this.watchIndex(r); this.bump();}")
+BANKR_BADGE = (f'<sc-if value="{{{{bankrOn}}}}" hint-placeholder-val="{{{{false}}}}"><span data-launchpad="bankr" style="{FPILL};color:{BANKR_COLOR};'
+               f'border:1px solid {BANKR_COLOR};background:rgba(255,138,61,0.08)">Bankr</span></sc-if>')
+rep("background:rgba(244,114,182,0.08)\">Flap</span></sc-if>\n            </div>\n",
+    "background:rgba(244,114,182,0.08)\">Flap</span></sc-if>" + BANKR_BADGE + "\n            </div>\n"
+    f'            <sc-if value="{{{{bankrOn}}}}" hint-placeholder-val="{{{{false}}}}"><div data-bankr-info="1" style="display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-width:0">'
+    f'<span style="{FPILL};color:#c9d1d6;border:1px solid #2c353b;background:#0b1013">{{{{bankrPair}}}}</span></div></sc-if>\n')
+HEADLINE_P = '<p data-grip="1" style="margin:0;font-size:19px;line-height:1.35;color:#eef1f3;letter-spacing:-0.01em;text-wrap:pretty">{{headline}}</p>\n'
+rep(HEADLINE_P, HEADLINE_P + f'              <sc-if value="{{{{partialOn}}}}" hint-placeholder-val="{{{{false}}}}"><span data-partial="1" style="{MONO};font-size:12.5px;line-height:1.5;color:#f5a623;padding:10px 12px;border:1px solid rgba(245,166,35,0.45);border-radius:8px;background:rgba(245,166,35,0.08);text-wrap:pretty">{{{{partialText}}}}</span></sc-if>\n')
+# критерий операторов: вестинг дева рядом
+rep("+(done&&imp?` · dump ${imp}`:''):null,",
+    "+(done&&imp?` · dump ${imp}`:'')+(done&&this.state.bankrOn&&bankrVesting(bankrOf(res&&res.raw))?' · '+bankrVesting(bankrOf(res.raw)):''):null,")
+# лента: бейдж Bankr, на телефоне — та же раскладка, что у Flap
+rep("flap:!!this.state.flapOn&&x.launchpad==='flap', flapAttr:this.state.flapOn&&x.launchpad==='flap'?'1':'0',",
+    "flap:!!this.state.flapOn&&x.launchpad==='flap', bankr:!!this.state.bankrOn&&x.launchpad==='bankr', "
+    "flapAttr:(this.state.flapOn&&x.launchpad==='flap')||(this.state.bankrOn&&x.launchpad==='bankr')?'1':'0',")
+rep(f'<sc-if value="{{{{r.flap}}}}" hint-placeholder-val="{{{{false}}}}"><span data-launchpad="flap" style="{PILL};color:{FLAP_COLOR};border:1px solid {FLAP_COLOR}">Flap</span></sc-if></span>\n',
+    f'<sc-if value="{{{{r.flap}}}}" hint-placeholder-val="{{{{false}}}}"><span data-launchpad="flap" style="{PILL};color:{FLAP_COLOR};border:1px solid {FLAP_COLOR}">Flap</span></sc-if>'
+    f'<sc-if value="{{{{r.bankr}}}}" hint-placeholder-val="{{{{false}}}}"><span data-launchpad="bankr" style="{PILL};color:{BANKR_COLOR};border:1px solid {BANKR_COLOR}">Bankr</span></sc-if></span>\n')
+# тексты с площадками: список по включённым флагам
+rep('<sc-if value="{{flapOn2}}" hint-placeholder-val="{{false}}"><span data-launchpads="1">(Pons, Flap) </span></sc-if>',
+    '<sc-if value="{{padsOn}}" hint-placeholder-val="{{false}}"><span data-launchpads="1">({{padsText}}) </span></sc-if>', count=2)
+rep("      flapOn2:!!this.state.flapOn,", "      flapOn2:!!this.state.flapOn, bankrOn2:!!this.state.bankrOn,\n"
+    "      padsOn:!!(this.state.flapOn||this.state.bankrOn), padsText:['Pons'].concat(this.state.flapOn?['Flap']:[],this.state.bankrOn?['Bankr']:[]).join(', '),")
+# роадмап: Bankr — после Flap, только при флаге
+bankr_card = (f'<sc-if value="{{{{bankrOn2}}}}" hint-placeholder-val="{{{{false}}}}">' + ITEM + TITLE + 'Bankr launchpad</span>' + DESC
+              + 'Bankr tokens on Robinhood Chain: ETH or stock token pair, dev vesting, full holder history, early buyers, same verdict.</span></div></sc-if>\n')
+rep(flap_card, flap_card + bankr_card)
 
 enc = encode(t)
 TITLE_OLD = '<title>Bundled Page</title>'
