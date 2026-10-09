@@ -26,7 +26,9 @@
   - телефон (≤ 640 px): без горизонтальной прокрутки — компактное меню в шапке, таблицы в две строки,
     переносы в логах, отступы 16 px;
   - полоса TOO EARLY (TOO_EARLY_OR_LATE) и счёт «—» без скора; TOO ESTABLISHED (TOO_ESTABLISHED) — без скора,
-    таблицы холдеров и критериев: шапка, чарт, карточка вердикта с пояснением, Trade on Axiom;
+    таблицы холдеров и критериев: шапка, чарт, карточка вердикта с пояснением, Trade on Axiom; TOO ACTIVE
+    (TOO_ACTIVE, Bankr: история больше скана, индекс выключен) — так же, в token stats — цена, капа, ликвидность,
+    вестинг дева; чарт — обычный (/api/chart), early buyers не запрашиваются;
   - цвета частей скора и критериев: больше баллов = чище = зелёный, мало = красный;
   - две сети: сеть по адресу (0x + 40 hex — Robinhood, base58 32–44 — Solana, регистр Solana
     не меняется), переключатель «Robinhood | Solana» над полем (плейсхолдер и sample сети),
@@ -111,7 +113,7 @@ rep('<meta name="viewport" content="width=device-width, initial-scale=1">\n<scri
 
 # полоса TOO EARLY
 rep("const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD};",
-    "const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD,'TOO EARLY':'#8a959c','TOO ESTABLISHED':'#8a959c'};")
+    "const BANDS={CLEAN:G,OK:LG,RISKY:A,DANGER:RD,ERROR:RD,'TOO EARLY':'#8a959c','TOO ESTABLISHED':'#8a959c','TOO ACTIVE':'#8a959c'};")
 
 # нормализация API -> формат дизайна (перед классом)
 rep("class Component extends DCLogic {", r'''// ---- live API (rh-crawler server.py) -> design format ----
@@ -149,7 +151,7 @@ function normalizeEvent(e){
       break;
     }
     case 'done':
-      o.band=e.band==='TOO_EARLY_OR_LATE'?'TOO EARLY':e.band==='TOO_ESTABLISHED'?'TOO ESTABLISHED':e.band; break;
+      o.band=e.band==='TOO_EARLY_OR_LATE'?'TOO EARLY':e.band==='TOO_ESTABLISHED'?'TOO ESTABLISHED':e.band==='TOO_ACTIVE'?'TOO ACTIVE':e.band; break;
     case 'error': o.detail=e.detail||'error'; break;
   }
   return o;
@@ -1381,12 +1383,13 @@ rep("  blank(ca){return {", r"""  loadRecent(){   // лента «recently scann
     const items=this.state.recent||[], now=Date.now()/1000;
     const ago=ts=>{const s=Math.max(0,Math.floor(now-ts)); return s<60?'just now':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago';};
     const rows=items.map(x=>{
-      const early=x.band==='TOO_EARLY_OR_LATE', est=x.band==='TOO_ESTABLISHED', band=early?'TOO EARLY':est?'TOO ESTABLISHED':x.band,
+      const early=x.band==='TOO_EARLY_OR_LATE', act=x.band==='TOO_ACTIVE', est=x.band==='TOO_ESTABLISHED'||act,
+        band=early?'TOO EARLY':act?'TOO ACTIVE':est?'TOO ESTABLISHED':x.band,
         col=BANDS[band]||'#8a959c', sol=x.chain==='solana';
       return {ticker:x.ticker?'$'+x.ticker:(x.name||x.token.slice(0,6)+'…'+x.token.slice(-4)),
         chain:sol?'Solana':'Robinhood', chainColor:sol?'#9945FF':'#00c805',
         addr:x.token.slice(0,6)+'…'+x.token.slice(-4), full:x.token,
-        score:est?'':x.score!=null&&!early?String(x.score):'—', band:early?'too early':est?'too established':band, color:col,
+        score:est?'':x.score!=null&&!early?String(x.score):'—', band:early?'too early':act?'too active':est?'too established':band, color:col,
         rug:!!x.rug, ago:ago(x.ts), href:'/?ca='+encodeURIComponent(x.token),
         go:e=>{e.preventDefault(); this.startScan(x.token);},
         copy:e=>{e.preventDefault(); e.stopPropagation(); this.copyCa('r:'+x.token,x.token);},
@@ -1552,13 +1555,19 @@ rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:no
     "\n[data-est=\"1\"] aside>div{flex:1}"
     "\n@media (max-width:640px){[data-est=\"1\"] aside,.cs-est-stats{flex:1 1 100%!important}}\n")
 rep("  blank(ca){return {", """  estVals(){   // too established: полный скан не запускался; карточка token stats — числа GT (нет числа — нет строки)
-    const dn=this.state.view==='scan'&&this.m&&this.m.done, on=!!dn&&dn.band==='TOO ESTABLISHED';
+    const dn=this.state.view==='scan'&&this.m&&this.m.done, act=!!dn&&dn.band==='TOO ACTIVE';
+    const on=!!dn&&(dn.band==='TOO ESTABLISHED'||act);
     const raw=on&&this.m.result&&this.m.result.raw||{}, est=raw.established||{}, h=raw.header||{};
     const num=v=>typeof v==='number'&&isFinite(v), age=est.age_days, mcap=num(est.mcap_usd)?est.mcap_usd:h.mcap_usd;
     const liq=num(est.liquidity_usd)?est.liquidity_usd:h.liquidity_usd;
-    const stats=[['age',num(age)?Math.floor(age).toLocaleString('en-US')+(Math.floor(age)===1?' day':' days'):null],
+    // TOO ACTIVE (Bankr): точное без полной истории — цена, капа, ликвидность, вестинг дева
+    const pr=h.price_usd, vest=act?bankrVesting(bankrOf(raw)):null;
+    const stats=(act?[['price',num(pr)?'$'+(pr>=1?pr.toFixed(2):pr.toPrecision(3)):null],
+      ['market cap',num(mcap)?fmtUsd(mcap):null],['liquidity',num(liq)?fmtUsd(liq):null],
+      ['dev vesting',vest?vest.replace('dev vesting: ',''):null]]:
+      [['age',num(age)?Math.floor(age).toLocaleString('en-US')+(Math.floor(age)===1?' day':' days'):null],
       ['market cap',num(mcap)?fmtUsd(mcap):null],['liquidity · all pools',num(liq)?fmtUsd(liq):null],
-      ['24h volume',num(h.vol24h_usd)?fmtUsd(h.vol24h_usd):null]].filter(x=>x[1]).map(([label,value])=>({label,value}));
+      ['24h volume',num(h.vol24h_usd)?fmtUsd(h.vol24h_usd):null]]).filter(x=>x[1]).map(([label,value])=>({label,value}));
     return {estFlag:on?'1':'0', estStatsOn:on&&!!this.m.result&&stats.length>0, estStats:stats,
       estSrc:raw.market_source==='dexscreener'?'DexScreener':'GeckoTerminal'};
   }
@@ -1647,7 +1656,7 @@ rep("  handleResult(r){this.m.result=r; this.loadChart(); this.bump();}",
     "  handleResult(r){this.m.result=r; this.loadChart(); this.loadEarly(); this.bump();}\n"
     "  loadEarly(){   // early buyers — отдельным запросом после вердикта; TOO ESTABLISHED — не запрашиваем\n"
     "    const m=this.m, raw=(m.result&&m.result.raw)||{};\n"
-    "    if(raw.band==='TOO_ESTABLISHED'){m.early=null; return;}\n"
+    "    if(raw.band==='TOO_ESTABLISHED'||raw.band==='TOO_ACTIVE'){m.early=null; return;}\n"
     "    m.early={status:'loading'};\n"
     "    fetch('/api/early?token='+encodeURIComponent(m.ca)).then(r=>r.ok?r.json():null).catch(()=>null)\n"
     "      .then(d=>{if(this.m!==m) return;\n"

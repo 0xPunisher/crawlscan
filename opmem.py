@@ -7,7 +7,7 @@
 чаще раза в минуту). Любая ошибка записи — только строка в лог. Новых запросов в сеть нет: всё из результата скана.
 
 Один токен — не чаще раза в OPMEM_MIN_INTERVAL_H часов (по умолчанию 6), откуда бы ни пришёл скан (живой или
-перепроверка alerts). TOO_ESTABLISHED не пишется; limited / частичный скан — с пометкой. Частичный скан (Bankr:
+перепроверка alerts). TOO_ESTABLISHED и TOO_ACTIVE не пишутся; limited / частичный скан — с пометкой. Частичный скан (Bankr:
 индекс холдеров строится) не закрывает интервал для полного: полный скан того же токена после него пишется.
 
 Таблицы:
@@ -28,7 +28,7 @@ from draw_store import DEFAULT_PATH as DRAW_DEFAULT_PATH
 QUEUE_MAX = 500            # результатов ждут записи; больше — отбрасываются
 DROP_LOG_EVERY = 60        # секунд: строка о переполнении не чаще
 MIN_INTERVAL_H = 6.0       # часов между записями одного токена (env OPMEM_MIN_INTERVAL_H)
-SKIP_BANDS = ("TOO_ESTABLISHED",)
+SKIP_BANDS = ("TOO_ESTABLISHED", "TOO_ACTIVE")   # без вердикта: холдеров и операторов нет
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
@@ -73,7 +73,7 @@ def log(msg):
 
 
 def worth(result):
-    """Писать ли результат: есть токен и вердикт, не TOO_ESTABLISHED."""
+    """Писать ли результат: есть токен и вердикт, не TOO_ESTABLISHED / TOO_ACTIVE."""
     return isinstance(result, dict) and bool(result.get("token")) and bool(result.get("band")) \
         and result["band"] not in SKIP_BANDS
 

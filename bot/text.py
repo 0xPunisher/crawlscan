@@ -14,6 +14,8 @@ CHAIN_NAME = {"robinhood": "Robinhood Chain", "solana": "Solana"}
 BAND_ICON = {"CLEAN": "🟢", "OK": "🟡", "RISKY": "🟠", "DANGER": "🔴"}
 TOO_EARLY = "TOO_EARLY_OR_LATE"
 TOO_ESTABLISHED = "TOO_ESTABLISHED"
+TOO_ACTIVE = "TOO_ACTIVE"
+ACTIVE_HEADLINE = "This token has too many trades for a full scan right now."
 ESTABLISHED_HEADLINE = "This token is too established for CrawlScan."
 ESTABLISHED_TEXT = ("CrawlScan is built for fresh memecoins. On large, older tokens the top holders are mostly "
                     "exchanges and big liquidity pools: tokens reach exchange wallets by transfer, not by buying, "
@@ -198,6 +200,19 @@ def rug_lines(rug):
     return lines
 
 
+def _usd(v):
+    """$ с сокращением: $1.2M, $45.3K, $0.000123."""
+    if v >= 1e9:
+        return f"${v / 1e9:.1f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"${v / 1e3:.1f}K"
+    if v >= 1:
+        return f"${v:.2f}"
+    return f"${v:.3g}" if v else "$0"
+
+
 def _tax(x):
     return f"{x * 100:.2f}".rstrip("0").rstrip(".") + "%"
 
@@ -238,6 +253,15 @@ def verdict(res):
     if res.get("band") == TOO_ESTABLISHED:     # полный скан не запускался: без скора
         lines.append(f"🏛 <b>{e(res.get('headline') or ESTABLISHED_HEADLINE)}</b>")
         lines.append(e(res.get("reason") or ESTABLISHED_TEXT))
+        return "\n".join(lines)
+    if res.get("band") == TOO_ACTIVE:          # Bankr, история больше скана: без вердикта, только точное
+        lines.append(f"🌊 <b>{e(res.get('headline') or ACTIVE_HEADLINE)}</b>")
+        h = res.get("header") or {}
+        mk = [f"{k} {_usd(h[f])}" for k, f in (("price", "price_usd"), ("mcap", "mcap_usd"),
+                                               ("liquidity", "liquidity_usd")) if h.get(f) is not None]
+        if mk:
+            lines.append(" · ".join(mk))
+        lines.append("No verdict or score: the full holder history is too long to read in one scan.")
         return "\n".join(lines)
     if res.get("band") == TOO_EARLY:
         lines.append("⏳ <b>Too early or too late</b>")
@@ -423,6 +447,10 @@ def watch_limit(r, now):
 
 def watch_established(addr):
     return f"🏛 {e(short(addr))} is too established for CrawlScan, so it can't be watched."
+
+
+def watch_active(addr):
+    return f"🌊 {e(short(addr))} has too many trades for a full scan right now, so it can't be watched."
 
 
 def unwatched(r):

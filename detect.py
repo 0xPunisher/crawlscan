@@ -71,6 +71,13 @@ ESTABLISHED_TEXT = ("CrawlScan is built for fresh memecoins. On large, older tok
                     "and liquidity is spread across many pools, so holder patterns don't mean what they mean "
                     "on a fresh launch.")
 
+# --- Too active: история токена Bankr не помещается в обычный скан, фоновый индекс выключен — без вердикта ---
+TOO_ACTIVE = "TOO_ACTIVE"
+ACTIVE_HEADLINE = "This token has too many trades for a full scan right now."
+ACTIVE_TEXT = ("CrawlScan reads the whole transfer history to find who really holds a token. This one has more "
+               "trades than a scan can read, so there is no verdict or score. The dev vesting, price, liquidity and "
+               "market cap shown here are exact.")
+
 # --- Probably rug (README «Probably rug») ---
 RUG_MIN_DROP = 0.40        # проекция показывается, если продажа подозрительного запаса уронит цену на ≥ 40%
 RUG_ORDER = ("linked", "transfer", "virgin", "bundle")  # приоритет причин: кошелёк попадает в первую подходящую

@@ -123,6 +123,69 @@ def enabled():
     return os.environ.get("BANKR_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 
 
+def index_enabled():
+    """BANKR_INDEX_ENABLED (по умолчанию выключен): фоновый индекс холдеров и очередь построений. Выключен — ни
+    одного построения, индекс в памяти не хранится; история больше обычного скана — TooActive (TOO ACTIVE)."""
+    return os.environ.get("BANKR_INDEX_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+
+class TooActive(Exception):
+    """История токена не помещается в обычный скан, а фоновый индекс выключен: вердикта нет (TOO ACTIVE)."""
+
+    def __init__(self, est_logs):
+        super().__init__(est_logs)
+        self.est_logs = est_logs
+
+
+ACTIVE_TTL = 6 * 3600   # секунд: токен недавно был TOO ACTIVE — в watchlist не ставится
+ACTIVE_MAX = 2_000
+_ACTIVE = {}            # token -> время последнего TOO ACTIVE (порядок = давность)
+
+
+def mark_active(token):
+    with _INDEX_LOCK:
+        _ACTIVE.pop(token, None)
+        _ACTIVE[token] = time.time()
+        while len(_ACTIVE) > ACTIVE_MAX:
+            _ACTIVE.pop(next(iter(_ACTIVE)))
+
+
+def recently_active(token):
+    """Токен недавно был TOO ACTIVE (в памяти процесса, ACTIVE_TTL)."""
+    with _INDEX_LOCK:
+        ts = _ACTIVE.get((token or "").lower())
+    return ts is not None and time.time() - ts < ACTIVE_TTL
+
+
+def active_info(token, launch, supply=None):
+    """TOO ACTIVE: то, что точно и без истории переводов — пул, пара, дев, вестинг (всего / разблокировано) из
+    контрактов. Один HTTP-батч: остаток на контракте токена и доступное каждому бенефициару."""
+    token = token.lower()
+    st = _STATE.get(token) or {}
+    supply = supply if supply is not None else ch.token_supply(token)
+    vest = launch.get("vesting") or {}
+    total, bens = sum(vest.values()), sorted(vest)
+    res = ch.rpc_batch([_call(token, flap.SEL_BALANCE + _arg(token))] + [_call(token, SEL_AVAILABLE + _arg(b))
+                                                                            for b in bens]) if bens else []
+    in_contract = (_words(res[0]) or [0])[0] if res and res[0] else 0
+    available = sum((_words(x) or [0])[0] if x else 0 for x in res[1:])
+    left = min(in_contract, total)
+    released = total - left
+    unlocked = min(total, released + available)
+    pair = st.get("numeraire") or (launch["pool_key"]["currency1"] if launch["token_is0"]
+                                   else launch["pool_key"]["currency0"])
+    is_eth = pair in (ch.WETH_ADDR, ZERO)
+    return {"pool_id": launch["pool_id"], "pool_key": launch["pool_key"],
+            "pair": {"kind": "eth" if is_eth else "token", "address": pair,
+                     "symbol": "ETH" if is_eth else (ch.token_meta(pair).get("symbol") or None)},
+            "dev": launch.get("deployer"), "creator": launch.get("creator"),
+            "vesting": {"total": total, "unlocked": unlocked, "released": released, "in_contract": left,
+                        "beneficiaries": {b: vest[b] for b in bens},
+                        "total_share_supply": total / supply if supply else 0.0,
+                        "unlocked_share_supply": unlocked / supply if supply else 0.0},
+            "impact_source": None, "impact_curve": []}
+
+
 def candidate(token):
     """Похож на Bankr по адресу (без RPC): флаг включён и суффикс ba3."""
     return enabled() and isinstance(token, str) and token.lower().endswith(SUFFIX)
@@ -569,6 +632,8 @@ def _job_left(job, now):
 def _index_start(token, launch_block, excluded, est_total=None):
     """Индекс токена — в очередь построений (поток recheck-bankr-index строит по одному, по порядку)
     -> "building" | "queued" | "queue_full" | None (уже есть или недавно не удалось — не нужно)."""
+    if not index_enabled():
+        return None
     now = time.time()
     with _INDEX_CV:
         failed = _INDEX_FAILED.get(token)
@@ -691,8 +756,9 @@ def history(token, launch_block, supply, excluded, deadline=None):
     until = (deadline - flap.HISTORY_RESERVE) if deadline is not None else None
     t0 = time.time()
     head = ch.block_number()
+    indexing = index_enabled()
     with _INDEX_LOCK:
-        ix = _INDEX.get(token)
+        ix = _INDEX.get(token) if indexing else None
         start = ix["head"] if ix else None
     if ix is not None:
         tail = []
@@ -715,14 +781,18 @@ def history(token, launch_block, supply, excluded, deadline=None):
     n, complete = _read_all(token, launch_block, head, trs.extend, cap=cap, until=until, stats=stats)
     if complete:
         trs.sort(key=_key)
-        ix = _index_new()
-        _index_apply(ix, trs, excluded)
-        ix["head"] = head
-        _index_put(token, ix)
+        if indexing:   # индекс выключен — в памяти не храним (следующий скан снова читает целиком)
+            ix = _index_new()
+            _index_apply(ix, trs, excluded)
+            ix["head"] = head
+            _index_put(token, ix)
         return trs, None, {"mode": "full", "logs": n, "seconds": {"read": round(time.time() - t0, 1)}}, None
     probe_s = round(time.time() - t0, 1)
     trs = None   # прочитанное пробой не держим: окна Flap читают заново
     est = max(stats.get("est_total") or 0, n, cap + 1)
+    if not indexing:   # не помещается в обычный скан, индекса нет — без вердикта (TOO ACTIVE)
+        print(f"bankr: {token} too active for a full scan (~{est} logs, probe {probe_s}s)", flush=True)
+        raise TooActive(est)
     started = _index_start(token, launch_block, excluded, est) in ("building", "queued")
     transfers, base, info, infra = flap.history(token, launch_block, supply, excluded, deadline)
     ixs = index_status(token)

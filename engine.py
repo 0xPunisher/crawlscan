@@ -153,6 +153,21 @@ def established_result(token, chain, gt, limits, ev, t0, rpc_requests=0):
             "elapsed_s": round(time.time() - t0, 1), "rpc_requests": rpc_requests}
 
 
+def active_result(token, chain, gt, launch, info, est_logs, ev, t0, rpc_requests):
+    """Результат без вердикта: история токена Bankr не помещается в обычный скан, а фоновый индекс выключен
+    (bankr.TooActive). Только то, что точно без полной истории: вестинг дева, цена, ликвидность, капа (GT), чарт."""
+    ev("done", d.ACTIVE_TEXT, score=None, band=d.TOO_ACTIVE, headline=d.ACTIVE_HEADLINE, rug=None)
+    meta = {} if gt.get("name") else ch.token_meta(token)
+    age_h = round((time.time() - launch["ts"]) / 3600, 1) if launch.get("ts") else None
+    return {"token": token, "chain": chain, "launchpad": "bankr", "bankr": info, "header": _header(gt, meta, age_h),
+            "launch": launch, "score": None, "band": d.TOO_ACTIVE, "headline": d.ACTIVE_HEADLINE,
+            "reason": d.ACTIVE_TEXT, "parts": {}, "gates": [], "metrics": {}, "rug": None,
+            "holders": [], "holders_total": None, "operators": [], "links": [], "packs": [], "unread": [],
+            "too_active": {"est_logs": est_logs}, "partial_scan": None, "limited": False,
+            "market_source": gt.get("source"), "market_pool": gt.get("pool"),
+            "elapsed_s": round(time.time() - t0, 1), "rpc_requests": rpc_requests}
+
+
 def validate(token):
     """CA → нормализованный адрес или ScanError (см. chain_of)."""
     return chain_of(token)[1]
@@ -326,6 +341,16 @@ def scan(token, emit=lambda e: None):
     except ch.HistoryTooLarge as e:
         print(f"scan: {token} history too large ({e} logs, cap {ch.SCAN_MAX_LOGS})", flush=True)
         raise ScanError(TOO_LARGE) from None
+    except bankr.TooActive as e:   # Bankr, индекс выключен: история больше обычного скана — без вердикта
+        if est := late_established():
+            return est
+        bankr.mark_active(token)
+        info = bankr.active_info(token, launch)
+        if late:   # рынок нужен для шапки: ждём поздний ответ GT в пределах бюджета
+            mkt_thread.join(timeout=max(0.0, deadline - time.time()))
+            gt = dict(mkt_box)
+        ts0 = a.block_timestamps([launch["block"]]).get(launch["block"])
+        return active_result(token, chain, gt, launch | {"ts": ts0}, info, e.est_logs, ev, t0, a.REQUESTS[0] - r0)
     transfers, supply, excluded, mkt = facts["transfers"], facts["supply"], facts["excluded"], facts["market"]
     base = facts["base"] or d.supply_base(transfers, supply, excluded)
     holders = d.top_holders(base)

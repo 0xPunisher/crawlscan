@@ -474,8 +474,8 @@ def record_snapshot(result):
     Вызывается после done, как лента: клиент уже получил вердикт; сбой базы только логируется.
     diff со старым снимком не пуст — событие в очередь уведомлений (подписчиков ищет и шлёт фоновый поток;
     здесь — без сети и ожидания). TOO_ESTABLISHED — авто-отписка всех подписчиков токена с одним сообщением."""
-    if not alerts.enabled() or result.get("partial_scan"):   # частичный скан Bankr: diff с полным был бы ложным
-        return
+    if not alerts.enabled() or result.get("partial_scan") or result.get("band") == detect.TOO_ACTIVE:
+        return   # частичный скан Bankr: diff с полным был бы ложным; TOO ACTIVE — без вердикта, сравнивать нечего
     try:
         snap = alerts.snapshot(result, early.known_share(result.get("chain"), result.get("token")))
         if not snap:
@@ -511,6 +511,7 @@ def record_early(body):
 
 WATCH_MARKET_BUDGET = 3.0  # секунд на проверку «too established» при подписке на токен, который ещё не сканировали
 TOO_ESTABLISHED_WATCH = "This token is too established for CrawlScan, so it can't be watched."
+TOO_ACTIVE_WATCH = "This token has too many trades for a full scan right now, so it can't be watched."
 WATCH_LIMIT_TEXT = f"You can watch up to {alerts.WATCH_LIMIT} tokens. Unwatch one first."
 
 
@@ -619,6 +620,8 @@ def alerts_api(method, path, body, q):
     if path == "/api/alerts/unwatch":
         removed = store.unwatch(chat_id, token)
         return 200, {"ok": True, "token": token, "removed": removed, "items": store.watches(chat_id, now)} | meta
+    if chain == "robinhood" and bankr.recently_active(token):   # TOO ACTIVE: вердикта нет — следить не за чем
+        return 422, {"error": "too active", "message": TOO_ACTIVE_WATCH, "token": token}
     if too_established(chain, token):
         return 422, {"error": "too established", "message": TOO_ESTABLISHED_WATCH, "token": token}
     status, w, items = store.watch(chat_id, token, chain, now)
@@ -896,7 +899,7 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, body, cache=STATUS_CACHE)
         if u.path == "/api/index":   # Bankr: готов ли полный индекс холдеров (сайт перескан делает, когда ready)
             token = (q.get("token") or [""])[0]
-            if not bankr.enabled():
+            if not bankr.enabled() or not bankr.index_enabled():   # фоновый индекс выключен — его нет
                 return self._send(404, {"error": "not found"})
             try:
                 chain, ca = engine.chain_of(token)

@@ -305,6 +305,8 @@ class Bot:
                     return T.watch_limit_view(r, now, self.tickers)
                 return T.watch_limit(r, now), None
             if r.get("status") == 422:
+                if r.get("error") == "too active":
+                    return T.watch_active(found[1]), None
                 return T.watch_established(found[1]), None
             self.log(f"watch {found[1]} chat {chat_id}" + (" renewed" if r.get("renewed") else ""))
             return T.watching(r), None
@@ -399,7 +401,7 @@ class Bot:
                 self.tickers.clear()
             self.tickers[token] = ticker
         chain = res.get("chain") or T.chain_of(token)
-        watch = watch and res.get("band") != T.TOO_ESTABLISHED and self.alerts_on()
+        watch = watch and res.get("band") not in (T.TOO_ESTABLISHED, T.TOO_ACTIVE) and self.alerts_on()
         return T.verdict(res), T.report_button(token, trade.url(chain, token, self.trade_urls), watch)
 
     # --- цикл опроса ------------------------------------------------------------------------------

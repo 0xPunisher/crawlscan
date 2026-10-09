@@ -11,6 +11,7 @@ import fakes
 from fakes import ch, engine, ZERO
 from chains import bankr, flap
 import detect as d
+import opmem
 import early
 import test_flap
 
@@ -477,6 +478,10 @@ def small_pages(cap=5):
         mock.patch.object(flap, "PAGE_LOGS", cap)
 
 
+INDEX_ON = mock.patch.dict(os.environ, {"BANKR_INDEX_ENABLED": "1"})
+
+
+@INDEX_ON
 class TestHistory(unittest.TestCase):
 
     def test_parallel_read_splits_by_suggestion_and_reads_all(self):
@@ -649,6 +654,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
+@INDEX_ON
 class TestIndexStability(unittest.TestCase):
     """B2: индекс Bankr под правилами стабильности — LRU по записям, защита по памяти, фон, одно построение."""
 
@@ -929,6 +935,7 @@ class TestIndexStability(unittest.TestCase):
         self.assertGreater(stats["est_live"], 0)                                # объём по ответившим участкам
 
 
+@INDEX_ON
 class TestPartialScan(unittest.TestCase):
     """B2: большой токен Bankr при первом скане (индекс строится) — вердикт не лучше RISKY и «Partial scan: …»."""
 
@@ -971,6 +978,72 @@ class TestPartialScan(unittest.TestCase):
         self.assertNotIn("launchpad", r)
 
 
+class TestTooActive(unittest.TestCase):
+    """BANKR_INDEX_ENABLED выключен (по умолчанию): ни одного фонового построения; история больше обычного скана —
+    TOO ACTIVE без вердикта; обычный токен — полный вердикт как раньше."""
+
+    def setUp(self):
+        for p in (mock.patch.dict(os.environ, {"BANKR_INDEX_ENABLED": ""}),
+                  *(mock.patch.dict(x, clear=True) for x in (bankr._INDEX, bankr._INDEX_BUILDING, bankr._INDEX_FAILED,
+                                                             bankr._INDEX_QUEUE, bankr._ACTIVE))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_big_token_too_active_no_build(self):
+        c = Chain()
+        with c.patched(), mock.patch.object(bankr, "FULL_MAX_LOGS", 3), \
+                mock.patch.object(bankr, "build_index", side_effect=AssertionError("no builds")) as bi, \
+                mock.patch.object(bankr, "_WORKER", []) as worker:
+            r = engine.scan(BTOKEN)
+        bi.assert_not_called()
+        self.assertEqual(worker, [])                                        # поток очереди не запускался
+        self.assertEqual((r["band"], r["score"], r["launchpad"]), (d.TOO_ACTIVE, None, "bankr"))
+        self.assertEqual((r["headline"], r["holders"], r["operators"]), (d.ACTIVE_HEADLINE, [], []))
+        self.assertIsNone(r["partial_scan"])
+        v = r["bankr"]["vesting"]
+        self.assertAlmostEqual(v["total_share_supply"], VEST / SUPPLY)
+        self.assertGreater(r["too_active"]["est_logs"], 3)
+        self.assertEqual((bankr._INDEX, bankr._INDEX_QUEUE, bankr._INDEX_BUILDING), ({}, {}, {}))
+        self.assertTrue(bankr.recently_active(BTOKEN))
+        self.assertIsNone(bankr._index_start(BTOKEN, 1, set()))          # и напрямую — ничего
+        self.assertFalse(opmem.worth(r))                                    # не в память операторов
+
+    def test_normal_token_full_verdict_nothing_kept(self):
+        c = Chain()
+        with c.patched():
+            r = engine.scan(BTOKEN)
+        self.assertEqual(r["bankr"]["history"]["mode"], "full")
+        self.assertIsNotNone(r["score"])
+        self.assertNotEqual(r["band"], d.TOO_ACTIVE)
+        self.assertEqual(bankr._INDEX, {})                                  # индекс в памяти не хранится
+        self.assertFalse(bankr.recently_active(BTOKEN))
+
+    def test_same_verdict_as_with_index(self):
+        c = Chain()
+        with c.patched():
+            off = engine.scan(BTOKEN)
+            with mock.patch.dict(os.environ, {"BANKR_INDEX_ENABLED": "1"}):
+                on = engine.scan(BTOKEN)
+        for k in ("score", "band", "gates", "operators", "holders_total"):
+            self.assertEqual(off[k], on[k], k)
+
+    def test_index_endpoint_off(self):
+        import server, urllib.request, urllib.error
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with mock.patch.dict(os.environ, {"BANKR_ENABLED": "1"}):
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(f"http://127.0.0.1:{srv.server_port}/api/index?token=" + BTOKEN)
+                self.assertEqual(cm.exception.code, 404)
+                cm.exception.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+@INDEX_ON
 class TestB2Server(unittest.TestCase):
 
     def test_cache_bypassed_when_index_ready(self):
