@@ -12,6 +12,7 @@ Telegram bot: [@CrawlScanBot](https://t.me/CrawlScanBot)
 
 [![live](https://img.shields.io/badge/live-crawlscan.fun-00c805?style=flat-square\&labelColor=07090b)](https://crawlscan.fun)
 ![chains](https://img.shields.io/badge/chains-Robinhood_%C2%B7_Solana-9fd9ff?style=flat-square\&labelColor=07090b)
+![launchpads](https://img.shields.io/badge/launchpads-Pons_%C2%B7_Flap_%C2%B7_pump.fun-9fd9ff?style=flat-square\&labelColor=07090b)
 ![Robinhood Chain](https://img.shields.io/badge/Robinhood_Chain-4663-9fd9ff?style=flat-square\&labelColor=07090b)
 ![read-only](https://img.shields.io/badge/read--only-no_keys-00c805?style=flat-square\&labelColor=07090b)
 ![python](https://img.shields.io/badge/python-3.12-9fd9ff?style=flat-square\&labelColor=07090b)
@@ -19,7 +20,7 @@ Telegram bot: [@CrawlScanBot](https://t.me/CrawlScanBot)
 [![license](https://img.shields.io/badge/license-MIT-9fd9ff?style=flat-square\&labelColor=07090b)](LICENSE)
 [![tests](https://img.shields.io/github/actions/workflow/status/0xPunisher/crawlscan/tests.yml?branch=main\&style=flat-square\&labelColor=07090b\&label=tests)](https://github.com/0xPunisher/crawlscan/actions/workflows/tests.yml)
 
-![crawlscan](banner.jpg)
+![crawlscan](banner12.jpg)
 
 </div>
 
@@ -41,20 +42,22 @@ The goal is to make a complex on-chain investigation understandable in seconds, 
 
 ### The core idea
 
-Paste a token address. CRAWLSCAN detects the chain automatically from the address format and returns a verdict such as:
+Paste a token address. CRAWLSCAN detects the chain and the launchpad automatically and returns a verdict such as:
 
 > **20 wallets -> 4 operators, biggest holds 38% of float (9% of supply), could move price -45% if sold**
 
 What normally requires manual blockchain analysis is reduced to a few seconds.
 
-### Supported chains
+### Supported chains and launchpads
 
-| Chain              | Launchpads                                   | Explorer links |
-| ------------------ | -------------------------------------------- | -------------- |
-| **Robinhood Chain** | Pons V2 (bonding curve and Uniswap V4 pools) | Robinhood explorer |
-| **Solana**          | pump.fun (bonding curve, PumpSwap and Raydium after migration) | Solscan |
+| Chain               | Launchpads | Explorer links |
+| ------------------- | ---------- | -------------- |
+| **Robinhood Chain** | **Pons V2** (bonding curve and Uniswap V4 pools)<br>**Flap** (bonding curve, then Uniswap V2 after graduation, with optional buy and sell tax) | Robinhood explorer |
+| **Solana**          | **pump.fun** (bonding curve, PumpSwap and Raydium after migration) | Solscan |
 
-**Flap** on Robinhood Chain (bonding curve, then Uniswap V2 after graduation, with optional buy and sell tax) is supported behind `FLAP_ENABLED` and is off by default. With it on, Flap results show the curve progress or the pool, the tax and whether it goes to the dev, a price from the curve while GeckoTerminal doesn't list the token yet, and early buyers through the curve and the pair. The site and the bot mention Flap only when it is on.
+For **Flap** tokens the result also shows the bonding curve progress or the pool, the buy and sell tax and whether it goes to the dev, a price read from the curve while GeckoTerminal doesn't list the token yet, and early buyers through the curve and the pair.
+
+**Bankr** on Robinhood Chain is in progress (see the roadmap).
 
 ## Why CRAWLSCAN is different
 
@@ -97,10 +100,10 @@ That distinction can completely change how a token's distribution should be read
 
 The crawlers start by building the token's real holder picture directly from on-chain data.
 
-* **Robinhood Chain**: the token's full transfer history since launch is read and the holder balances are reconstructed from it.
+* **Robinhood Chain**: the token's transfer history since launch is read and the holder balances are reconstructed from it. Very large histories are read in windows plus per-holder transfers, and repeat scans of the same token only read the new transfers since the last scan.
 * **Solana**: the top holders are read directly from the chain, then each holder's own history is crawled up to the moment it entered the token.
 
-In both cases bonding curves, liquidity pools, lockers, routers and other infrastructure addresses are excluded, so the analysis focuses on actual wallets. Ownership is measured against the **real circulating float**, not against raw supply that sits locked in a curve or pool.
+In both cases bonding curves, liquidity pools, lockers, routers, tax processors and other infrastructure addresses are excluded, so the analysis focuses on actual wallets. Ownership is measured against the **real circulating float**, not against raw supply that sits locked in a curve or pool.
 
 ![crawlscan](screen4.jpg)
 
@@ -113,8 +116,9 @@ Each top holder is analysed across several behavioural dimensions.
 * **History depth**: how much trading activity a wallet had before entry.
 * **Snipers**: wallets entering in the first seconds after launch, and how much of their position they still hold.
 * **Deployer**: what the creator still holds and how it affects concentration.
+* **Locked tokens**: tokens sent to a known locker are shown as locked, not as moved.
 
-If a wallet's entry cannot be read reliably, it is marked as **unread** and left out of the signals instead of being guessed.
+The biggest holders are read first, so the wallets that matter most for the verdict are always covered. If a wallet's entry cannot be read reliably, it is marked as **unread** and left out of the signals instead of being guessed.
 
 ![crawlscan](screen2.jpg)
 
@@ -154,7 +158,7 @@ All signals are combined into a single score from **0 to 100**.
 
 | Signal            | What it measures |
 | ----------------- | ---------------- |
-| **Operator**      | How far the price could fall if the largest detected operator sold everything into the liquidity |
+| **Operator**      | How far the price could fall if the largest detected operator sold everything into the liquidity (adjusted for sell tax on tax tokens) |
 | **Virgin**        | The share of virgin wallets among the top holders |
 | **Transfer**      | How much of the float was received rather than bought |
 | **Sniper**        | How much float early snipers still hold |
@@ -162,7 +166,10 @@ All signals are combined into a single score from **0 to 100**.
 
 Hard rules cover cases where a weighted score alone would be misleading:
 
-* a single operator able to crash the price forces `DANGER`;
+* an operator of **linked wallets** able to crash the price by 50% or more forces `DANGER`;
+* the same applies when that holder is the **deployer**, a **fresh wallet**, or received its tokens **by transfer**;
+* a **single independent holder** who bought with a trading history can still move the price in a thin pool, but on its own this caps the result at `RISKY` with the reason *one holder could move price -X% (thin liquidity)*, because one honest whale is a risk, not a rug;
+* a holder that couldn't be read is never treated as evidence: the result is capped at `RISKY` and marked as such;
 * detected multi-wallet operators or suspicious packs cap the result at `RISKY`;
 * thin liquidity caps the result at `RISKY`;
 * too few holders returns `TOO EARLY`.
@@ -176,9 +183,9 @@ Hard rules cover cases where a weighted score alone would be misleading:
 
 ## Price chart and probably rug
 
-Every scan result has a price chart from GeckoTerminal. It loads separately after the verdict, so it never slows a scan down. The timeframe follows the token's age, and for pump.fun tokens that have migrated, the bonding curve history and the pool are joined into one chart.
+Every scan result has a price chart from GeckoTerminal, with DexScreener as a fallback. It loads separately after the verdict, so it never slows a scan down. The timeframe follows the token's age, and for pump.fun tokens that have migrated, the bonding curve history and the pool are joined into one chart. Liquidity in the header is the sum across all of the token's pools.
 
-When the verdict is `DANGER`, CRAWLSCAN also projects a **probably rug** level. It collects the suspicious supply held by the top holders:
+When the verdict is `DANGER` **and** it comes from a behavioural signal (linked wallets, fresh wallets or transfer supply), CRAWLSCAN also projects a **probably rug** level. It collects the suspicious supply held by the top holders:
 
 * fresh wallets with no trading history;
 * wallets linked into one operator;
@@ -187,9 +194,21 @@ When the verdict is `DANGER`, CRAWLSCAN also projects a **probably rug** level. 
 
 Each wallet is counted once. CRAWLSCAN then estimates how far the price would fall if all of that supply were sold into the current liquidity. If the drop is 40% or more, the chart shows a red dashed arrow from the current price down to that level, labelled `probably rug -X%`, with the reasons and their share of the float below the chart.
 
-How to read it: the arrow is not a prediction of when or whether a dump will happen. It shows how much damage the suspicious holders *could* do right now. The score and the verdict are not affected by the projection. The Telegram bot shows the same projection as one line.
+How to read it: the arrow is not a prediction of when or whether a dump will happen. It shows how much damage the suspicious holders *could* do right now. A token that is only risky because of thin liquidity and independent whales does not get a probably rug label. The score and the verdict are not affected by the projection. The Telegram bot shows the same projection as one line.
 
-## Built for speed
+## Early buyers
+
+Every result also shows the first 20 buyers after launch: how many seconds after launch each one bought, how much, and what they did since (holding all, added, sold part, sold all, moved, locked or burned). Early buyers that sent their tokens to the same wallet are grouped and highlighted.
+
+## Burns and holder rewards
+
+The $CrawlScan token pays its holders back:
+
+* **Burns**: every 12 hours the developer burns tokens from his own supply, sent to the dead address.
+* **Daily holder reward**: once a day one holder wins 10% of the day's creator fees, **paid in ETH**. Every token is a ticket, and the chance is based on the average balance over the whole day, so buying one minute before the draw does nothing.
+* **Verifiable**: the winner is derived from a Robinhood Chain block hash nobody can know in advance. Every draw, payout and burn is listed on the site with a Verify link: [crawlscan.fun/#burns](https://crawlscan.fun/#burns) and [crawlscan.fun/#winners](https://crawlscan.fun/#winners).
+
+## Built for speed and traffic
 
 Analysing wallets one by one would take minutes. CRAWLSCAN runs multiple wallet crawlers in parallel under a hard time budget, so a full verdict arrives in seconds while the interface streams the crawl live.
 
@@ -213,16 +232,25 @@ Verdict
 
 Every crawler move you see on the page is a real step of the scan, not a loading animation.
 
+Under heavy traffic the scanner protects itself instead of falling over:
+
+* a scan queue with a clear *Scanner is busy, try again in a few seconds* when it's full;
+* a per-address limit on new scans, so one script can't take the scanner from everyone else;
+* bounded caches and a memory guard tied to the container limit;
+* the daily draw and payouts run with their own priority and are never slowed down by live scans;
+* page polling for the feed and rewards is cached and paused while the tab is hidden.
+
 ## Technical architecture
 
 CRAWLSCAN is intentionally lightweight.
 
 * **Python 3.12** with the **standard library only**: zero runtime dependencies.
-* **One adapter per chain**: Robinhood Chain and Solana each have their own adapter that turns on-chain data into the same set of facts. The detectors and the scoring are shared and chain-agnostic.
+* **One adapter per chain and launchpad**: Robinhood Chain (Pons, Flap) and Solana each turn on-chain data into the same set of facts. The detectors and the scoring are shared and chain-agnostic.
 * **Alchemy RPC**: read-only access to Robinhood Chain and Solana.
-* **GeckoTerminal**: market data for the token header, with a short timeout so it never blocks a scan.
+* **GeckoTerminal and DexScreener**: market data for the token header, with a short timeout so it never blocks a scan.
 * **Transaction-level trade classification**: real buys are recognised even through bot routers and aggregators.
-* **Parallel crawling** under a hard time budget.
+* **Parallel crawling** under a hard time budget, biggest holders first.
+* **Transfer history cache** between scans of the same token.
 * **Live event stream** from the engine to the page.
 * **Automated tests** on every push.
 * **No private keys**: CRAWLSCAN never signs transactions or touches funds.
@@ -280,10 +308,11 @@ python3 -m unittest discover -s tests -v
 
 ## Telegram bot
 
-[@CrawlScanBot](https://t.me/CrawlScanBot) is a separate service in `bot/` (standard library only). It is a thin client of the CRAWLSCAN API: it never talks to a blockchain, it starts a scan on the website and turns the result into a short verdict with a link to the full report.
+[@CrawlScanBot](https://t.me/CrawlScanBot) is a separate service in `bot/` (standard library only). It is a thin client of the CRAWLSCAN API: it never talks to a blockchain, it starts a scan on the website and turns the result into a short verdict with a link to the full report and a Trade on Axiom button.
 
-* In a private chat: send a token address (Robinhood Chain or Solana), or `/scan <address>`. `/start` and `/help` explain the bot and the verdict.
-* In groups: only `/scan <address>`.
+* In a private chat: send a token address (Robinhood Chain or Solana), or `/scan <address>`. `/start` and `/help` explain the bot and the verdict, `/rewards` shows the next burn and draw and the last winner.
+* **Alerts**: tap **Watch** under a verdict, or open **Watchlist** and add a token with **New**. Watch up to 3 tokens for 7 days and get a message when the verdict moves into or out of `DANGER`, a probably rug warning appears or disappears, the biggest operator starts selling, or the early buyers exit. Remove a token from the Watchlist or with the button under any alert. `/watch`, `/watchlist` and `/unwatch` work too.
+* In groups: only `/scan <address>` and `/rewards`.
 
 ```sh
 # .env
@@ -298,34 +327,58 @@ Only one copy of the bot can poll Telegram at a time.
 
 ### ✅ Shipped
 
-* [x] **Live crawler scanner for Robinhood Chain (Pons V2)**
-* [x] **Operator clustering**: proven links and behavioural packs
-* [x] **Solana support (pump.fun)**: automatic chain detection, Solscan links
-* [x] **Dump-impact scoring** and liquidity guard
-* [x] **Telegram bot**: send a token address and get the verdict, score and key holder signals
-* [x] **Price chart and probably rug projection**
-* [x] **Recently scanned feed** on the homepage
-* [x] **Too established state**: tokens older than 30 days with high liquidity and market cap get an explanation and token stats instead of a full scan
-* [x] **Burns & holder rewards**: the developer burns tokens every 12 hours, and one holder wins daily rewards paid in ETH. Every burn, winner and payout is verifiable onchain, with the full history on the site
-* [x] **Early buyers**: the first 20 buyers after launch, what they did since, and wallets that sent tokens to the same destination
-* [x] **Telegram alerts**: watch up to 3 tokens in the bot and get a message when the verdict, the probably rug projection, the biggest operator or the early buyers change
-* [x] **Flap launchpad** (behind `FLAP_ENABLED`): Flap tokens on Robinhood Chain with bonding curve progress, buy and sell tax, early buyers and the same verdict
+* [x] **Live crawler scanner with operator clustering**
+
+Paste any token and parallel crawlers read every top holder onchain in seconds. Wallets linked by the same buy transaction, a shared distributor or direct transfers are merged into real operators, fresh-wallet packs are flagged, and the biggest operator's dump impact on the price is turned into one clear 0-100 verdict.
+
+* [x] **Two chains, three launchpads**
+
+Robinhood Chain with **Pons** and **Flap**, and Solana with **pump.fun**. The chain and the launchpad are detected automatically from the address. Flap support goes further than a holder check: bonding curve progress, buy and sell tax and whether the tax goes to the dev, all before you buy.
+
+* [x] **Probably rug early warning**
+
+When a setup looks like a rug, the price chart shows how deep the drop could go if the suspicious supply were sold, with the exact wallets and reasons behind it.
+
+* [x] **Early buyers**
+
+The first 20 buyers after launch: how fast they got in, how much they bought, and whether they are still holding, already out, or quietly sending tokens to the same wallet.
+
+* [x] **Telegram bot with live alerts**
+
+[@CrawlScanBot](https://t.me/CrawlScanBot) scans any token in seconds. Add tokens to your Watchlist and the crawlers keep watching them for you: you get a message the moment the verdict turns `DANGER`, a rug warning appears, the biggest operator starts selling or the early buyers exit.
+
+* [x] **$CrawlScan burns and daily holder rewards**
+
+The developer burns tokens from his own supply every 12 hours, and every day one holder wins 10% of the creator fees, paid in ETH. Every burn, draw and payout is verifiable onchain, with the full history on the site.
+
+* [x] **Operator memory: recording**
+
+Every scan is now remembered: linked wallets, packs, snipers, devs and early buyers, across every token anyone scans. The scanner builds its own history of the people behind the wallets and gets smarter every day.
 
 ### 🟢 In progress
 
-* [ ] **Browser extension**
-  Bring CRAWLSCAN into the places where users discover and trade tokens, so a token can be checked without leaving the page.
+* [ ] **Bankr launchpad**
+  Bankr tokens on Robinhood Chain: real price impact read from the pool itself, dev vesting shown as the dev's position, and full holder history even for the busiest tokens.
+
+* [ ] **Premium for $CrawlScan holders**
+  Priority scans when the scanner is busy, bigger watchlists with no time limit and faster alerts, unlocked by holding the token. Verification is a simple onchain action, no wallet connection required.
 
 ### 🔜 Next
 
-* [ ] **All-chain support**
-  More EVM chains and beyond: the same methodology, adapted to each chain's infrastructure.
+* [ ] **Repeat operator detection**
+  Use the operator memory in every verdict: see when the wallets in front of you were linked, bundled or dumping on previous launches.
 
-* [ ] **Operator memory across launches**
-  Recognise wallet clusters and behavioural patterns across multiple launches.
+* [ ] **Partner API**
+  Let other terminals and bots plug CRAWLSCAN verdicts into their products, with keys and limits.
 
 * [ ] **Wallet profiler**
-  Paste a wallet and see its trading history, behaviour and the operators it belongs to.
+  Paste a wallet and see its history across launches, its behaviour and the operators it belongs to.
+
+* [ ] **More chains and launchpads**
+  The same methodology, adapted to each chain's infrastructure.
+
+* [ ] **Browser extension**
+  Check a token without leaving the page where you trade it.
 
 ### 🧠 Intelligence layer
 

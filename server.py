@@ -52,13 +52,17 @@ Alerts, подписки для бота (только при ALERTS_ENABLED=tru
 для Cloudflare; у статуса наград поле now всегда текущее); сбой не кэшируется.
 Новых сканов с одного IP (CF-Connecting-IP) — не больше SCAN_RATE_PER_MIN в минуту, иначе 429 rate_limited с Retry-After;
 user agent crawlscan-bot — SCAN_RATE_BOT_PER_MIN, верный X-Alerts-Secret (наш бот) — без лимита.
-Лента /api/recent кэшируется 15 секунд; запись — после завершения скана, сбой базы скан не ломает.
+Лента /api/recent кэшируется 15 секунд (запись скана сбрасывает кэш; чтение, пересёкшееся с записью, в кэш не идёт);
+запись — после завершения скана, сбой базы скан не ломает (в лог «recent: not saved»).
 При ALERTS_ENABLED=true после скана пишется снимок для alerts (alerts.py, alerts_store.py), так же без влияния на скан;
 изменился важный показатель — уведомление подписчикам в Telegram (alerts_notify.py, свой поток, TG_BOT_TOKEN);
 плановые перепроверки отслеживаемых токенов — alerts_recheck.py (свой поток, уступает живым сканам).
-Не больше 3 сканов одновременно (остальные ждут слота), в очереди — не больше SCAN_QUEUE_MAX; сверх очереди или
-при памяти процесса выше MEMORY_SOFT_LIMIT_MB (memguard.py) новый скан — 503 busy с Retry-After (кэш и уже идущий
-скан того же токена отдаются как раньше). Сбой базы в /api/rewards/* и /api/draw/* — 503, процесс и сканы живут.
+При OPMEM_ENABLED=true результат скана и перепроверки — в очередь памяти операторов (opmem.py: своя база
+memory.db, свой поток записи, токен не чаще раза в OPMEM_MIN_INTERVAL_H); скан запись не ждёт.
+Не больше 3 сканов одновременно (остальные ждут слота), в очереди — не больше SCAN_QUEUE_MAX; сверх очереди — 503 busy
+с Retry-After (кэш и уже идущий скан того же токена отдаются как раньше). Память процесса (memguard.py) выше мягкого
+порога после сброса кэшей — сканы до MAX_CONCURRENT без очереди, выше жёсткого — 503 busy. Раз в минуту в лог
+строка с памятью, числом активных сканов и счётчиками за минуту. Сбой базы в /api/rewards/* и /api/draw/* — 503, процесс и сканы живут.
 PORT из env, по умолчанию 8000.
 """
 import hashlib, hmac, json, os, re, threading, time, uuid
@@ -76,6 +80,7 @@ import early
 import engine
 import market
 import memguard
+import opmem
 import trade
 import draw_service as ds
 import rewards_service as rs
@@ -111,6 +116,7 @@ RECENT_DEFAULT = 12        # записей в ленте по умолчани�
 JOBS = {}                  # job_id -> {"token", "chain", "events", "done", "result", "error", "ts"}
 CHARTS = {}                # token -> {"ok": (ts, удачный ответ) | None, "miss": (ts, пустой ответ) | None}
 RECENT = {}                # limit -> (ts, ответ /api/recent)
+_RECENT_GEN = [0]          # поколение ленты: +1 при каждой записи скана (под _lock)
 BY_TOKEN = {}              # token -> job_id последнего скана
 _lock = threading.Lock()
 
@@ -128,6 +134,7 @@ _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
 SCAN_QUEUE_MAX = 6         # новых сканов ждут слота сверх MAX_CONCURRENT (env SCAN_QUEUE_MAX); дальше — 503 busy
 SCAN_QUEUE_MAX = _env_int("SCAN_QUEUE_MAX", SCAN_QUEUE_MAX)
 _ACTIVE = [0]              # сканов идёт или ждёт слота (под _lock)
+_STATS = {"started": 0, "busy": 0}   # новых сканов и отказов busy с прошлой строки memguard (под _lock)
 RETRY_AFTER = 5            # секунд: заголовок Retry-After у 503 busy
 BUSY = {"error": "busy", "message": "Scanner is busy, try again in a few seconds"}
 # частота новых сканов с одного IP (CF-Connecting-IP): обычный клиент / бот CrawlScan по user agent;
@@ -206,6 +213,7 @@ def _run_job(job_id, token):
                                       "chain": job["chain"]})
             job["done"] = True
     if not err:
+        opmem.record(res)       # только в очередь (OPMEM_ENABLED), запись — в своём потоке
         record_recent(res)
         record_snapshot(res)
 
@@ -225,6 +233,20 @@ def _index_ready(result):
     return bool(ps) and bankr.index_status(result["token"])["state"] == "ready"
 
 
+def _busy(why):
+    with _lock:
+        _STATS["busy"] += 1
+    raise Busy(why)
+
+
+def scan_stats():
+    """Для строки memguard раз в минуту: (активных сканов, хвост строки); счётчики обнуляются."""
+    with _lock:
+        active, started, busy = _ACTIVE[0], _STATS["started"], _STATS["busy"]
+        _STATS["started"] = _STATS["busy"] = 0
+    return active, f", last min: {started} started, {busy} busy"
+
+
 def start_scan(token, client=None):
     """job_id: свежий кэш по токену или уже идущий скан того же токена, иначе новый.
     Новый — только если в очереди есть место и память ниже порога, иначе Busy; и если client (ключ, лимит в минуту)
@@ -241,18 +263,19 @@ def start_scan(token, client=None):
             return jid
         active = _ACTIVE[0]
     if active >= MAX_CONCURRENT + SCAN_QUEUE_MAX:
-        print(f"scan: busy, {active} scans running or queued", flush=True)
-        raise Busy("queue")
-    if memguard.over(live=active):   # вне _lock: сброс кэшей и gc не держат остальные запросы
-        raise Busy("memory")
+        _busy("queue")
+    if memguard.over(live=active, cap=MAX_CONCURRENT):   # вне _lock: сброс кэшей и gc не держат остальные запросы
+        _busy("memory")
     with _lock:
         jid = _reuse(token, now)
         if jid:
             return jid
         if _ACTIVE[0] >= MAX_CONCURRENT + SCAN_QUEUE_MAX:
+            _STATS["busy"] += 1
             raise Busy("queue")
         _rate_take(client, now)
         _ACTIVE[0] += 1
+        _STATS["started"] += 1
         jid = uuid.uuid4().hex[:12]
         JOBS[jid] = {"token": token, "chain": chain, "events": [], "done": False, "result": None, "error": None,
                      "ts": now}
@@ -403,6 +426,7 @@ def record_recent(result):
     try:
         if recent_store().record(result):
             with _lock:
+                _RECENT_GEN[0] += 1
                 RECENT.clear()
     except Exception as e:
         print(f"recent: not saved: {type(e).__name__}: {e}", flush=True)
@@ -643,13 +667,15 @@ def get_recent(limit):
         hit = RECENT.get(limit)
         if hit and now - hit[0] < RECENT_TTL:
             return hit[1]
+        gen = _RECENT_GEN[0]
     try:
         out = {"items": recent_store().recent(limit)}
     except Exception as e:
         print(f"recent: not read: {type(e).__name__}: {e}", flush=True)
         return {"items": []}
     with _lock:
-        RECENT[limit] = (now, out)
+        if _RECENT_GEN[0] == gen:   # пока читали, скан записался — этот ответ уже старый, в кэш не кладём
+            RECENT[limit] = (now, out)
     return out
 
 
@@ -964,6 +990,12 @@ def recheck_scan(token):
     return engine.scan(token)
 
 
+def recheck_done(result):
+    """Принятая перепроверка: снимок alerts и память операторов (та же дедупликация по токену, что у живых)."""
+    opmem.record(result)
+    record_snapshot(result)
+
+
 def start_alerts_rechecker():
     """Плановые перепроверки отслеживаемых токенов — только при ALERTS_ENABLED=true."""
     if not alerts.enabled():
@@ -971,7 +1003,7 @@ def start_alerts_rechecker():
     cfg = alerts_recheck.config()
     print(f"alerts: rechecks every {cfg['recheck_min']} min, max {cfg['max_per_hour']}/hour", flush=True)
     return alerts_recheck.Rechecker(
-        alerts_store, recheck_scan, record_snapshot, notify_message,
+        alerts_store, recheck_scan, recheck_done, notify_message,
         rate_limited=lambda: sum(a.RATE_LIMITED[0] for a in engine.CHAINS.values()), cfg=cfg,
         memory_high=lambda: memguard.over(live=1)).start()
 
@@ -979,6 +1011,8 @@ def start_alerts_rechecker():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"rh-crawler on http://0.0.0.0:{port}", flush=True)
+    print(memguard.status_line(0), flush=True)
+    memguard.start_monitor(scan_stats)
     start_draw_scheduler()
     start_rewards_scheduler()
     start_alerts_rechecker()

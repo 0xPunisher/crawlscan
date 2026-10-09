@@ -691,6 +691,9 @@ const SOL_ACC=a=>'https://solscan.io/account/'+a, SOL_TX=t=>'https://solscan.io/
 const drawShort=a=>a?a.slice(0,4)+'…'+a.slice(-4):'—';
 const BIG_KEYS=['weight','total_weight','r','winner_weight','total'];   // веса — целые базовые единицы: BigInt, без потери точности
 const parseBig=txt=>JSON.parse(txt,(k,v,ctx)=>BIG_KEYS.includes(k)&&typeof v==='number'?BigInt(ctx&&ctx.source!=null?ctx.source:v):v);
+// опросы статуса, ленты и истории — мимо HTTP-кэша браузера: Cloudflare переписывает Cache-Control на max-age=14400
+// (Browser Cache TTL), и браузер часами отдавал бы старый ответ; кэш на сервере и на краю Cloudflare остаётся
+const NO_STORE={cache:'no-store'};
 async function sha256hex(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s)); return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('');}
 const fmtChance=(w,t)=>{if(w==null||!Number(t)) return '—'; const p=Number(w)/Number(t)*100; return p>=10?p.toFixed(1)+'%':p>=0.01?p.toFixed(2)+'%':'<0.01%';};
 const fmtLeft=ms=>{const s=Math.max(0,Math.floor(ms/1000)); return [Math.floor(s/3600),Math.floor(s/60)%60,s%60].map(x=>String(x).padStart(2,'0')).join(':');};
@@ -698,7 +701,7 @@ const fmtLeft=ms=>{const s=Math.max(0,Math.floor(ms/1000)); return [Math.floor(s
 // list_hash = sha256(канонический JSON [[адрес, вес], ...] по адресу, без пробелов);
 // r = int(sha256(blockhash + list_hash), 16) mod сумма_весов; победитель — первый адрес, у которого накопленная сумма > r
 async function verifyDraw(day,base='/api/draw'){   // base: /api/draw (Solana) или /api/rewards (Robinhood)
-  const get=async u=>{const r=await fetch(u); if(!r.ok) throw new Error('http '+r.status); return parseBig(await r.text());};
+  const get=async u=>{const r=await fetch(u,NO_STORE); if(!r.ok) throw new Error('http '+r.status); return parseBig(await r.text());};
   const [p,v]=await Promise.all([get(`${base}/${day}/participants`),get(`${base}/${day}/verify`)]);
   const rows=p.participants.map(x=>[String(x.address),BigInt(x.weight)]).sort((a,b)=>a[0]<b[0]?-1:a[0]>b[0]?1:0);
   const canon='['+rows.map(([a,w])=>'['+JSON.stringify(a)+','+w.toString()+']').join(',')+']';
@@ -720,7 +723,7 @@ class Component extends DCLogic {'''
 rep("class Component extends DCLogic {", DRAW_JS)
 
 rep("  blank(ca){return {", r"""  loadDraw(){   // статус розыгрыша; выключен — секции нет и больше никаких запросов
-    const j=u=>fetch(u).then(r=>r.ok?r.json():null).catch(()=>null);
+    const j=u=>fetch(u,NO_STORE).then(r=>r.ok?r.json():null).catch(()=>null);
     this._drawAt=Date.now();
     j('/api/draw/status').then(st=>{
       if(!st||!st.enabled){this.setState({draw:null}); clearInterval(this._drawT); this._drawT=null; return;}
@@ -915,7 +918,7 @@ rep("class Component extends DCLogic {", RW_JS)
 
 rep("  blank(ca){return {", r"""  loadRewards(){   // статус Rewards & Burns; выключено — секции нет и больше никаких запросов
     this._rwAt=Date.now();
-    fetch('/api/rewards/status').then(r=>r.ok?r.text():null).then(txt=>{
+    fetch('/api/rewards/status',NO_STORE).then(r=>r.ok?r.text():null).then(txt=>{
       const st=txt?parseRw(txt):null;
       if(!st||!st.enabled){this.setState({rw:null}); clearInterval(this._rwT); this._rwT=null; return;}
       this.rwUpdate(st);
@@ -1371,7 +1374,7 @@ rep("a{color:#8a959c;text-decoration:none}", "a{color:#8a959c;text-decoration:no
 rep("  blank(ca){return {", r"""  loadRecent(){   // лента «recently scanned»: только при открытой вкладке и не чаще раза в 20 с
     const t=Date.now(); if(document.hidden||t-(this._recentAt||0)<20000) return;
     this._recentAt=t;
-    fetch('/api/recent?limit=12').then(r=>r.ok?r.json():null)
+    fetch('/api/recent?limit=12',NO_STORE).then(r=>r.ok?r.json():null)
       .then(d=>{if(d&&Array.isArray(d.items)) this.setState({recent:d.items});}).catch(()=>{});
   }
   recentVals(){
@@ -1418,7 +1421,7 @@ RW_HIST_JS = r"""  rwH(kind){   // состояние списка: страни
     const h=this.rwH(kind); if(h.loading) return;
     h.loading=true; h.err=false; this.rwHistSet();
     const before=h.loaded&&h.next!=null?'&before='+h.next:'';
-    fetch(`/api/rewards/history?kind=${kind}&limit=10${before}`).then(r=>r.ok?r.text():Promise.reject(new Error('http '+r.status)))
+    fetch(`/api/rewards/history?kind=${kind}&limit=10${before}`,NO_STORE).then(r=>r.ok?r.text():Promise.reject(new Error('http '+r.status)))
       .then(txt=>{const p=parseRw(txt); h.items=h.items.concat(p.items); h.next=p.next_before; h.total=p.total; h.loaded=true;})
       .catch(()=>{h.err=true;})
       .finally(()=>{h.loading=false; this.rwHistSet(); if(scroll) this.rwHistScroll(kind);});
@@ -1807,7 +1810,7 @@ rep("  blank(ca){return {", """  bankrVals(){   // токен Bankr и флаг 
     const poll=async()=>{
       if(!this.m||this.m.ca!==ca||this.state.view!=='scan'||++n>INDEX_POLL_MAX) return;
       try{
-        const d=await fetch('/api/index?token='+encodeURIComponent(ca)).then(x=>x.ok?x.json():null);
+        const d=await fetch('/api/index?token='+encodeURIComponent(ca),NO_STORE).then(x=>x.ok?x.json():null);
         if(!this.m||this.m.ca!==ca||this.state.view!=='scan') return;
         if(d&&d.state==='ready'){this._rescanned[ca]=true; this.setState({rescanning:true}); setTimeout(()=>{if(this.m&&this.m.ca===ca&&this.state.view==='scan'){this.setState({rescanning:false}); this.startScan(ca,true);}},1200); return;}
         if(d&&!['building','none'].includes(d.state)) return;   // too_large / unavailable — ждать нечего

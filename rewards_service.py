@@ -358,7 +358,8 @@ def verify_json(store, day):
 class Scheduler(threading.Thread):
     """Фоновый поток: розыгрыш в 22:05 UTC за сутки до 22:00 UTC (наверстывает пропущенные), каждые 5 минут —
     сжигания, выплаты и сожжённый сапплай. Ошибки логируются и повторяются позже; поток не падает и не
-    роняет сервер; сканер не затрагивается (общий только лимитер RPS адаптера)."""
+    роняет сервер; сканер не затрагивается (общий только лимитер RPS адаптера). Работа критичная
+    (priority.critical): живым сканам не уступает, защитой по памяти не блокируется, свой лимит CRITICAL_RPS."""
 
     def __init__(self, store, cfg):
         super().__init__(daemon=True, name="rewards-scheduler")
@@ -399,7 +400,7 @@ class Scheduler(threading.Thread):
             log(f"ignored invalid DEV_WALLETS entries: {len(self.cfg['invalid_dev_wallets'])}")
         while not self._stop.is_set():
             try:
-                with priority.background():   # уступает живым сканам, свой лимит BACKGROUND_RPS
+                with priority.critical():   # не уступает живым сканам и не зависит от защиты по памяти; свой лимит CRITICAL_RPS
                     self.tick()
             except Exception:
                 log("tick failed: " + traceback.format_exc(limit=3).replace("\n", " | "))

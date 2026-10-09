@@ -723,6 +723,48 @@ class TestIndexStability(unittest.TestCase):
                 mock.patch.object(memguard, "rss_mb", return_value=10 ** 6):
             self.assertFalse(memguard.near())
 
+    def test_memguard_near_from_container_limit(self):
+        """memfix: мягкий порог — 75% лимита контейнера; построение индекса останавливается с 85% мягкого."""
+        import memguard
+        with mock.patch.dict(os.environ, {"MEMORY_SOFT_LIMIT_MB": ""}), \
+                mock.patch.object(memguard, "cgroup_limit_mb", return_value=8000):
+            self.assertEqual(memguard.soft_limit_mb(), 6000)
+            with mock.patch.object(memguard, "rss_mb", return_value=5200):
+                self.assertTrue(memguard.near())
+                self.assertFalse(memguard.over(live=1, cap=3))           # живые сканы при этом пускаются
+            with mock.patch.object(memguard, "rss_mb", return_value=5000):
+                self.assertFalse(memguard.near())
+
+    def test_build_from_critical_thread_is_background(self):
+        """Построение, запущенное откуда угодно (даже из критичного потока), — фон: уступает живым сканам и
+        не идёт по лимиту критичной работы; критичный запрос его не ждёт."""
+        from chains import priority
+        gate, seen = threading.Event(), []
+
+        def build(t, b, ex, est=None):
+            seen.append((priority.is_critical(), priority.is_background()))
+            gate.wait(5)
+            return True, None
+        with mock.patch.object(bankr, "build_index", side_effect=build), priority.critical():
+            self.assertTrue(bankr._index_start("0xa", 1, set()))
+            for _ in range(200):
+                if seen:
+                    break
+                _t.sleep(0.01)
+            with mock.patch.object(ch._LIMIT, "wait"), mock.patch.object(ch._CRIT_LIMIT, "wait") as cw, \
+                    mock.patch.object(ch._BG_LIMIT, "wait") as bgw, priority.live():
+                t0 = _t.time()
+                ch._rate_limit()                                             # награды во время построения
+                self.assertLess(_t.time() - t0, 0.2)
+                cw.assert_called_once()
+                bgw.assert_not_called()
+            gate.set()
+            for _ in range(200):
+                if not bankr._INDEX_BUILDING:
+                    break
+                _t.sleep(0.01)
+        self.assertEqual(seen, [(False, True)])
+
     def test_start_limits(self):
         gate, seen = threading.Event(), []
 

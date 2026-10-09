@@ -1,7 +1,7 @@
 """Лента «Recently scanned»: SQLite, тот же файл, что у розыгрыша (DRAW_DB_PATH, по умолчанию ./data/draw.db),
 таблица recent_scans. Один токен — одна запись: новый скан того же токена обновляет её и поднимает наверх.
 Пишется только завершённый скан с вердиктом (ошибки и «not a token address» сюда не попадают).
-launchpad — "flap" у токенов Flap (result["launchpad"]), иначе NULL; колонка добавляется в старую базу при старте.
+launchpad — "flap" / "bankr" у токенов Flap и Bankr (result["launchpad"]), иначе NULL; колонка добавляется в старую базу при старте.
 """
 import os, time
 
