@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Flap launchpad on Robinhood Chain, behind `FLAP_ENABLED` (off by default). Results show a Flap badge, the bonding curve progress or Uniswap V2, the buy and sell tax, "tax goes to the dev" when the dev receives it, and a link to flap.sh. Tokens still on the curve get their name and ticker from the contract and a price from the curve times ETH/USD; the chart card says the chart appears after the token graduates. Early buyers work for Flap tokens (buys through the curve and through the pair). The bot adds a "Flap · bonding curve 26% · tax 3%/3%" line, the recently scanned feed shows a Flap badge, and the site lists Flap next to Pons only when it is on.
 - `GET /api/config` returns `flap`, `GET /api/recent` returns `launchpad`.
 - Early buyers who send their tokens to a known token locker (Sablier) now show "locked in Sablier" instead of "moved", on Pons and Flap tokens. Locked tokens don't count as an exit, also for early buyer alerts.
+- Operator memory, behind `OPMEM_ENABLED` (off by default): finished scans are recorded to a separate SQLite file (`OPMEM_DB_PATH`, by default `memory.db` next to the draw database) by a background writer, at most once per token per `OPMEM_MIN_INTERVAL_H` hours. Record only: verdicts don't use it yet, and scans never wait for it. `scripts/opmem_stats.py` prints what has been collected.
 
 ### Changed
 
