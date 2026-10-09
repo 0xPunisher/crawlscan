@@ -325,30 +325,35 @@ Only one copy of the bot can poll Telegram at a time.
 
 ## Roadmap
 
-## Roadmap
-
 ### ✅ Shipped
 
 * [x] **Live crawler scanner with operator clustering**
-  Paste any token and parallel crawlers read every top holder onchain in seconds. Wallets linked by the same buy transaction, a shared distributor or direct transfers are merged into real operators, fresh-wallet packs are flagged, and the biggest operator's dump impact on the price is turned into one clear 0-100 verdict.
+
+Paste any token and parallel crawlers read every top holder onchain in seconds. Wallets linked by the same buy transaction, a shared distributor or direct transfers are merged into real operators, fresh-wallet packs are flagged, and the biggest operator's dump impact on the price is turned into one clear 0-100 verdict.
 
 * [x] **Two chains, three launchpads**
-  Robinhood Chain with **Pons** and **Flap**, and Solana with **pump.fun**. The chain and the launchpad are detected automatically from the address. Flap support goes further than a holder check: bonding curve progress, buy and sell tax and whether the tax goes to the dev, all before you buy.
+
+Robinhood Chain with **Pons** and **Flap**, and Solana with **pump.fun**. The chain and the launchpad are detected automatically from the address. Flap support goes further than a holder check: bonding curve progress, buy and sell tax and whether the tax goes to the dev, all before you buy.
 
 * [x] **Probably rug early warning**
-  When a setup looks like a rug, the price chart shows how deep the drop could go if the suspicious supply were sold, with the exact wallets and reasons behind it.
+
+When a setup looks like a rug, the price chart shows how deep the drop could go if the suspicious supply were sold, with the exact wallets and reasons behind it.
 
 * [x] **Early buyers**
-  The first 20 buyers after launch: how fast they got in, how much they bought, and whether they are still holding, already out, or quietly sending tokens to the same wallet.
+
+The first 20 buyers after launch: how fast they got in, how much they bought, and whether they are still holding, already out, or quietly sending tokens to the same wallet.
 
 * [x] **Telegram bot with live alerts**
-  [@CrawlScanBot](https://t.me/CrawlScanBot) scans any token in seconds. Add tokens to your Watchlist and the crawlers keep watching them for you: you get a message the moment the verdict turns `DANGER`, a rug warning appears, the biggest operator starts selling or the early buyers exit.
+
+[@CrawlScanBot](https://t.me/CrawlScanBot) scans any token in seconds. Add tokens to your Watchlist and the crawlers keep watching them for you: you get a message the moment the verdict turns `DANGER`, a rug warning appears, the biggest operator starts selling or the early buyers exit.
 
 * [x] **$CrawlScan burns and daily holder rewards**
-  The developer burns tokens from his own supply every 12 hours, and every day one holder wins 10% of the creator fees, paid in ETH. Every burn, draw and payout is verifiable onchain, with the full history on the site.
+
+The developer burns tokens from his own supply every 12 hours, and every day one holder wins 10% of the creator fees, paid in ETH. Every burn, draw and payout is verifiable onchain, with the full history on the site.
 
 * [x] **Operator memory: recording**
-  Every scan is now remembered: linked wallets, packs, snipers, devs and early buyers, across every token anyone scans. The scanner builds its own history of the people behind the wallets and gets smarter every day.
+
+Every scan is now remembered: linked wallets, packs, snipers, devs and early buyers, across every token anyone scans. The scanner builds its own history of the people behind the wallets and gets smarter every day.
 
 ### 🟢 In progress
 
