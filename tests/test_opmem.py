@@ -64,7 +64,7 @@ class TestRows(unittest.TestCase):
         scan, ops, wal = opmem.rows(result(limited=True), 100)
         self.assertEqual(scan | {}, {"token": T1, "chain": "robinhood", "launchpad": None, "ts": 100, "band": "RISKY",
                                      "score": 50, "limited": 1, "partial": 0, "holders_total": 120, "unread": 1,
-                                     "deployer": DEV})
+                                     "deployer": DEV} | {c: None for c, _ in opmem.MARKET_COLUMNS})
         self.assertEqual(len(ops), 1)                      # одиночный кошелёк — не оператор
         self.assertEqual(ops[0]["operator_id"], opmem.operator_id([C, A, B]))
         self.assertEqual(ops[0]["kinds"], "distributor,same_tx")
