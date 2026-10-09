@@ -594,6 +594,25 @@ class TestPremiumAPI(Site):
         self.assertEqual(self.req("/api/premium/admin_unlink", {"wallet": "nope"})[0], 400)
         self.assertEqual(self.req("/api/premium/reserve", {"user_id": U2, "wallet": W1})[1]["state"], "reserved")
 
+    def test_real_service_and_start_do_not_hang(self):
+        """premium_svc() и start_premium() как на сервере (не подставной сервис): без взаимоблокировки замков."""
+        out = {}
+        with mock.patch.object(premium_service.Service, "start", lambda svc: svc):   # поток не запускаем
+            t = threading.Thread(target=lambda: out.update(svc=server.premium_svc(), started=server.start_premium()),
+                                 daemon=True)
+            t.start()
+            t.join(5)
+        self.assertFalse(t.is_alive(), "premium_svc() / start_premium() зависли")
+        self.assertIs(out["svc"], out["started"])
+        self.assertIs(out["svc"].store, server.premium_store())
+
+    def test_status_of_linked_user_uses_real_service(self):
+        self.verify(U1, W1, 600_000 * E18)
+        server._premium["svc"] = None                    # статус создаёт сервис сам (decimals)
+        with mock.patch.object(premium_service.Service, "decimals", lambda svc: 18):
+            code, st = self.req(f"/api/premium/status?user_id={U1}")
+        self.assertEqual((code, st["balance_tokens"]), (200, 600_000))
+
     def test_db_failure_is_500(self):
         with mock.patch.object(PremiumStore, "link_of", side_effect=RuntimeError("locked")):
             self.assertEqual(self.req("/api/premium/status?user_id=1")[0], 500)

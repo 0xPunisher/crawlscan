@@ -690,11 +690,13 @@ def premium_downgrade(user_id):
 
 
 def premium_svc():
-    """Сервис премиума (поток стартует start_premium); здесь — для decimals токена в статусе."""
+    """Сервис премиума (поток стартует start_premium); здесь — для decimals токена в статусе.
+    Хранилище берётся до _stores_lock: premium_store() сам берёт этот замок (он не реентерабельный)."""
+    store = premium_store()
     with _stores_lock:
         if _premium["svc"] is None:
             from chains import robinhood
-            _premium["svc"] = premium_service.Service(premium_store(), notify_message, premium_upgrade,
+            _premium["svc"] = premium_service.Service(store, notify_message, premium_upgrade,
                                                       premium_downgrade, robinhood)
         return _premium["svc"]
 
