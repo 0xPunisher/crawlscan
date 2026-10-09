@@ -14,7 +14,7 @@ Dump impact и probably rug — по котировкам V4Quoter (eth_call, б
 Вестинг дева (15% сапплая на контракте токена у большинства запусков): контракт — не холдер, остаток приписан
 бенефициару (деву); ещё не разблокированное в q для impact не входит (продать сейчас нельзя).
 Исследование и замеры — scripts/probe_bankr.py (локально), раздел «Bankr» в DEV_NOTES."""
-import math, os, re, sys, threading, time
+import math, os, random, re, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
 from chains import flap, priority
@@ -85,12 +85,15 @@ READ_TARGET = 8_000                # переполненный участок �
 WAVE_MAX = 3.0                     # секунд: с потолком (cap) первая волна дольше не ждёт — история велика (у плотных
                                    # участков RPC отвечает «Query timeout» по ~10 с: musebook ждал волну 14 с)
 READ_WORKERS = 12                  # запросов getLogs одновременно (ответ на 10K логов идёт ~1.5–2 с; RPS — общий лимитер)
-READ_WORKERS_BG = 3                # в фоне (BACKGROUND_RPS ~2, ответ ~1.5 с): больше в полёте не нужно, а страница в
-                                   # полёте — до ~25 МБ (сырой JSON + разбор; musebook: пик RSS +270 МБ при 4 потоках)
+READ_WORKERS_BG = 2                # в фоне (BACKGROUND_RPS ~2, короткие страницы ~0.5 с): больше в полёте не нужно
+READ_TARGET_BG = 3_000             # фон (строгий): логов на страницу — запрос в полёте при начале живого скана короткий
+READ_CHUNK_MIN_BG = 500            # ... и участок первой волны фона не короче стольких блоков
 INDEX_MAX = 20                     # токенов в индексе (LRU) ...
 INDEX_MAX_ENTRIES = 500_000        # ... и записей во всех токенах (балансы + входы + продажи + рёбра; ~270 байт запись —
                                    # до ~135 МБ; musebook 2.4M переводов — 179K записей, 46 МБ). Токен больше — не индексируем
-INDEX_BUILDS_MAX = 1               # индексов строится одновременно (остальные — при следующем скане)
+INDEX_QUEUE_MAX = 5                # токенов ждут построения (строится один, по порядку; повтор не добавляется)
+ETA_WARMUP_S, ETA_WARMUP_REQ = 60, 50   # ETA по фактической скорости — после стольких секунд активного чтения и запросов
+MEMORY_WAIT_S = 30                 # секунд: память у порога — новое построение не начинается, проверка снова через столько
 INDEX_RETRY_S = 600                # секунд: после сбоя или отказа по памяти построение не повторяется столько
 INDEX_TOO_LARGE_S = 6 * 3600       # ... после «больше INDEX_MAX_ENTRIES» — столько
 LOGS_PER_REQUEST = 3_000           # логов на HTTP при полном чтении (musebook: 2.43M / 820, с делением по таймаутам) — для ETA
@@ -102,9 +105,12 @@ for _k in ("INDEX_MAX_ENTRIES",):  # env BANKR_INDEX_MAX_ENTRIES
         pass
 _SUGGEST = re.compile(r"\[(0x[0-9a-fA-F]+),\s*(0x[0-9a-fA-F]+)\]")
 _INDEX = {}                        # token -> {"head", "bal", "first", "sold", "edges", "logs", "n", "built"}; порядок = LRU
-_INDEX_BUILDING = {}               # token -> {"started", "eta_s", "gen"} — строится сейчас
+_INDEX_BUILDING = {}               # token -> {"started", "eta_s", "est_total", "stats"} — строится сейчас
 _INDEX_FAILED = {}                 # token -> (до какого времени не строить, причина: "too_large" | "memory" | "error")
+_INDEX_QUEUE = {}                  # token -> {"block", "excluded", "est_total", "queued"}; порядок = очередь
 _INDEX_LOCK = threading.Lock()
+_INDEX_CV = threading.Condition(_INDEX_LOCK)
+_WORKER = []                       # поток очереди построений (один, запускается с первой постановкой)
 _GEN = [0]                         # drop_caches увеличивает: идущие построения прерываются
 memory_high = lambda: False        # server: память процесса близко к порогу (memguard) — построение прерывается
 after_build = lambda: None         # server: после построения — gc и malloc_trim (memguard.trim): страницы отданы ОС
@@ -283,19 +289,24 @@ def impact_curve(qs, raw):
     return out
 
 
-def _read_all(token, lo, hi, sink, cap=None, until=None, stats=None):
+def _read_all(token, lo, hi, sink, cap=None, until=None, stats=None, est=None):
     """Все переводы токена в [lo, hi] параллельно -> (логов, дочитано). sink(переводы) — под замком, по страницам.
     Первая волна — до READ_CHUNKS равных участков (не короче READ_CHUNK_MIN блоков); ответ «больше 10K логов» с подсказкой [lo, b] — читаем [lo, b],
     остаток делим по плотности подсказки на подучастки ~READ_TARGET логов (параллельно), без подсказки — пополам.
     cap — оценка объёма (прочитанное + плотность × блоки переполненных участков первой волны; растёт по мере ответов)
     больше cap или первая волна не ответила за WAVE_MAX — стоп, не дочитано. until — срок (unix-время): вышел — стоп, не дочитано.
-    stats (dict) — сюда "est_total": оценка всей истории (оценка ответивших участков первой волны на все участки).
+    stats (dict) — сюда "est_total": оценка всей истории (оценка ответивших участков первой волны на все участки);
+    по ходу — "req" (HTTP getLogs этого чтения) и "logs".
+    Строгий фон (priority.background(strict=True): построение индекса) — короткие страницы (READ_TARGET_BG логов,
+    первая волна — по оценке est (логов всего) на столько же участков): запрос в полёте, когда начинается живой скан,
+    короткий; ответ, пришедший во время живого скана, разбирается только после его конца.
     sink может бросить StopRead — чтение прерывается (не дочитано)."""
     if lo > hi:
         return 0, True
     lock, done = threading.Lock(), threading.Event()
-    st = {"pending": 0, "logs": 0, "est": 0, "wave": 0, "waves": 0, "answered": 0, "stop": False}
-    bg = priority.is_background()
+    st = {"pending": 0, "logs": 0, "est": 0, "wave": 0, "waves": 0, "answered": 0, "stop": False, "req": 0}
+    bg, strict = priority.is_background(), priority.is_strict()
+    target = READ_TARGET_BG if strict else READ_TARGET
     pool = ThreadPoolExecutor(max_workers=READ_WORKERS_BG if bg else READ_WORKERS,
                               thread_name_prefix=f"{priority.BG}-bankr" if bg else "bankr")
 
@@ -311,6 +322,8 @@ def _read_all(token, lo, hi, sink, cap=None, until=None, stats=None):
             st["est"] += est
             st["wave"] -= wave
             st["answered"] += wave
+            if stats is not None and wave and st["answered"] >= max(5, st["waves"] // 20):
+                stats["est_live"] = int(st["est"] * st["waves"] / st["answered"])   # по ответившим участкам волны
             if cap is not None and (st["est"] > cap or st["logs"] > cap):
                 st["stop"] = True
             st["pending"] -= 1
@@ -318,12 +331,22 @@ def _read_all(token, lo, hi, sink, cap=None, until=None, stats=None):
                 done.set()
 
     def run(a, b, wave):
+        if strict:
+            with priority.background(strict=True):   # tls пула: строгое ожидание живых сканов перед каждым запросом
+                return _run(a, b, wave)
+        return _run(a, b, wave)
+
+    def _run(a, b, wave):
         est = 0
         try:
             if st["stop"] or (until is not None and time.time() > until):
                 st["stop"] = True
                 return
             flt = {"fromBlock": hex(a), "toBlock": hex(b), "address": token, "topics": [ch.TRANSFER_TOPIC]}
+            with lock:
+                st["req"] += 1
+                if stats is not None:
+                    stats["req"] = st["req"]
             try:
                 logs = ch.rpc("eth_getLogs", [flt])
             except RuntimeError as e:
@@ -332,9 +355,13 @@ def _read_all(token, lo, hi, sink, cap=None, until=None, stats=None):
                     c = int(m.group(2), 16)
                     dens = flap.PAGE_LOGS / (c - a + 1)
                     est = int(dens * (b - a + 1))
-                    k = max(1, math.ceil(dens * (b - c) / READ_TARGET))
+                    k = max(1, math.ceil(dens * (b - c) / target))
                     step = (b - c) // k + 1
-                    submit(a, c)
+                    j = max(1, min(c - a + 1, math.ceil(flap.PAGE_LOGS / target))) if strict else 1   # [a, c] ~ PAGE_LOGS логов
+                    sp = (c - a) // j + 1
+                    for i in range(j):
+                        if a + i * sp <= c:
+                            submit(a + i * sp, min(c, a + (i + 1) * sp - 1))
                     for i in range(k):
                         x = c + 1 + i * step
                         if x <= b:
@@ -350,10 +377,14 @@ def _read_all(token, lo, hi, sink, cap=None, until=None, stats=None):
                 submit((a + b) // 2 + 1, b)
                 est = len(logs) * 2
                 return
+            if strict:
+                priority.wait_turn()   # живой скан начался, пока запрос летел: разбор и запись — после него
             page = [t for t in map(flap._transfer, logs) if t]
             est = len(page)
             with lock:
                 st["logs"] += len(page)
+                if stats is not None:
+                    stats["logs"] = st["logs"]
                 if not st["stop"]:
                     sink(page)
         except StopRead:
@@ -364,13 +395,17 @@ def _read_all(token, lo, hi, sink, cap=None, until=None, stats=None):
         finally:
             finish(wave, est if wave else 0)
 
-    step = (hi - lo) // max(1, min(READ_CHUNKS, (hi - lo + 1) // READ_CHUNK_MIN)) + 1
+    chunks = min(READ_CHUNKS, (hi - lo + 1) // READ_CHUNK_MIN)
+    if strict and est:   # фон: сразу короткие участки по оценке (огромные участки — «Query timeout» по ~10 с)
+        chunks = min(math.ceil(est / target), (hi - lo + 1) // READ_CHUNK_MIN_BG)
+    step = (hi - lo) // max(1, chunks) + 1
     with lock:
         st["pending"] += 1   # держим, пока раздаём первую волну
-    for i in range(READ_CHUNKS):
-        a = lo + i * step
-        if a <= hi:
-            submit(a, min(hi, a + step - 1), wave=True)
+    starts = [lo + i * step for i in range(max(1, chunks) if strict and est else READ_CHUNKS) if lo + i * step <= hi]
+    if strict and est:
+        random.shuffle(starts)   # первая волна — случайная выборка участков: оценка объёма на ходу без перекоса
+    for a in starts:
+        submit(a, min(hi, a + step - 1), wave=True)
     finish(False, 0)
     if cap is not None:   # первая волна долго — история велика: не ждём (оценке без её ответов не на что опереться)
         t_wave = time.time() + WAVE_MAX
@@ -479,17 +514,17 @@ def drop_caches():
 
 
 def build_index(token, launch_block, excluded, est_total=None):
-    """Индекс токена: вся история с запуска (в фоне: BACKGROUND_RPS, READ_WORKERS_BG, уступает живым сканам).
-    Считается по страницам — все переводы в памяти не держим (musebook: 2.4M). Прерывается (False, причина): больше
-    INDEX_MAX_ENTRIES записей ("too_large"), память близко к порогу или drop_caches ("memory"). -> (готов, причина)."""
+    """Индекс токена: вся история с запуска (строгий фон: BACKGROUND_RPS, READ_WORKERS_BG, короткие страницы, пауза на
+    время живых сканов). Считается по страницам — все переводы в памяти не держим (musebook: 2.4M). Прерывается
+    (False, причина): больше INDEX_MAX_ENTRIES записей ("too_large"), память близко к порогу или drop_caches
+    ("memory"). -> (готов, причина)."""
     head = ch.block_number()
     ix = _index_new()
     with _INDEX_LOCK:
         gen = _GEN[0]
         job = _INDEX_BUILDING.get(token)
     why = []
-    t0, total = time.time(), max(1, head - launch_block + 1)
-    done_blocks = [0]
+    stats = job["stats"] if job is not None else {}
 
     def sink(page):
         if ix["n"] > INDEX_MAX_ENTRIES:
@@ -499,12 +534,8 @@ def build_index(token, launch_block, excluded, est_total=None):
             why.append("memory")
             raise StopRead
         _index_apply(ix, page, excluded)
-        if job is not None and page:   # ETA по прочитанному: логов против оценки всей истории
-            el = time.time() - t0
-            if est_total and el > 10:
-                job["eta_s"] = int(el * max(0, est_total - ix["logs"]) / max(1, ix["logs"]))
 
-    n, complete = _read_all(token, launch_block, head, sink)
+    n, complete = _read_all(token, launch_block, head, sink, stats=stats, est=est_total)
     if not complete:
         return False, (why or ["error"])[0]
     ix.update(head=head, built=time.time())
@@ -514,64 +545,125 @@ def build_index(token, launch_block, excluded, est_total=None):
 
 
 def index_eta(est_total):
-    """Секунд до готового индекса по оценке истории: HTTP ≈ логов / LOGS_PER_REQUEST под BACKGROUND_RPS."""
+    """Секунд на построение по оценке истории (без пауз на живые сканы): HTTP ≈ логов / LOGS_PER_REQUEST под
+    BACKGROUND_RPS."""
     rps = priority.background_rps() or RPS
     return int((est_total or FULL_MAX_LOGS) / LOGS_PER_REQUEST / rps) + 5
 
 
+def _job_left(job, now):
+    """Под _INDEX_LOCK: (секунд до конца идущего построения, замедление против оценки ≥ 1). Объём — оценка по
+    ответившим участкам первой волны (случайная выборка), иначе — проба скана. Скорость — по активному времени
+    (паузы на живые сканы не в счёт: их не предсказать); пока прочитано мало — по оценке index_eta."""
+    st = job["stats"]
+    est = st.get("est_live") or job.get("est_total") or FULL_MAX_LOGS
+    logs, req = st.get("logs", 0), st.get("req", 0)
+    active = (now - job["started"]) - (priority.live_seconds() - job.get("live0", 0.0))
+    if active < ETA_WARMUP_S or logs <= 0 or req < ETA_WARMUP_REQ:   # сначала — переполненные участки (подсказки без логов)
+        return index_eta(est) * max(0.0, 1 - logs / est) if logs else max(0, index_eta(est) - max(0, active)), 1.0
+    rate = logs / active                                     # логов в секунду активного чтения
+    slow = max(1.0, index_eta(logs) / active) if logs else 1.0
+    return max(0, est - logs) / rate, slow
+
+
 def _index_start(token, launch_block, excluded, est_total=None):
-    """Построение индекса в фоновом потоке (один на токен, не больше INDEX_BUILDS_MAX сразу) -> запущено ли."""
+    """Индекс токена — в очередь построений (поток recheck-bankr-index строит по одному, по порядку)
+    -> "building" | "queued" | "queue_full" | None (уже есть или недавно не удалось — не нужно)."""
     now = time.time()
-    with _INDEX_LOCK:
+    with _INDEX_CV:
         failed = _INDEX_FAILED.get(token)
-        if failed and failed[0] > now:
-            return False
-        if (token in _INDEX_BUILDING or token in _INDEX or len(_INDEX_BUILDING) >= INDEX_BUILDS_MAX
-                or memory_high()):
-            return False
-        _INDEX_BUILDING[token] = {"started": now, "eta_s": index_eta(est_total), "est_total": est_total}
+        if token in _INDEX or failed and failed[0] > now:
+            return None
+        if token in _INDEX_BUILDING:
+            return "building"
+        if token in _INDEX_QUEUE:
+            return "queued"
+        if len(_INDEX_QUEUE) >= INDEX_QUEUE_MAX:
+            return "queue_full"
+        _INDEX_QUEUE[token] = {"block": launch_block, "excluded": excluded, "est_total": est_total, "queued": now}
+        if not _WORKER or not _WORKER[0].is_alive():
+            _WORKER[:] = [threading.Thread(target=_index_worker, name=f"{priority.BG}-bankr-index", daemon=True)]
+            _WORKER[0].start()
+        _INDEX_CV.notify_all()
+        return "queued"
 
-    def job():
-        t0, ok, why = time.time(), False, "error"
-        r0 = ch.REQUESTS[0]
+
+def _index_worker():
+    """Очередь построений: по одному, по порядку. Память у порога — новое не начинается (ждём MEMORY_WAIT_S);
+    все запросы — строгий фон (без живых сканов, BACKGROUND_RPS)."""
+    with priority.background(strict=True):
+        while True:
+            with _INDEX_CV:
+                while not _INDEX_QUEUE:
+                    _INDEX_CV.wait()
+            if memory_high():
+                with _INDEX_CV:
+                    _INDEX_CV.wait(MEMORY_WAIT_S)
+                continue
+            priority.wait_turn()   # не начинать во время живого скана
+            with _INDEX_CV:
+                if not _INDEX_QUEUE:
+                    continue
+                token = next(iter(_INDEX_QUEUE))
+                job = _INDEX_QUEUE.pop(token)
+                if token in _INDEX:
+                    continue
+                _INDEX_BUILDING[token] = {"started": time.time(), "eta_s": index_eta(job["est_total"]),
+                                          "est_total": job["est_total"], "stats": {}, "live0": priority.live_seconds()}
+            _index_run(token, job)
+
+
+def _index_run(token, job):
+    t0, ok, why = time.time(), False, "error"
+    r0 = ch.REQUESTS[0]
+    try:
+        ok, why = build_index(token, job["block"], job["excluded"], job["est_total"])
+        ix = _INDEX.get(token) or {}
+        print(f"bankr: index {token} {'built' if ok else 'stopped (' + why + ')'} in {time.time() - t0:.0f}s"
+              + (f", {ix.get('logs')} logs, {ix.get('n')} entries" if ok else "")
+              + f", ~{ch.REQUESTS[0] - r0} HTTP (all threads), queue {len(_INDEX_QUEUE)}", flush=True)
+    except Exception as e:
+        print(f"bankr: index {token} failed: {type(e).__name__}: {e}", flush=True)
+    finally:
         try:
-            with priority.background():
-                ok, why = build_index(token, launch_block, excluded, est_total)
-            ix = _INDEX.get(token) or {}
-            print(f"bankr: index {token} {'built' if ok else 'stopped (' + why + ')'} in {time.time() - t0:.0f}s"
-                  + (f", {ix.get('logs')} logs, {ix.get('n')} entries" if ok else "")
-                  + f", ~{ch.REQUESTS[0] - r0} HTTP (all threads)", flush=True)
-        except Exception as e:
-            print(f"bankr: index {token} failed: {type(e).__name__}: {e}", flush=True)
-        finally:
-            try:
-                after_build()
-            except Exception:
-                pass
-            with _INDEX_LOCK:
-                _INDEX_BUILDING.pop(token, None)
-                if not ok:
-                    _INDEX_FAILED[token] = (time.time() + (INDEX_TOO_LARGE_S if why == "too_large" else INDEX_RETRY_S),
-                                            why)
-
-    threading.Thread(target=job, name=f"{priority.BG}-bankr-index", daemon=True).start()
-    return True
+            after_build()
+        except Exception:
+            pass
+        with _INDEX_LOCK:
+            _INDEX_BUILDING.pop(token, None)
+            if not ok:
+                _INDEX_FAILED[token] = (time.time() + (INDEX_TOO_LARGE_S if why == "too_large" else INDEX_RETRY_S),
+                                        why)
 
 
 def index_status(token):
-    """{"state": "ready" | "building" | "too_large" | "unavailable" | "none", "eta_s"} — для сайта (перескан, когда
-    индекс готов) и сообщения частичного скана."""
+    """{"state": "ready" | "building" | "queued" | "queue_full" | "too_large" | "unavailable" | "none", "eta_s"[,
+    "position"]} — для сайта (перескан, когда индекс готов) и сообщения частичного скана. queued: position — место в
+    очереди (1 — следующий), eta_s — остаток идущего построения + построения впереди и своё (с замедлением идущего)."""
     token = token.lower()
+    now = time.time()
     with _INDEX_LOCK:
         if token in _INDEX:
             return {"state": "ready", "eta_s": 0}
         job = _INDEX_BUILDING.get(token)
         if job:
-            left = job["eta_s"] - (time.time() - job["started"]) if job["eta_s"] is not None else None
-            return {"state": "building", "eta_s": max(15, int(left)) if left is not None else None}
+            return {"state": "building", "eta_s": max(15, int(_job_left(job, now)[0]))}
+        if token in _INDEX_QUEUE:
+            left, slow = 0.0, 1.0
+            for b in _INDEX_BUILDING.values():
+                l, slow = _job_left(b, now)
+                left += l
+            order = list(_INDEX_QUEUE)
+            pos = order.index(token) + 1
+            left += sum(index_eta(_INDEX_QUEUE[t]["est_total"]) * slow for t in order[:pos])
+            if pos == 1 and not _INDEX_BUILDING and not memory_high():   # впереди никого: начнётся после живых сканов
+                return {"state": "building", "eta_s": max(15, int(left))}
+            return {"state": "queued", "eta_s": max(15, int(left)), "position": pos}
         failed = _INDEX_FAILED.get(token)
-        if failed and failed[0] > time.time():
+        if failed and failed[0] > now:
             return {"state": "too_large" if failed[1] == "too_large" else "unavailable", "eta_s": None}
+        if len(_INDEX_QUEUE) >= INDEX_QUEUE_MAX:
+            return {"state": "queue_full", "eta_s": None}
     return {"state": "none", "eta_s": None}
 
 
@@ -631,7 +723,7 @@ def history(token, launch_block, supply, excluded, deadline=None):
     probe_s = round(time.time() - t0, 1)
     trs = None   # прочитанное пробой не держим: окна Flap читают заново
     est = max(stats.get("est_total") or 0, n, cap + 1)
-    started = _index_start(token, launch_block, excluded, est)
+    started = _index_start(token, launch_block, excluded, est) in ("building", "queued")
     transfers, base, info, infra = flap.history(token, launch_block, supply, excluded, deadline)
     ixs = index_status(token)
     info = dict(info, index=ixs["state"], index_eta_s=ixs["eta_s"], index_started=started, full_probe_logs=n,

@@ -47,22 +47,38 @@ class ScanError(Exception):
 
 PARTIAL_BUILDING = "Partial scan: building the full holder history, check again in {eta}"
 PARTIAL_TOO_LARGE = "Partial scan: the holder history is too large to read in full, top holders are approximate"
+PARTIAL_QUEUED = "Partial scan: full holder history queued: {pos} in line, check again in {eta}"
+PARTIAL_QUEUE_FULL = "Partial scan: full history is queued, check again later"
 PARTIAL_LATER = "Partial scan: the full holder history is not available right now, check again later"
 
 
 def bankr_partial(token, hist):
-    """Частичный скан Bankr -> {"state", "eta_s", "message"} (state — bankr.index_status: building | too_large |
-    unavailable | none | ready). ready — индекс достроился, пока шёл скан: следующий скан будет полным."""
+    """Частичный скан Bankr -> {"state", "eta_s", "message"[, "position"]} (state — bankr.index_status: building |
+    queued | queue_full | too_large | unavailable | none | ready). ready — индекс достроился, пока шёл скан: следующий
+    скан будет полным."""
     st = bankr.index_status(token)
     state, eta = st["state"], st["eta_s"]
     if state in ("building", "ready"):
-        mins = math.ceil((eta or 60) / 60)
-        msg = PARTIAL_BUILDING.format(eta="about a minute" if mins <= 1 or state == "ready" else f"about {mins} minutes")
+        msg = PARTIAL_BUILDING.format(eta="about a minute" if state == "ready" else _about(eta))
+    elif state == "queued":
+        msg = PARTIAL_QUEUED.format(pos=_ordinal(st["position"]), eta=_about(eta))
+        return {"state": state, "eta_s": eta, "position": st["position"], "message": msg}
+    elif state == "queue_full":
+        msg = PARTIAL_QUEUE_FULL
     elif state == "too_large":
         msg = PARTIAL_TOO_LARGE
     else:
         msg = PARTIAL_LATER
     return {"state": state, "eta_s": eta, "message": msg}
+
+
+def _about(eta_s):
+    mins = math.ceil((eta_s or 60) / 60)
+    return "about a minute" if mins <= 1 else f"about {mins} minutes"
+
+
+def _ordinal(n):
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
 def not_launchpad(chain):

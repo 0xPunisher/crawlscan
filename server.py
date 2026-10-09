@@ -12,7 +12,7 @@ Read-only: скан идёт в фоне, браузер опрашивает с
                                             лента «Recently scanned»: последние уникальные токены, новые сверху
   GET  /api/config                       -> {"solana": bool, "alerts": bool, "flap": bool, "bankr": bool, "trade": {"robinhood": шаблон, "solana": шаблон}}
                                             шаблоны ссылки Trade on Axiom ({address}), env TRADE_URL_* (trade.py)
-  GET  /api/index?token=CA               -> {"token", "state": ready|building|too_large|unavailable|none, "eta_s"} (BANKR_ENABLED)
+  GET  /api/index?token=CA               -> {"token", "state": ready|building|queued|queue_full|too_large|unavailable|none, "eta_s"[, "position"]} (BANKR_ENABLED)
                                             полный индекс холдеров Bankr готов? (сайт перескан делает, когда ready)
   GET  /                                 -> index.html
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/

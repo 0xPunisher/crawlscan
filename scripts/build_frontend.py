@@ -1783,8 +1783,11 @@ const bankrOf=r=>r&&r.launchpad==='bankr'&&r.bankr&&typeof r.bankr==='object'?r.
 const bankrPair=b=>{const p=(b&&b.pair)||{}; return (p.symbol||(p.kind==='eth'?'ETH':'token'))+' pair';};
 const bankrPct=x=>{const v=Math.round((x||0)*1000)/10; return (v%1?v.toFixed(1):String(v))+'%';};   // 0.15 -> 15%
 const bankrVesting=b=>{const v=(b&&b.vesting)||{}; return v.total_share_supply?`dev vesting: ${bankrPct(v.total_share_supply)} (${bankrPct(v.unlocked_share_supply)} unlocked)`:null;};
-const INDEX_POLL_MS=15000, INDEX_POLL_MAX=80;   // ~20 минут опроса /api/index
-const partialEta=s=>{const n=Math.ceil((s||60)/60); return 'Partial scan: building the full holder history, check again in '+(n<=1?'about a minute':`about ${n} minutes`);};   // = engine.PARTIAL_BUILDING
+const INDEX_POLL_MS=15000, INDEX_POLL_MAX=240;   // ~60 минут опроса /api/index (очередь построений)
+const ixAbout=s=>{const n=Math.ceil((s||60)/60); return n<=1?'about a minute':`about ${n} minutes`;};
+const ixOrd=n=>n+((n%100>=10&&n%100<=20)?'th':({1:'st',2:'nd',3:'rd'}[n%10]||'th'));
+const partialEta=d=>d.state==='queued'?`Partial scan: full holder history queued: ${ixOrd(d.position)} in line, check again in ${ixAbout(d.eta_s)}`:
+  'Partial scan: building the full holder history, check again in '+ixAbout(d.eta_s);   // = engine.PARTIAL_BUILDING / PARTIAL_QUEUED
 
 """
 rep("class Component extends DCLogic {", BANKR_JS.replace("__BANKR_COLOR__", BANKR_COLOR) + "class Component extends DCLogic {")
@@ -1800,11 +1803,11 @@ rep("  blank(ca){return {", """  bankrVals(){   // токен Bankr и флаг 
     const b=ok&&bankrOf(raw), ps=ok&&m.done&&raw&&raw.partial_scan;
     return {bankrOn:!!b,bankrPair:b?bankrPair(b):'',partialOn:!!(ps&&ps.message),
       partialText:ps&&ps.message?(this.state.rescanning?'Full holder history is ready, rescanning…':
-        ps.state==='building'&&this.state.ixEta&&this.state.ixEta.ca===m.ca?partialEta(this.state.ixEta.s):ps.message):''};
+        ['building','queued'].includes(ps.state)&&this.state.ixEta&&this.state.ixEta.ca===m.ca?partialEta(this.state.ixEta.d):ps.message):''};
   }
   watchIndex(r){   // частичный скан Bankr: индекс строится — опрос /api/index; готов — один перескан этого токена
     clearTimeout(this._ixT); const raw=r&&r.raw, ps=raw&&raw.partial_scan, ca=this.m&&this.m.ca;
-    if(!this.state.bankrOn||!ps||!['building','ready'].includes(ps.state)||!ca) return;
+    if(!this.state.bankrOn||!ps||!['building','queued','ready'].includes(ps.state)||!ca) return;
     this._rescanned=this._rescanned||{}; if(this._rescanned[ca]) return;
     let n=0;
     const poll=async()=>{
@@ -1813,8 +1816,8 @@ rep("  blank(ca){return {", """  bankrVals(){   // токен Bankr и флаг 
         const d=await fetch('/api/index?token='+encodeURIComponent(ca),NO_STORE).then(x=>x.ok?x.json():null);
         if(!this.m||this.m.ca!==ca||this.state.view!=='scan') return;
         if(d&&d.state==='ready'){this._rescanned[ca]=true; this.setState({rescanning:true}); setTimeout(()=>{if(this.m&&this.m.ca===ca&&this.state.view==='scan'){this.setState({rescanning:false}); this.startScan(ca,true);}},1200); return;}
-        if(d&&!['building','none'].includes(d.state)) return;   // too_large / unavailable — ждать нечего
-        if(d&&d.state==='building'&&d.eta_s) this.setState({ixEta:{ca,s:d.eta_s}});   // ETA по ходу построения
+        if(d&&!['building','queued','none'].includes(d.state)) return;   // too_large / unavailable / queue_full — ждать нечего
+        if(d&&['building','queued'].includes(d.state)&&d.eta_s) this.setState({ixEta:{ca,d}});   // очередь и ETA по ходу
       }catch(e){}
       this._ixT=setTimeout(poll,INDEX_POLL_MS);
     };

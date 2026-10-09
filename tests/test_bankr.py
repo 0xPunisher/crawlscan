@@ -464,6 +464,13 @@ class TestCurveImpact(unittest.TestCase):
                                                                          impact_curve=None, locked=None))
 
 
+def until(cond, timeout=3.0):
+    t0 = _t.time()
+    while not cond() and _t.time() - t0 < timeout:
+        _t.sleep(0.01)
+    return cond()
+
+
 def small_pages(cap=5):
     """Чтение маленькими страницами: потолок ответа RPC cap логов, участки первой волны — от 1 блока."""
     return mock.patch.multiple(bankr, READ_CHUNK_MIN=1, READ_CHUNKS=4, READ_TARGET=3), \
@@ -540,12 +547,14 @@ class TestHistory(unittest.TestCase):
             return False, "error"
         with c.patched(), mock.patch.object(bankr, "FULL_MAX_LOGS", 3), \
                 mock.patch.object(bankr, "build_index", side_effect=build), \
-                mock.patch.dict(bankr._INDEX_BUILDING, clear=True), mock.patch.dict(bankr._INDEX_FAILED, clear=True):
+                mock.patch.dict(bankr._INDEX_BUILDING, clear=True), mock.patch.dict(bankr._INDEX_FAILED, clear=True), \
+                mock.patch.dict(bankr._INDEX_QUEUE, clear=True):
             r = engine.scan(BTOKEN)
             h = r["bankr"]["history"]
-            self.assertEqual((h["index"], h["index_started"]), ("building", True))
+            self.assertIn(h["index"], ("queued", "building"))                   # поток очереди берёт сразу
+            self.assertTrue(h["index_started"])
             self.assertGreater(h["index_eta_s"], 0)
-            self.assertEqual(bankr.index_status(BTOKEN)["state"], "building")
+            self.assertTrue(until(lambda: bankr.index_status(BTOKEN)["state"] == "building"))
             gate.set()
             for _ in range(100):
                 if BTOKEN not in bankr._INDEX_BUILDING:
@@ -646,7 +655,7 @@ class TestIndexStability(unittest.TestCase):
     def setUp(self):
         self.st = mock.patch.multiple(bankr, memory_high=lambda: False)
         self.st.start()
-        for dct in (bankr._INDEX, bankr._INDEX_BUILDING, bankr._INDEX_FAILED):
+        for dct in (bankr._INDEX, bankr._INDEX_BUILDING, bankr._INDEX_FAILED, bankr._INDEX_QUEUE):
             p = mock.patch.dict(dct, clear=True)
             p.start()
             self.addCleanup(p.stop)
@@ -746,11 +755,8 @@ class TestIndexStability(unittest.TestCase):
             gate.wait(5)
             return True, None
         with mock.patch.object(bankr, "build_index", side_effect=build), priority.critical():
-            self.assertTrue(bankr._index_start("0xa", 1, set()))
-            for _ in range(200):
-                if seen:
-                    break
-                _t.sleep(0.01)
+            self.assertEqual(bankr._index_start("0xa", 1, set()), "queued")
+            self.assertTrue(until(lambda: seen))
             with mock.patch.object(ch._LIMIT, "wait"), mock.patch.object(ch._CRIT_LIMIT, "wait") as cw, \
                     mock.patch.object(ch._BG_LIMIT, "wait") as bgw, priority.live():
                 t0 = _t.time()
@@ -765,6 +771,79 @@ class TestIndexStability(unittest.TestCase):
                 _t.sleep(0.01)
         self.assertEqual(seen, [(False, True)])
 
+    def test_queue(self):
+        """Строится один, остальные — в очереди до INDEX_QUEUE_MAX по порядку, повтор не добавляется; переполнена —
+        queue_full; позиция и ETA (остаток идущего + впереди + своё)."""
+        from chains import priority
+        gate, seen = threading.Event(), []
+
+        def build(t, b, ex, est=None):
+            seen.append((t, priority.is_background(), priority.is_strict()))
+            gate.wait(5)
+            return True, None
+        with mock.patch.object(bankr, "build_index", side_effect=build):
+            self.assertEqual(bankr._index_start("0xa", 1, set(), 10 ** 6), "queued")
+            self.assertTrue(until(lambda: "0xa" in bankr._INDEX_BUILDING))
+            self.assertEqual(bankr._index_start("0xa", 1, set()), "building")
+            for t in ("0xb", "0xc", "0xd", "0xe", "0xf"):
+                self.assertEqual(bankr._index_start(t, 1, set(), 10 ** 6), "queued")
+            self.assertEqual(bankr._index_start("0xc", 1, set()), "queued")     # повтор — не добавляется
+            self.assertEqual(list(bankr._INDEX_QUEUE), ["0xb", "0xc", "0xd", "0xe", "0xf"])
+            self.assertEqual(bankr._index_start("0xg", 1, set()), "queue_full")
+            a, b, c = (bankr.index_status(t) for t in ("0xa", "0xb", "0xc"))
+            self.assertEqual((a["state"], b["state"], b["position"], c["position"]), ("building", "queued", 1, 2))
+            self.assertGreater(a["eta_s"], 60)                                    # 1M логов под BACKGROUND_RPS — минуты
+            self.assertGreater(c["eta_s"], b["eta_s"])
+            self.assertGreaterEqual(b["eta_s"], a["eta_s"] + bankr.index_eta(10 ** 6) - 2)
+            self.assertEqual(bankr.index_status("0xg")["state"], "queue_full")
+            with mock.patch.object(bankr, "index_status", return_value=c):
+                self.assertEqual(engine.bankr_partial("0xc", {})["message"],
+                                 "Partial scan: full holder history queued: 2nd in line, check again in about "
+                                 f"{-(-c['eta_s'] // 60)} minutes")
+            with mock.patch.object(bankr, "index_status", return_value={"state": "queue_full", "eta_s": None}):
+                self.assertEqual(engine.bankr_partial("0xg", {})["message"],
+                                 "Partial scan: full history is queued, check again later")
+            gate.set()
+            self.assertTrue(until(lambda: not bankr._INDEX_QUEUE and not bankr._INDEX_BUILDING))
+        self.assertEqual([x[0] for x in seen], ["0xa", "0xb", "0xc", "0xd", "0xe", "0xf"])   # по порядку
+        self.assertTrue(all(bg and strict for _, bg, strict in seen))            # строгий фон
+
+    def test_queue_waits_for_memory(self):
+        """Память у порога: в очередь ставится, но новое построение не начинается, пока память не опустится."""
+        seen, high = [], [True]
+        with mock.patch.object(bankr, "build_index", side_effect=lambda *a: (seen.append(a[0]), (True, None))[1]), \
+                mock.patch.object(bankr, "memory_high", lambda: high[0]), mock.patch.object(bankr, "MEMORY_WAIT_S", 0.05):
+            self.assertEqual(bankr._index_start("0xm", 1, set()), "queued")
+            _t.sleep(0.3)
+            self.assertEqual((seen, bankr.index_status("0xm")["state"]), ([], "queued"))
+            high[0] = False
+            self.assertTrue(until(lambda: seen == ["0xm"]))
+
+    def test_queue_waits_for_live_scan(self):
+        """Живой скан идёт — построение из очереди не начинается до его конца."""
+        from chains import priority
+        seen = []
+        with mock.patch.object(bankr, "build_index", side_effect=lambda *a: (seen.append(a[0]), (True, None))[1]):
+            with priority.live():
+                self.assertEqual(bankr._index_start("0xl", 1, set()), "queued")
+                _t.sleep(0.3)
+                self.assertEqual(seen, [])
+                self.assertEqual(bankr.index_status("0xl")["state"], "building")   # впереди никого: не «1st in line»
+            self.assertTrue(until(lambda: seen == ["0xl"]))
+
+    def test_eta_by_active_time_and_live_estimate(self):
+        """ETA: объём — оценка первой волны на ходу, скорость — по активному времени (паузы на живые сканы не в счёт)."""
+        from chains import priority
+        now = _t.time()
+        job = {"started": now - 100, "eta_s": 10 ** 6, "est_total": 10 ** 7, "live0": 5.0,
+               "stats": {"logs": 1000, "req": 60, "est_live": 2000}}
+        with mock.patch.object(priority, "live_seconds", return_value=35.0):     # 30 с из 100 шли живые сканы
+            left, _ = bankr._job_left(job, now)
+        self.assertAlmostEqual(left, 70, delta=1)                                 # 1000 логов за 70 с активных
+        with mock.patch.object(priority, "live_seconds", return_value=65.0):     # активных 40 с — ещё разгон: по оценке
+            left, _ = bankr._job_left(job, now)
+        self.assertAlmostEqual(left, bankr.index_eta(2000) * 0.5, delta=1)
+
     def test_start_limits(self):
         gate, seen = threading.Event(), []
 
@@ -774,22 +853,15 @@ class TestIndexStability(unittest.TestCase):
             gate.wait(5)
             return True, None
         with mock.patch.object(bankr, "build_index", side_effect=build):
-            self.assertTrue(bankr._index_start("0xa", 1, set(), 10 ** 6))
-            self.assertFalse(bankr._index_start("0xa", 1, set()))           # уже строится
-            self.assertFalse(bankr._index_start("0xb", 1, set()))           # INDEX_BUILDS_MAX = 1
-            st = bankr.index_status("0xa")
-            self.assertEqual(st["state"], "building")
-            self.assertGreater(st["eta_s"], 60)                              # 1M логов под BACKGROUND_RPS — минуты
+            self.assertEqual(bankr._index_start("0xa", 1, set(), 10 ** 6), "queued")
+            self.assertTrue(until(lambda: seen))
             gate.set()
-            for _ in range(200):
-                if not bankr._INDEX_BUILDING:
-                    break
-                _t.sleep(0.01)
+            self.assertTrue(until(lambda: not bankr._INDEX_BUILDING))
         self.assertEqual(seen, [True])                                       # поток построения — фоновый
-        with mock.patch.object(bankr, "memory_high", lambda: True):
-            self.assertFalse(bankr._index_start("0xc", 1, set()))           # у порога памяти не стартует
+        bankr._INDEX["0xa"] = self.ix(1)
+        self.assertIsNone(bankr._index_start("0xa", 1, set()))              # уже есть
         bankr._INDEX_FAILED["0xd"] = (_t.time() + 60, "too_large")
-        self.assertFalse(bankr._index_start("0xd", 1, set()))
+        self.assertIsNone(bankr._index_start("0xd", 1, set()))
         self.assertEqual(bankr.index_status("0xd")["state"], "too_large")
 
     def test_background_read_uses_fewer_workers(self):
@@ -808,6 +880,53 @@ class TestIndexStability(unittest.TestCase):
             th.start()
             th.join()
         self.assertEqual(sizes, [(bankr.READ_WORKERS, False), (bankr.READ_WORKERS_BG, True)])
+
+    def test_strict_read_pauses_for_live_scan(self):
+        """Строгий фон: пока идёт живой скан, ни одного нового запроса; ответ, пришедший во время скана, разбирается
+        после него; страницы короткие (участки по оценке est), и всё дочитано."""
+        from chains import priority
+        c = Chain()
+        c.page_cap = 5
+        log, live_on, first = [], threading.Event(), threading.Event()
+        orig = c.rpc
+
+        def rpc(m, p):
+            ch._rate_limit()                 # как ch._post перед каждой попыткой
+            if m == "eth_getLogs":
+                log.append(("req", live_on.is_set()))
+                if not first.is_set():
+                    first.set()
+                    _t.sleep(0.2)            # первый запрос в полёте, когда начинается живой скан
+            return orig(m, p)
+        got = []
+
+        def sink(page):
+            log.append(("page", live_on.is_set()))
+            got.extend(page)
+
+        stats = {}
+
+        def read():
+            with priority.background(strict=True):
+                bankr._read_all(BTOKEN, LAUNCH_BLOCK, c.head, sink, est=len(c.trs), stats=stats)
+        a, b = small_pages()
+        with c.patched(), a, b, mock.patch.multiple(bankr, READ_TARGET_BG=3, READ_CHUNK_MIN_BG=1), \
+                mock.patch.object(ch, "rpc", side_effect=rpc), mock.patch.object(ch._BG_LIMIT, "wait"), \
+                mock.patch.object(ch._LIMIT, "wait"):
+            th = threading.Thread(target=read, name=priority.BG + "-bankr-index")
+            th.start()
+            first.wait(2)
+            with priority.live():
+                live_on.set()
+                _t.sleep(0.5)
+                live_on.clear()
+            th.join(5)
+        self.assertEqual(sorted((t["tx"], t["log_index"]) for t in got), sorted((t["tx"], t["log_index"]) for t in c.trs))
+        self.assertNotIn(("req", True), log[1:])                                # во время скана новых запросов нет
+        self.assertNotIn(("page", True), log)                                   # и разбора тоже
+        self.assertGreater(sum(1 for k, _ in log if k == "req"), len(c.trs) // 3)   # короткие участки сразу
+        self.assertEqual((stats["logs"], stats["req"]), (len(c.trs), sum(1 for k, _ in log if k == "req")))
+        self.assertGreater(stats["est_live"], 0)                                # объём по ответившим участкам
 
 
 class TestPartialScan(unittest.TestCase):

@@ -7,6 +7,8 @@
 Живые потоки не ждут никогда: для них — одна проверка потока.
 Критичная работа (critical(): планировщик наград — розыгрыш, сжигания, выплаты) живым сканам не уступает и не
 считается фоном: проходит свой лимит CRITICAL_RPS (гарантированная доля) и общий лимит адаптера.
+Строгий фон (background(strict=True): построение индекса Bankr) ждёт конца живых сканов без потолка YIELD_MAX:
+пока идёт хоть один живой скан, ни одного запроса не начинает.
 RATE_LIMITED в адаптерах — сколько раз нода ответила rate-limit (для паузы перепроверок).
 """
 import os, threading, time
@@ -17,6 +19,7 @@ YIELD_MAX = 60.0          # секунд: дольше одного ожидан
 BACKGROUND_RPS = 2.0      # по умолчанию env BACKGROUND_RPS: запросов/сек на всю фоновую работу адаптера; 0 — без своего лимита
 _cond = threading.Condition()
 _live = [0]
+_live_time = [0.0, None]  # секунд, когда шёл хоть один живой скан (сумма), и с какого момента идёт текущий
 _tls = threading.local()
 CRITICAL_RPS = 2.0        # по умолчанию env CRITICAL_RPS: запросов/сек критичной работы адаптера; 0 — без своего лимита
 YIELDS = [0]              # сколько раз фоновые запросы уступили живым сканам
@@ -24,6 +27,10 @@ YIELDS = [0]              # сколько раз фоновые запросы 
 
 def is_critical():
     return getattr(_tls, "crit", False)
+
+
+def is_strict():
+    return getattr(_tls, "strict", False)
 
 
 def is_background():
@@ -44,15 +51,17 @@ def critical():
 
 
 @contextmanager
-def background():
+def background(strict=False):
     """Фоновая работа в текущем потоке (/api/early без истории скана).
-    BACKGROUND_RPS=0 — выключатель: такая работа не фоновая, как раньше (перепроверки alerts — фон всегда)."""
-    prev = getattr(_tls, "bg", False)
-    _tls.bg = prev or background_rps() > 0
+    BACKGROUND_RPS=0 — выключатель: такая работа не фоновая, как раньше (перепроверки alerts — фон всегда).
+    strict — фон всегда (и при BACKGROUND_RPS=0) и ждёт живых сканов без потолка YIELD_MAX (индекс Bankr)."""
+    prev, prev_strict = getattr(_tls, "bg", False), getattr(_tls, "strict", False)
+    _tls.bg = prev or strict or background_rps() > 0
+    _tls.strict = prev_strict or strict
     try:
         yield
     finally:
-        _tls.bg = prev
+        _tls.bg, _tls.strict = prev, prev_strict
 
 
 @contextmanager
@@ -60,12 +69,23 @@ def live():
     """Живой скан пользователя (или /api/early по его истории) идёт: фоновые запросы ждут."""
     with _cond:
         _live[0] += 1
+        if _live[0] == 1:
+            _live_time[1] = time.time()
     try:
         yield
     finally:
         with _cond:
             _live[0] -= 1
+            if _live[0] == 0 and _live_time[1] is not None:
+                _live_time[0] += time.time() - _live_time[1]
+                _live_time[1] = None
             _cond.notify_all()
+
+
+def live_seconds():
+    """Сколько секунд всего шёл хоть один живой скан (для ETA фона: его паузы)."""
+    with _cond:
+        return _live_time[0] + (time.time() - _live_time[1] if _live_time[1] is not None else 0.0)
 
 
 def live_count():
@@ -81,6 +101,10 @@ def wait_turn():
         if _live[0] == 0:
             return
         YIELDS[0] += 1
+        if is_strict():
+            while _live[0]:
+                _cond.wait(YIELD_MAX)
+            return
         _cond.wait_for(lambda: _live[0] == 0, timeout=YIELD_MAX)
 
 
