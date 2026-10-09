@@ -448,7 +448,9 @@ class TestServer(unittest.TestCase):
         for w in ("scam", "scammer"):
             self.assertNotIn(w, page)
         self.assertIn("tracking started today. confirmed cases appear here as they happen.", page)
-        self.assertIn("facts only: market cap at the time of the scan vs now. not financial advice.", page)
+        self.assertIn("showing the most recent confirmed cases. the list refreshes every hour as new ones come in.", page)
+        self.assertNotIn("facts only", page)
+        self.assertNotIn("collecting data", page)
 
 
 if __name__ == "__main__":

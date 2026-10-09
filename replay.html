@@ -25,17 +25,19 @@ header{border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba
 nav{display:flex;align-items:center;gap:28px;font-family:var(--mono);font-size:13px}
 nav .on{color:var(--hi)}
 nav svg{display:block}
-main{padding:56px 0 72px}
-.kicker{font-family:var(--mono);font-size:12px;color:var(--mute);letter-spacing:0.06em;text-transform:uppercase}
-h1{margin:10px 0 12px;font-size:44px;line-height:1.05;letter-spacing:-0.03em;color:var(--hi);font-weight:600}
+main.wrap{padding-top:56px;padding-bottom:72px}
+h1{margin:0 0 12px;font-size:44px;line-height:1.05;letter-spacing:-0.03em;color:var(--hi);font-weight:600}
 h1 span{color:var(--red)}
-.lead{margin:0;max-width:640px;font-size:16px;line-height:1.55;color:var(--dim);text-wrap:pretty}
+.lead{margin:0;font-size:16px;line-height:1.55;color:var(--dim);text-wrap:pretty}
+.sub{margin:8px 0 0;font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--mute)}
 .stats{margin:32px 0 28px;display:flex;flex-wrap:wrap;align-items:stretch;gap:12px}
+.stats:empty{display:none}
+#list{margin-top:32px}
+.stats:not(:empty)+#list{margin-top:0}
 .stat{flex:1 1 240px;min-width:0;padding:16px 18px;border:1px solid var(--line);border-radius:12px;background:linear-gradient(180deg,#0c1114,#090c0f)}
 .stat .k{font-family:var(--mono);font-size:11.5px;color:var(--mute);letter-spacing:0.04em}
 .stat .v{margin-top:6px;font-family:var(--mono);font-size:24px;color:var(--hi);font-variant-numeric:tabular-nums}
 .stat .s{margin-top:4px;font-family:var(--mono);font-size:12px;color:var(--dim)}
-.stat.collect .v{font-size:15px;color:var(--dim);padding-top:6px}
 .v.red{color:var(--red)} .v.green{color:var(--green)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
 .card{display:flex;flex-direction:column;gap:14px;min-width:0;padding:20px 20px 18px;border:1px solid var(--line);border-radius:14px;
@@ -69,12 +71,11 @@ h1 span{color:var(--red)}
 .empty{padding:48px 24px;border:1px dashed var(--line2);border-radius:14px;background:var(--card2);text-align:center;font-family:var(--mono);font-size:14px;line-height:1.6;color:var(--dim)}
 .skel{height:240px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(90deg,#0b1013 0%,#10171b 50%,#0b1013 100%);background-size:200% 100%;animation:sk 1.4s linear infinite}
 @keyframes sk{from{background-position:200% 0}to{background-position:-200% 0}}
-.note{margin-top:40px;font-family:var(--mono);font-size:11.5px;color:var(--mute);line-height:1.6}
 @media (max-width:640px){
   .wrap{padding:0 16px}
   nav{gap:14px}
   nav .wide{display:none}
-  main{padding:36px 0 56px}
+  main.wrap{padding-top:36px;padding-bottom:56px}
   h1{font-size:32px}
   .lead{font-size:15px}
   .grid{grid-template-columns:minmax(0,1fr)}
@@ -105,14 +106,12 @@ h1 span{color:var(--red)}
 </div></header>
 
 <main class="wrap">
-  <div class="kicker">rug replay · last 7 days</div>
   <h1>Marked <span>DANGER</span>. Then it fell.</h1>
   <p class="lead">Tokens CrawlScan marked DANGER whose market cap later fell 90% or more from the moment of the scan.</p>
+  <p class="sub">Showing the most recent confirmed cases. The list refreshes every hour as new ones come in.</p>
 
   <section class="stats" id="stats" aria-live="polite"></section>
   <section id="list"><div class="grid"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div></section>
-
-  <p class="note">Facts only: market cap at the time of the scan vs now. Not financial advice.</p>
 </main>
 
 <script>
@@ -121,6 +120,7 @@ h1 span{color:var(--red)}
   var ICON_COPY='<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"></rect><path d="M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5h-5A1.5 1.5 0 0 0 2.5 3v5a1.5 1.5 0 0 0 1.5 1.5h.5"></path></svg>';
   var ICON_CHECK='<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#00c805" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5l3.2 3L13 4.5"></path></svg>';
   var CHAIN={robinhood:['Robinhood','#00c805'],solana:['Solana','#9945FF']};
+  var SHOW=15;   // API отдаёт до 30, на странице — 15 последних
   var PAD={flap:['Flap','#f472b6'],bankr:['Bankr','#ff8a3d']};
   var esc=function(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});};
   var short=function(a){a=String(a||'');return a.length>14?a.slice(0,6)+'…'+a.slice(-4):a;};
@@ -152,13 +152,7 @@ h1 span{color:var(--red)}
   }
   function renderStats(st){
     var el=document.getElementById('stats');
-    if(!st){el.innerHTML='';return;}
-    if(!st.ready){
-      el.innerHTML='<div class="stat collect"><div class="k">DANGER vs CLEAN · tokens older than 24 h · last 7 days</div>'+
-        '<div class="v">collecting data</div><div class="s">'+st.danger.tokens+' DANGER · '+st.clean.tokens+
-        ' CLEAN/OK so far, '+st.min_tokens+' needed in each</div></div>';
-      return;
-    }
+    if(!st||!st.ready){el.innerHTML='';return;}   // данных мало — плашки нет
     el.innerHTML=statCard('Marked DANGER · fell 90%+ after the scan',st.danger,'red')+
       statCard('Marked CLEAN or OK · fell 90%+ after the scan',st.clean,'green');
   }
@@ -191,7 +185,7 @@ h1 span{color:var(--red)}
       el.innerHTML='<div class="empty">Tracking started today. Confirmed cases appear here as they happen.</div>';
       return;
     }
-    el.innerHTML='<div class="grid">'+items.map(card).join('')+'</div>';
+    el.innerHTML='<div class="grid">'+items.slice(0,SHOW).map(card).join('')+'</div>';
   }
   function load(){
     fetch('/api/replay',{cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(d){
