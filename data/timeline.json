@@ -1,0 +1,23 @@
+{
+  "milestones": [
+    {"date": "Oct 4", "title": "CrawlScan launch", "text": "CrawlScan goes live on Robinhood Chain: paste a Pons token and the crawlers reveal who really controls the supply, merging linked wallets into real operators.", "url": "https://x.com/0x_Punisher/status/2106826850106327173"},
+    {"date": "Oct 5", "title": "Solana and pump.fun", "text": "Every pump.fun token on Solana can be scanned, with the chain detected automatically from the address.", "url": "https://x.com/0x_Punisher/status/2107167783301915047"},
+    {"date": "Oct 6", "title": "Burns and holder rewards", "text": "$CrawlScan gets burns every 12 hours from the dev's own supply and a daily reward for one holder, all verifiable onchain.", "url": "https://x.com/0x_Punisher/status/2107283863122636824"},
+    {"date": "Oct 6", "title": "Telegram bot", "text": "@CrawlScanBot brings the verdict to Telegram: send a contract and get the score, operators and dump risk in seconds.", "url": "https://x.com/0x_Punisher/status/2107455393387471047"},
+    {"date": "Oct 6", "title": "Probably rug warning", "text": "Every result gets a live price chart, and DANGER setups show how deep the drop could go and which wallets are behind it.", "url": "https://x.com/0x_Punisher/status/2107572644782461269"},
+    {"date": "Oct 7", "title": "Early buyers", "text": "The first 20 buyers after launch: how fast they got in, and whether they're still holding or already out.", "url": "https://x.com/0x_Punisher/status/2107810994282004552"},
+    {"date": "Oct 7", "title": "Telegram alerts", "text": "Watch tokens in the bot and get a message when the verdict turns DANGER, a rug warning appears or the biggest holders start selling.", "url": "https://x.com/CrawlScan_/status/2107876810704724190"},
+    {"date": "Oct 8", "title": "Flap launchpad", "text": "Flap tokens on Robinhood Chain, with bonding curve progress and buy and sell tax shown before you buy.", "url": "https://x.com/CrawlScan_/status/2108238441615958145"},
+    {"date": "Oct 9", "title": "Operator memory", "text": "Every scan is now remembered, so the scanner builds its own history of the wallets behind memecoins and gets smarter every day.", "url": "https://x.com/CrawlScan_/status/2108554945901305999"},
+    {"date": "Oct 9", "title": "Bankr launchpad", "text": "Bankr tokens on Robinhood Chain, with dev vesting and the real price impact read from the pool itself.", "url": "https://x.com/CrawlScan_/status/2108626618822402132"},
+    {"date": "Oct 9", "title": "Rug Replay", "text": "A public record of tokens CrawlScan flagged DANGER that then fell 90% or more, with the market cap at the scan and after.", "url": "https://x.com/CrawlScan_/status/2108658317874643132"}
+  ],
+  "next": [
+    "Premium features for $CrawlScan holders",
+    "Repeat operator detection",
+    "A new chain",
+    "Partner API",
+    "Wallet profiler",
+    "Browser extension"
+  ]
+}

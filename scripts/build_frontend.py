@@ -66,6 +66,9 @@
     «tax goes to the dev», flap.sh в шапке; факт pool; карточка «chart appears after the token graduates»
     у токена на кривой; бейдж в ленте; «Robinhood (Pons, Flap) and Solana» и карточка роадмапа.
   - Rug Replay (только при /api/config → replay): ссылка «Rug Replay» на /replay в шапке (на телефоне — в меню).
+  - Timeline вместо роадмапа: вехи и «What comes next» из data/timeline.json (встраиваются при сборке, новая веха —
+    одна запись в файле); десктоп — горизонтальная линия со скроллом внутри блока и карточкой у точки, телефон —
+    вертикальная с текстом под точкой; пункт шапки «timeline» (#timeline).
   - Bankr (только при /api/config → bankr и только у токенов Bankr): бейдж и пара в шапке, факт pool, вестинг дева
     у критерия операторов, сообщение частичного скана и перескан по готовому индексу (/api/index), бейдж в ленте,
     Bankr в тексте площадок и карточка роадмапа.
@@ -1878,6 +1881,151 @@ rep(".then(d=>this.setState({solanaOn:!!d.solana,trade:d.trade||null,flapOn:!!d.
     ".then(d=>this.setState({solanaOn:!!d.solana,trade:d.trade||null,flapOn:!!d.flap,bankrOn:!!d.bankr,replayOn:!!d.replay}))")
 rep("      flapOn2:!!this.state.flapOn, bankrOn2:!!this.state.bankrOn,\n",
     "      flapOn2:!!this.state.flapOn, bankrOn2:!!this.state.bankrOn, replayOn:!!this.state.replayOn,\n")
+
+# Timeline вместо роадмапа: вехи и «What comes next» из data/timeline.json (встраиваются в страницу при сборке).
+# Десктоп — горизонтальная линия (скролл внутри блока), карточка у точки; телефон (≤ 640 px) — вертикальная,
+# текст раскрывается под точкой. Рисуется в ref (как early buyers), состояние — this.tlOpen.
+TL_PATH = os.path.join(ROOT, "data", "timeline.json")
+try:
+    tl = json.load(open(TL_PATH, encoding="utf-8"))
+except (OSError, ValueError) as err:
+    sys.exit(f"data/timeline.json: {err} — сборка остановлена")
+ms, nx = tl.get("milestones"), tl.get("next")
+if not isinstance(ms, list) or not ms or not isinstance(nx, list):
+    sys.exit("data/timeline.json: нужны непустой массив milestones и массив next — сборка остановлена")
+for i, x in enumerate(ms):
+    if not isinstance(x, dict) or not all(isinstance(x.get(k), str) and x[k].strip() for k in ("date", "title", "text", "url")):
+        sys.exit(f"data/timeline.json: веха {i} — нужны строки date, title, text, url — сборка остановлена")
+    if not x["url"].startswith("https://"):
+        sys.exit(f"data/timeline.json: веха {i} — url не https:// — сборка остановлена")
+if not all(isinstance(s, str) and s.strip() for s in nx):
+    sys.exit("data/timeline.json: next — массив строк — сборка остановлена")
+TL_DATA = json.dumps({"milestones": [{k: x[k] for k in ("date", "title", "text", "url")} for x in ms], "next": nx},
+                     ensure_ascii=False).replace("</", "<\\/")
+
+ms_ = re.search(r'      <section id="roadmap" class="cs-wrap".*?</section>\n', t, re.S)
+if not ms_ or t.count('<section id="roadmap"') != 1:
+    sys.exit("design.html: не найдена секция roadmap — сборка остановлена")
+t = (t[:ms_.start()]
+     + '''      <section id="timeline" class="cs-wrap" style="max-width:1280px;margin:0 auto;padding:40px 32px 140px;box-sizing:border-box">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;gap:24px;border-top:1px solid #12181c;padding-top:22px;margin-bottom:56px">
+          <h2 data-grip="1" style="margin:0;font-size:34px;font-weight:500;letter-spacing:-0.03em;color:#eef1f3">Timeline</h2>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72">{{numRoadmap}}</span>
+        </div>
+        <div ref="{{tlRef}}" data-timeline="1" style="min-width:0"></div>
+      </section>
+''' + t[ms_.end():])
+# шапка и меню: «roadmap» -> «timeline»
+rep('href="#roadmap"', 'href="#timeline"', count=2)
+rep('>roadmap</a>', '>timeline</a>', count=2)
+rep("this.scrollToId('roadmap');", "this.scrollToId('timeline');")
+
+rep("a{color:#8a959c;text-decoration:none}\n", "a{color:#8a959c;text-decoration:none}\n" + r'''
+.cs-tl-scroll{overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;scrollbar-color:#1c252b transparent;padding-bottom:6px;min-width:0}
+.cs-tl-track{position:relative;display:flex;margin:0;padding:0 72px 0 34px;list-style:none;min-width:max-content}
+.cs-tl-track::before{content:'';position:absolute;left:4px;right:14px;top:21px;height:2px;background:linear-gradient(90deg,#1c252b,#00c805 18%,#00c805);box-shadow:0 0 8px rgba(0,200,5,0.35)}
+.cs-tl-track::after{content:'';position:absolute;right:2px;top:15px;border-left:14px solid #00c805;border-top:7px solid transparent;border-bottom:7px solid transparent;filter:drop-shadow(0 0 5px rgba(0,200,5,0.6))}
+.cs-tl-start{position:absolute;left:0;top:16px;width:10px;height:10px;border-radius:50%;border:2px solid #2c353b;background:#07090b;box-sizing:border-box}
+.cs-tl-track>li:not(.cs-tl-start){width:128px;flex:0 0 128px}
+.cs-tl-btn{all:unset;box-sizing:border-box;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:8px;width:100%;padding:12px 6px 4px;text-align:center;border-radius:10px;-webkit-tap-highlight-color:transparent}
+.cs-tl-btn:focus-visible{outline:1px solid #9fd9ff;outline-offset:2px}
+.cs-tl-pt{width:14px;height:14px;border-radius:50%;background:#0b1013;border:2px solid #00c805;box-sizing:border-box;box-shadow:0 0 8px rgba(0,200,5,0.45);transition:transform .15s,background .15s,box-shadow .15s;position:relative;z-index:1;flex-shrink:0}
+.cs-tl-btn:hover .cs-tl-pt{transform:scale(1.2);box-shadow:0 0 12px rgba(0,200,5,0.7)}
+.cs-tl-btn.is-on .cs-tl-pt{background:#00c805;transform:scale(1.25);box-shadow:0 0 0 5px rgba(0,200,5,0.16),0 0 16px #00c805}
+.cs-tl-t{font-size:13.5px;line-height:1.35;color:#aab4ba;text-wrap:balance}
+.cs-tl-btn:hover .cs-tl-t,.cs-tl-btn.is-on .cs-tl-t{color:#eef1f3}
+.cs-tl-d{font-family:'JetBrains Mono',monospace;font-size:11.5px;color:#5f6b72}
+.cs-tl-btn.is-on .cs-tl-d{color:#00c805}
+.cs-tl-card{position:relative;width:min(380px,100%);margin-top:14px;padding:20px 22px;border:1px solid #1c252b;border-radius:14px;background:linear-gradient(180deg,#0c1114,#090c0f);box-shadow:0 12px 32px rgba(0,0,0,0.45),inset 0 1px 0 rgba(255,255,255,0.03);box-sizing:border-box}
+.cs-tl-card::before{content:'';position:absolute;top:-7px;left:calc(var(--cs-caret,50%) - 6px);width:12px;height:12px;background:#0c1114;border-left:1px solid #1c252b;border-top:1px solid #1c252b;transform:rotate(45deg)}
+.cs-tl-card[hidden],.cs-tl-panel[hidden]{display:none}
+.cs-tl-ch{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.cs-tl-ct{font-size:17px;font-weight:500;color:#eef1f3}
+.cs-tl-cd{font-family:'JetBrains Mono',monospace;font-size:12px;color:#00c805;flex-shrink:0}
+.cs-tl-x{margin:10px 0 16px;font-size:14.5px;line-height:1.55;color:#aab4ba;text-wrap:pretty}
+.cs-tl-go{display:inline-flex;align-items:center;gap:6px;font-family:'JetBrains Mono',monospace;font-size:12.5px;padding:8px 14px;border-radius:8px;color:#00c805;border:1px solid rgba(0,200,5,0.45);background:rgba(0,200,5,0.08);transition:background .15s,color .15s}
+.cs-tl-go:hover{background:rgba(0,200,5,0.16);color:#d9ffd4}
+.cs-tl-go:focus-visible{outline:1px solid #9fd9ff;outline-offset:2px}
+.cs-tl-v{display:none}
+.cs-tl-next{margin-top:56px;padding-top:22px;border-top:1px solid #12181c}
+.cs-tl-next h3{margin:0 0 18px;font-size:22px;font-weight:500;letter-spacing:-0.02em;color:#eef1f3}
+.cs-tl-next ul{margin:0;padding:0;list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:0 40px;border-top:1px solid #141b20}
+.cs-tl-next li{display:flex;align-items:center;gap:12px;padding:16px 0;border-bottom:1px solid #141b20;font-size:16px;color:#dfe5e8}
+.cs-tl-next li::before{content:'';width:7px;height:7px;border-radius:50%;border:1.5px solid #5f6b72;flex-shrink:0}
+@media (max-width:640px){
+  .cs-tl-h{display:none}
+  .cs-tl-v{display:block}
+  .cs-tl-vlist{position:relative;margin:0;padding:18px 0 0;list-style:none}
+  .cs-tl-vlist::before{content:'';position:absolute;left:6px;top:4px;bottom:0;width:2px;background:linear-gradient(180deg,#1c252b,#00c805 60px,#00c805);box-shadow:0 0 8px rgba(0,200,5,0.35)}
+  .cs-tl-vlist .cs-tl-start{left:2px;top:0}
+  .cs-tl-vlist>li{position:relative}
+  .cs-tl-vlist .cs-tl-btn{flex-direction:row;align-items:center;gap:14px;padding:12px 0;text-align:left;border-radius:6px}
+  .cs-tl-vlist .cs-tl-t{flex:1;font-size:15px;text-wrap:pretty}
+  .cs-tl-vlist .cs-tl-pt{margin-left:0}
+  .cs-tl-panel{padding:2px 0 14px 28px}
+  .cs-tl-panel .cs-tl-x{margin:0 0 14px}
+  .cs-tl-varrow{width:0;height:0;margin-left:0;border-top:14px solid #00c805;border-left:8px solid transparent;border-right:8px solid transparent;filter:drop-shadow(0 0 5px rgba(0,200,5,0.6))}
+  .cs-tl-next{margin-top:40px}
+}
+''')
+
+rep("class Component extends DCLogic {", r'''// ---- timeline (data/timeline.json, встроен при сборке) ----
+const TIMELINE=__TL_DATA__;
+const tlEsc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const tlGo=m=>`<a class="cs-tl-go" href="${tlEsc(m.url)}" target="_blank" rel="noopener noreferrer">Read the post on X ↗</a>`;
+function timelineHtml(tl){
+  const ms=tl.milestones||[], btn=(m,i,ctl)=>`<button type="button" class="cs-tl-btn" data-grip="1" data-tl-i="${i}" aria-expanded="false" aria-controls="${ctl}"><span class="cs-tl-pt"></span><span class="cs-tl-t">${tlEsc(m.title)}</span><span class="cs-tl-d">${tlEsc(m.date)}</span></button>`;
+  const h=`<div class="cs-tl-h"><div class="cs-tl-scroll"><ol class="cs-tl-track"><li class="cs-tl-start" aria-hidden="true"></li>${ms.map((m,i)=>`<li>${btn(m,i,'cs-tl-card')}</li>`).join('')}</ol></div>`
+    +`<div class="cs-tl-card" id="cs-tl-card" role="region" aria-live="polite" hidden></div></div>`;
+  const v=`<div class="cs-tl-v"><ol class="cs-tl-vlist"><li class="cs-tl-start" aria-hidden="true"></li>${ms.map((m,i)=>`<li>${btn(m,i,'cs-tl-p'+i)}<div class="cs-tl-panel" id="cs-tl-p${i}" hidden><p class="cs-tl-x">${tlEsc(m.text)}</p>${tlGo(m)}</div></li>`).join('')}</ol><div class="cs-tl-varrow" aria-hidden="true"></div></div>`;
+  const n=(tl.next||[]).length?`<div class="cs-tl-next"><h3 data-grip="1">What comes next</h3><ul>${tl.next.map(s=>`<li data-grip="1">${tlEsc(s)}</li>`).join('')}</ul></div>`:'';
+  return h+v+n;
+}
+class Component extends DCLogic {''')
+t = t.replace("const TIMELINE=__TL_DATA__;", "const TIMELINE=" + TL_DATA + ";", 1)
+
+rep("chartRef=React.createRef(); earlyRef=React.createRef();",
+    "chartRef=React.createRef(); earlyRef=React.createRef(); tlRef=React.createRef(); tlOpen=TIMELINE.milestones.length-1;")
+rep("earlyRef:this.earlyRef,", "earlyRef:this.earlyRef, tlRef:this.tlRef,")
+rep("componentDidUpdate(){this.paintChart(); this.paintEarly();", "componentDidUpdate(){this.paintChart(); this.paintEarly(); this.paintTimeline();")
+rep("    this._chartRs=()=>this.paintChart(); window.addEventListener('resize',this._chartRs);\n",
+    "    this._chartRs=()=>{this.paintChart(); this.tlPlace();}; window.addEventListener('resize',this._chartRs);\n"
+    "    this._tlOut=e=>{if(this.tlOpen<0||!this.tlRef.current||e.target.closest('.cs-tl-card,.cs-tl-panel,[data-tl-i]')) return; this.tlSet(-1);};\n"
+    "    document.addEventListener('click',this._tlOut);\n"
+    "    this.paintTimeline();\n")
+rep("window.removeEventListener('hashchange',this._rwHash);",
+    "window.removeEventListener('hashchange',this._rwHash); document.removeEventListener('click',this._tlOut);")
+rep("  paintEarly(){", r'''  paintTimeline(){   // один раз на элемент; лендинг перерисовывается часто
+    const el=this.tlRef.current; if(!el||el.dataset.k) return; el.dataset.k='1';
+    try{el.innerHTML=timelineHtml(TIMELINE);}catch(err){el.innerHTML=''; console.warn('timeline render failed',err); return;}
+    el.addEventListener('click',e=>{const b=e.target.closest('[data-tl-i]'); if(!b) return; const i=+b.dataset.tlI; this.tlSet(this.tlOpen===i?-1:i,b);});
+    el.addEventListener('keydown',e=>{if(e.key==='Escape'&&this.tlOpen>=0){const i=this.tlOpen; this.tlSet(-1); const b=[...el.querySelectorAll(`[data-tl-i="${i}"]`)].find(x=>x.offsetParent); if(b) b.focus();}});
+    const sc=el.querySelector('.cs-tl-scroll'); if(sc) sc.addEventListener('scroll',()=>this.tlPlace(),{passive:true});
+    const end=()=>{if(sc&&this.tlOpen===TIMELINE.milestones.length-1) sc.scrollLeft=sc.scrollWidth; this.tlPlace();};   // открыта последняя — линия у конца
+    this.tlSet(this.tlOpen); end(); requestAnimationFrame(end); if(document.fonts) document.fonts.ready.then(end);
+  }
+  tlSet(i,src){
+    this.tlOpen=i; const el=this.tlRef.current; if(!el) return;
+    el.querySelectorAll('[data-tl-i]').forEach(b=>{const on=+b.dataset.tlI===i; b.classList.toggle('is-on',on); b.setAttribute('aria-expanded',on?'true':'false');});
+    el.querySelectorAll('.cs-tl-panel').forEach(p=>{p.hidden=p.id!=='cs-tl-p'+i;});
+    const card=el.querySelector('.cs-tl-card'), m=TIMELINE.milestones[i]; if(!card) return;
+    card.hidden=!m;
+    if(m) card.innerHTML=`<div class="cs-tl-ch"><span class="cs-tl-ct">${tlEsc(m.title)}</span><span class="cs-tl-cd">${tlEsc(m.date)}</span></div><p class="cs-tl-x">${tlEsc(m.text)}</p>${tlGo(m)}`;
+    const sc=el.querySelector('.cs-tl-scroll'), b=m&&sc&&src&&sc.contains(src)?src:null;
+    if(b&&i===TIMELINE.milestones.length-1) sc.scrollLeft=sc.scrollWidth;
+    else if(b){const r=b.getBoundingClientRect(), s=sc.getBoundingClientRect();   // точку у края — в видимую часть линии (без прокрутки страницы)
+      if(r.left<s.left) sc.scrollLeft-=s.left-r.left+24; else if(r.right>s.right) sc.scrollLeft+=r.right-s.right+24;}
+    this.tlPlace();
+  }
+  tlPlace(){   // карточка под активной точкой, в пределах блока; стрелка-уголок — на точку
+    const el=this.tlRef.current; if(!el) return; const card=el.querySelector('.cs-tl-card'), box=el.querySelector('.cs-tl-h');
+    if(!card||card.hidden||!box||!box.offsetParent) return;
+    const pt=el.querySelector(`.cs-tl-track [data-tl-i="${this.tlOpen}"] .cs-tl-pt`); if(!pt) return;
+    const W=box.clientWidth, cw=card.offsetWidth, r=pt.getBoundingClientRect(), x=r.left+r.width/2-box.getBoundingClientRect().left;
+    const left=Math.max(0,Math.min(W-cw,x-cw/2));
+    card.style.marginLeft=left+'px'; card.style.setProperty('--cs-caret',Math.max(16,Math.min(cw-16,x-left))+'px');
+  }
+  paintEarly(){''')
 
 enc = encode(t)
 TITLE_OLD = '<title>Bundled Page</title>'
