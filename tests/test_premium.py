@@ -18,6 +18,7 @@ SECRET = "s3cret"
 CURVE, PM, ROUTER = "0x" + "c0" * 20, "0x" + "e1" * 20, "0x" + "e2" * 20
 W1, W2, W3 = "0x" + "a1" * 20, "0x" + "a2" * 20, "0x" + "a3" * 20
 FRIEND = "0x" + "f0" * 20                    # обычный кошелёк: его перевод — не покупка
+AGG = "0x" + "a9" * 20                       # приложение / агрегатор, которого нет в списках роутеров
 U1, U2 = 111111, 222222
 E18 = 10 ** 18
 NOW = 1_800_000_000
@@ -30,7 +31,7 @@ class FakeChain:
     V4_POOL_MGR = PM
 
     def __init__(self):
-        self.head, self.transfers, self.balance, self.calls = 1000, [], {}, []
+        self.head, self.transfers, self.balance, self.calls, self.missing = 1000, [], {}, [], set()
 
     def get_launch(self, token):
         return {"curve": CURVE}
@@ -51,6 +52,14 @@ class FakeChain:
 
     def block_timestamps(self, blocks):
         return {}
+
+    def receipt_logs(self, txs):
+        """Чек: Transfer-логи токена всех переводов этой транзакции (missing — чека ещё нет)."""
+        self.calls.append(("receipts", tuple(txs)))
+        topic = lambda a: "0x" + "0" * 24 + a[2:]
+        return {h: [] if h in self.missing else
+                [{"address": fakes.TOKEN, "topics": [premium.TRANSFER_TOPIC, topic(t["frm"]), topic(t["to"])],
+                  "data": hex(t["amount"])} for t in self.transfers if t["tx"] == h] for h in txs}
 
     def token_balance(self, token, wallet):
         self.calls.append("balanceOf")
@@ -93,6 +102,22 @@ class TestRules(unittest.TestCase):
         self.assertFalse(premium.counts_as_buy(t | {"ts": NOW + 901}, r, senders))       # после брони
         self.assertFalse(premium.counts_as_buy(t | {"amount": 0}, r, senders))
         self.assertFalse(premium.counts_as_buy(t | {"to": W2}, r, senders))
+
+    def test_pool_out(self):
+        topic = lambda a: "0x" + "0" * 24 + a[2:]
+        log = lambda frm, to, address=fakes.TOKEN: {"address": address, "data": "0x1",
+                                                     "topics": [premium.TRANSFER_TOPIC, topic(frm), topic(to)]}
+        pools = {PM, CURVE}
+        self.assertTrue(premium.pool_out([log(PM, AGG), log(AGG, W1)], fakes.TOKEN, pools))     # вышли из пула
+        self.assertTrue(premium.pool_out([log(CURVE, W1)], fakes.TOKEN, pools))
+        self.assertFalse(premium.pool_out([log(FRIEND, W1)], fakes.TOKEN, pools))               # кошелёк → кошелёк
+        self.assertFalse(premium.pool_out([log(W1, PM), log(AGG, W1)], fakes.TOKEN, pools))     # в пул (продажа), не из
+        self.assertFalse(premium.pool_out([log(PM, W1, address=W3)], fakes.TOKEN, pools))       # другой токен из пула
+        r = {"wallet": W1, "created_at": NOW, "expires_at": NOW + 900}
+        t = {"frm": AGG, "to": W1, "amount": 1, "ts": NOW + 10}
+        self.assertFalse(premium.counts_as_buy(t, r, pools))
+        self.assertTrue(premium.counts_as_buy(t, r, pools, from_pool=True))
+        self.assertFalse(premium.counts_as_buy(t | {"ts": NOW - 1}, r, pools, from_pool=True))
 
     def test_known_routers_of_the_network(self):
         svc = service(None, FakeChain(), Clock(), [])
@@ -232,6 +257,37 @@ class TestService(unittest.TestCase):
         self.assertIsNone(self.st.link_of(U1))
         self.assertEqual(self.notes, [])
         self.assertEqual(self.st.reservation_of(U1)["scanned_to"], self.ch.head)
+
+    def test_buy_through_any_app(self):
+        """Агрегатор не из списков: PM → AGG → кошелёк в одной транзакции — покупка (по чеку, +1 HTTP)."""
+        self.st.reserve(U1, W1, NOW)
+        self.ch.balance[W1] = 600_000 * E18
+        self.ch.buy(AGG, frm=PM, tx="0xagg", block=1001)
+        self.ch.buy(W1, frm=AGG, tx="0xagg", block=1001)
+        self.assertEqual(self.svc.verify_tick(), 1)
+        self.assertEqual(self.st.link_of(U1)["verify_tx"], "0xagg")
+        self.assertEqual([c if isinstance(c, str) else c[0] for c in self.ch.calls],
+                         ["eth_blockNumber", "eth_getLogs", "receipts", "balanceOf"])
+
+    def test_app_transfer_without_pool_out(self):
+        """Тот же агрегатор, но токены не из пула (кошелёк → AGG → кошелёк) — не покупка."""
+        self.st.reserve(U1, W1, NOW)
+        self.ch.buy(AGG, frm=FRIEND, tx="0xgift", block=1001)
+        self.ch.buy(W1, frm=AGG, tx="0xgift", block=1001)
+        self.ch.buy(W1, frm=FRIEND, tx="0xplain")
+        self.assertEqual(self.svc.verify_tick(), 0)
+        self.assertIsNone(self.st.link_of(U1))
+        self.assertEqual(self.ch.calls[2], ("receipts", ("0xgift", "0xplain")))           # один батч на проход
+
+    def test_receipt_not_ready_is_retried(self):
+        self.st.reserve(U1, W1, NOW)
+        self.ch.buy(AGG, frm=PM, tx="0xagg", block=1001)
+        self.ch.buy(W1, frm=AGG, tx="0xagg", block=1001)
+        self.ch.missing.add("0xagg")
+        self.assertEqual(self.svc.verify_tick(), 0)
+        self.assertIsNone(self.st.reservation_of(U1)["scanned_to"])                       # блоки не «прочитаны»
+        self.ch.missing.clear()
+        self.assertEqual(self.svc.verify_tick(), 1)
 
     def test_reads_from_scanned_block(self):
         self.st.reserve(U1, W1, NOW)

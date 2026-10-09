@@ -2,7 +2,8 @@
 
 Всё за выключателем PREMIUM_ENABLED (по умолчанию выключено). Верификация — только покупкой: пользователь бронирует
 кошелёк в боте (/verify) на RESERVE_MIN минут за свой Telegram ID, и если за это время на кошелёк пришёл $CrawlScan
-от пула или известного роутера (событие Transfer токена), кошелёк привязан. Кто первый, того и кошелёк: один
+от пула или известного роутера — или от любого приложения / агрегатора, если в той же транзакции токен вышел из пула
+(Transfer токена от пула), — кошелёк привязан. Кто первый, того и кошелёк: один
 кошелёк — один Telegram-аккаунт, один аккаунт — один кошелёк.
 Premium = баланс привязанного кошелька ≥ PREMIUM_MIN_TOKENS (проверка при верификации и раз в сутки). Ниже порога —
 GRACE_DAYS дней Watchlist остаётся как был, потом обрезается до обычного (alerts.WATCH_LIMIT, WATCH_DAYS).
@@ -21,6 +22,7 @@ GRACE_DAYS = 7               # дней после падения баланса
 CHECK_EVERY = 86400          # секунд между проверками баланса
 ATTEMPTS_PER_HOUR = 5        # броней в час на одного пользователя
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
 def enabled():
@@ -67,12 +69,28 @@ def watch_terms(link, now):
     return alerts.WATCH_LIMIT, alerts.WATCH_DAYS
 
 
-def counts_as_buy(transfer, reservation, senders):
-    """Перевод токена засчитывает бронь: пришёл на забронированный кошелёк от пула / роутера (senders), сумма > 0,
-    время блока внутри брони [created_at, expires_at]. С обычного кошелька — не покупка."""
+def in_window(transfer, reservation):
+    """Перевод на забронированный кошелёк, сумма > 0, время блока внутри брони [created_at, expires_at]."""
     ts = transfer.get("ts")
-    return (transfer["to"] == reservation["wallet"] and transfer["frm"] in senders and transfer.get("amount", 0) > 0
+    return (transfer["to"] == reservation["wallet"] and transfer.get("amount", 0) > 0
             and ts is not None and reservation["created_at"] <= ts <= reservation["expires_at"])
+
+
+def counts_as_buy(transfer, reservation, senders, from_pool=False):
+    """Перевод токена засчитывает бронь (in_window) и это покупка: отправитель — пул / известный роутер (senders)
+    или from_pool — в той же транзакции токен вышел из пула (pool_out по чеку: покупка через любое приложение
+    или агрегатор). Перевод с обычного кошелька (из пула в транзакции ничего не выходило) — не покупка."""
+    return in_window(transfer, reservation) and (transfer["frm"] in senders or from_pool)
+
+
+def pool_out(logs, token, pools):
+    """В логах чека транзакции есть Transfer токена token от адреса из pools (токены вышли из пула)."""
+    for l in logs:
+        tp = l.get("topics") or []
+        if (len(tp) >= 3 and (l.get("address") or "").lower() == token and tp[0].lower() == TRANSFER_TOPIC
+                and "0x" + tp[1][-40:].lower() in pools):
+            return True
+    return False
 
 
 def balance_event(link, balance, threshold, now):

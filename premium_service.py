@@ -4,10 +4,13 @@
   - eth_blockNumber и один eth_getLogs по Transfer токена с получателем = OR-список всех забронированных кошельков
     (get_token_transfers(..., to=[...])), с блока, до которого прочитано (новая бронь — с BACK_BLOCKS до головы:
     покупка могла попасть между бронью и первым проходом); время блока — из лога (blockTimestamp);
-  - покупка = перевод на кошелёк от пула или роутера токена (ch.market_addresses: кривая, роутеры Pons, V4 PoolManager)
-    или от известного роутера сети из адаптеров Flap / Bankr (bankr.ROUTERS: проходные роутеры агрегаторов, через
-    них идёт часть покупок $CrawlScan) внутри брони по времени блока (premium.counts_as_buy); перевод с обычного
-    кошелька не засчитывается;
+  - покупка = перевод на кошелёк внутри брони по времени блока (premium.counts_as_buy):
+    (а) от пула или роутера токена (ch.market_addresses: кривая, роутеры Pons, V4 PoolManager) или от известного
+        роутера сети из адаптеров Flap / Bankr (bankr.ROUTERS) — без лишних запросов;
+    (б) от любого другого адреса (приложение, агрегатор), если в той же транзакции есть Transfer токена от пула
+        (кривая или V4 PoolManager: токены вышли из пула) — по чеку: один HTTP-батч eth_getTransactionReceipt на
+        такие переводы за проход (ch.receipt_logs, кэш); чека ещё нет — перевод перечитается в следующем проходе;
+    перевод с обычного кошелька (из пула в транзакции ничего не выходило) не засчитывается;
   - нашли — balanceOf кошелька (1 eth_call), привязка, сообщение; бронь прошла (и прочитан блок после её конца) —
     снимается, сообщение "expired".
 Раз в BALANCE_TICK секунд (фоном, priority.background(): уступает живым сканам) — балансы привязок, которым пора
@@ -36,7 +39,7 @@ class Service:
         self.log = log or (lambda m: print(m, flush=True))
         self.threshold = threshold or premium.min_tokens()
         self.token = (token or premium.token()).lower()
-        self._senders, self._decimals = None, None
+        self._senders, self._pools, self._decimals = None, None, None
         self.balance_at = 0.0
         self.thread = None
 
@@ -46,9 +49,16 @@ class Service:
         """Пул и роутеры токена: перевод от них — покупка. Запуск читается один раз (кэш адаптера)."""
         if self._senders is None:
             launch = self.ch.get_launch(self.token)
-            self._senders = (self.ch.market_addresses(launch["curve"]) if launch and launch.get("curve")
+            curve = launch.get("curve") if launch else None
+            self._senders = (self.ch.market_addresses(curve) if curve
                              else set(self.ch.ROUTERS) | {self.ch.V4_POOL_MGR}) | bankr.ROUTERS
+            self._pools = {self.ch.V4_POOL_MGR} | ({curve.lower()} if curve else set())
         return self._senders
+
+    def pools(self):
+        """Пул токена (кривая и V4 PoolManager): Transfer токена от него в транзакции — токены вышли из пула."""
+        self.senders()
+        return self._pools
 
     def decimals(self):
         if self._decimals is None:
@@ -110,14 +120,30 @@ class Service:
             for t in trs:
                 if t.get("ts") is None:
                     t["ts"] = ts.get(t["block"])
-        senders, done = self.senders(), set()
+        senders, done, other = self.senders(), set(), []
         for t in trs:
             r = by_wallet.get(t["to"])
-            if r and r["wallet"] not in done and premium.counts_as_buy(t, r, senders):
+            if not r or r["wallet"] in done or not premium.in_window(t, r):
+                continue
+            if premium.counts_as_buy(t, r, senders):
                 done.add(r["wallet"])
                 self.verified(r, t, now)
+            else:
+                other.append((t, r))           # не от пула / роутера: покупка ли — по чеку транзакции
+        other = [(t, r) for t, r in other if r["wallet"] not in done]
+        retry = set()
+        if other:
+            logs = self.ch.receipt_logs(sorted({t["tx"] for t, _ in other}))
+            for t, r in other:
+                if r["wallet"] in done:
+                    continue
+                if not logs.get(t["tx"]):          # чека ещё нет: перечитать в следующем проходе
+                    retry.add(r["wallet"])
+                elif premium.counts_as_buy(t, r, senders, premium.pool_out(logs[t["tx"]], self.token, self.pools())):
+                    done.add(r["wallet"])
+                    self.verified(r, t, now)
         left = [w for w in by_wallet if w not in done]
-        self.store.set_scanned(left, head)
+        self.store.set_scanned([w for w in left if w not in retry], head)
         for w in left:
             r = by_wallet[w]
             if now >= r["expires_at"] + FINAL_S and self.store.drop_reservation(w):
