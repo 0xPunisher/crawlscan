@@ -14,6 +14,9 @@ Read-only: скан идёт в фоне, браузер опрашивает с
                                             шаблоны ссылки Trade on Axiom ({address}), env TRADE_URL_* (trade.py)
   GET  /api/index?token=CA               -> {"token", "state": ready|building|queued|queue_full|too_large|unavailable|none, "eta_s"[, "position"]} (BANKR_ENABLED)
                                             полный индекс холдеров Bankr готов? (сайт перескан делает, когда ready)
+  GET  /api/replay                       -> {"items": [...], "stats": {...}, "since"} (REPLAY_ENABLED, иначе 404; кэш 60 с)
+                                            Rug Replay: DANGER-токены, упавшие на ≥ 90% после скана, и доли за 7 дней
+  GET  /replay                           -> replay.html (REPLAY_ENABLED, иначе 404)
   GET  /                                 -> index.html
   GET  /favicon.svg, /favicon.png, /apple-touch-icon.png, /favicon.ico  -> иконки из static/
   GET  /health
@@ -59,6 +62,8 @@ user agent crawlscan-bot — SCAN_RATE_BOT_PER_MIN, верный X-Alerts-Secret
 плановые перепроверки отслеживаемых токенов — alerts_recheck.py (свой поток, уступает живым сканам).
 При OPMEM_ENABLED=true результат скана и перепроверки — в очередь памяти операторов (opmem.py: своя база
 memory.db, свой поток записи, токен не чаще раза в OPMEM_MIN_INTERVAL_H); скан запись не ждёт.
+При REPLAY_ENABLED=true — Rug Replay (replay.py): свой поток раз в REPLAY_CHECK_MIN сверяет капу DANGER-токенов из
+memory.db с DexScreener (без RPC), /replay и /api/replay; скан, бот и розыгрыш не трогаются.
 Не больше 3 сканов одновременно (остальные ждут слота), в очереди — не больше SCAN_QUEUE_MAX; сверх очереди — 503 busy
 с Retry-After (кэш и уже идущий скан того же токена отдаются как раньше). Память процесса (memguard.py) выше мягкого
 порога после сброса кэшей — сканы до MAX_CONCURRENT без очереди, выше жёсткого — 503 busy. Раз в минуту в лог
@@ -81,6 +86,7 @@ import engine
 import market
 import memguard
 import opmem
+import replay
 import trade
 import draw_service as ds
 import rewards_service as rs
@@ -111,6 +117,7 @@ CHART_MAX = 500            # чартов в памяти, старые выте
 RECENT_TTL = 15            # секунд: кэш ленты /api/recent (и max-age для Cloudflare)
 STATUS_TTL = 30            # секунд: кэш /api/rewards/status, /api/draw/status, /api/config (и max-age)
 STATUS_CACHE = f"public, max-age={STATUS_TTL}"
+REPLAY_TTL = 60            # секунд: кэш /api/replay (и max-age)
 RECENT_DEFAULT = 12        # записей в ленте по умолчанию
 
 JOBS = {}                  # job_id -> {"token", "chain", "events", "done", "result", "error", "ts"}
@@ -892,10 +899,10 @@ class H(BaseHTTPRequestHandler):
             return self._alerts("GET", u.path, q)
         if u.path == "/api/config":  # фронт и бот: какие сети включены (SOLANA_ENABLED), алерты (ALERTS_ENABLED), Trade on Axiom
             env = tuple(os.environ.get(k) for k in ("SOLANA_ENABLED", "ALERTS_ENABLED", "FLAP_ENABLED", "BANKR_ENABLED",
-                                                    "TRADE_URL_ROBINHOOD", "TRADE_URL_SOLANA"))
+                                                    "REPLAY_ENABLED", "TRADE_URL_ROBINHOOD", "TRADE_URL_SOLANA"))
             body = cached_response(("config",) + env, STATUS_TTL, lambda: {
                 "solana": engine.solana_enabled(), "alerts": alerts.enabled(), "flap": flap.enabled(),
-                "bankr": bankr.enabled(), "trade": trade.templates()})
+                "bankr": bankr.enabled(), "replay": replay.enabled(), "trade": trade.templates()})
             return self._send(200, body, cache=STATUS_CACHE)
         if u.path == "/api/index":   # Bankr: готов ли полный индекс холдеров (сайт перескан делает, когда ready)
             token = (q.get("token") or [""])[0]
@@ -907,6 +914,17 @@ class H(BaseHTTPRequestHandler):
                 return self._send(400, {"error": str(e)})
             return self._send(200, {"token": ca, **bankr.index_status(ca)} if chain == "robinhood" else
                               {"token": ca, "state": "none", "eta_s": None})
+        if u.path in ("/api/replay", "/replay"):   # Rug Replay: выключено — страницы и API нет
+            if not replay.enabled():
+                return self._send(404, {"error": "not found"})
+            if u.path == "/replay":
+                return self._send_page(os.path.join(ROOT, "replay.html"))
+            try:
+                body = cached_response(("replay",), REPLAY_TTL, lambda: replay.api(replay.db_path()))
+            except Exception as e:   # сбой базы: не кэшируется, процесс живёт
+                print(f"replay: not read: {type(e).__name__}: {e}", flush=True)
+                return self._send(503, {"error": "temporarily unavailable"})
+            return self._send(200, body, cache=f"public, max-age={REPLAY_TTL}")
         if u.path == "/api/chart":
             try:
                 return self._send(200, get_chart((q.get("token") or [""])[0]))
@@ -1011,6 +1029,19 @@ def start_alerts_rechecker():
         memory_high=lambda: memguard.over(live=1)).start()
 
 
+def start_replay_checker():
+    """Rug Replay: фоновая проверка исхода DANGER-токенов — только при REPLAY_ENABLED=true."""
+    if not replay.enabled():
+        return None
+    cfg = replay.config()
+    print(f"replay: checks every {cfg['check_min']} min, market cap at scan >= ${cfg['min_mcap']:,.0f}, "
+          f"clean max {cfg['max_clean_per_hour']}/hour, db {replay.db_path()}", flush=True)
+    if not opmem.enabled():
+        print("replay: OPMEM_ENABLED is off, new scans are not recorded: only scans already in memory.db are checked",
+              flush=True)
+    return replay.Checker(replay.db_path(), cfg).start()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"rh-crawler on http://0.0.0.0:{port}", flush=True)
@@ -1019,4 +1050,5 @@ if __name__ == "__main__":
     start_draw_scheduler()
     start_rewards_scheduler()
     start_alerts_rechecker()
+    start_replay_checker()
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()

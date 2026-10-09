@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rug Replay · CRAWLSCAN</title>
+<meta name="description" content="Tokens CrawlScan marked DANGER, and what their market cap did after the scan.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#07090b;--card:#0b1013;--card2:#090c0f;--line:#141b20;--line2:#1c252b;--text:#c9d1d6;--hi:#eef1f3;--dim:#8a959c;
+  --mute:#5f6b72;--green:#00c805;--red:#ff4d4d;--blue:#9fd9ff;--sol:#9945FF;--flap:#f472b6;--bankr:#ff8a3d;
+  --mono:'JetBrains Mono',ui-monospace,monospace;--sans:'Geist',Helvetica,Arial,sans-serif}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased;font-family:var(--sans)}
+a{color:var(--dim);text-decoration:none}
+a:hover{color:#fff}
+.wrap{max-width:1280px;margin:0 auto;padding:0 32px}
+header{border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba(7,9,11,0.92);backdrop-filter:blur(8px);z-index:5}
+.head{height:64px;display:flex;align-items:center;justify-content:space-between;gap:16px}
+.logo{display:flex;align-items:center;gap:10px;color:var(--hi);font-family:var(--mono);font-size:15px;font-weight:500;letter-spacing:0.08em}
+nav{display:flex;align-items:center;gap:28px;font-family:var(--mono);font-size:13px}
+nav .on{color:var(--hi)}
+nav svg{display:block}
+main{padding:56px 0 72px}
+.kicker{font-family:var(--mono);font-size:12px;color:var(--mute);letter-spacing:0.06em;text-transform:uppercase}
+h1{margin:10px 0 12px;font-size:44px;line-height:1.05;letter-spacing:-0.03em;color:var(--hi);font-weight:600}
+h1 span{color:var(--red)}
+.lead{margin:0;max-width:640px;font-size:16px;line-height:1.55;color:var(--dim);text-wrap:pretty}
+.stats{margin:32px 0 28px;display:flex;flex-wrap:wrap;align-items:stretch;gap:12px}
+.stat{flex:1 1 240px;min-width:0;padding:16px 18px;border:1px solid var(--line);border-radius:12px;background:linear-gradient(180deg,#0c1114,#090c0f)}
+.stat .k{font-family:var(--mono);font-size:11.5px;color:var(--mute);letter-spacing:0.04em}
+.stat .v{margin-top:6px;font-family:var(--mono);font-size:24px;color:var(--hi);font-variant-numeric:tabular-nums}
+.stat .s{margin-top:4px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+.stat.collect .v{font-size:15px;color:var(--dim);padding-top:6px}
+.v.red{color:var(--red)} .v.green{color:var(--green)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
+.card{display:flex;flex-direction:column;gap:14px;min-width:0;padding:20px 20px 18px;border:1px solid var(--line);border-radius:14px;
+  background:linear-gradient(180deg,#0c1114,#090c0f);box-shadow:inset 0 1px 0 rgba(255,255,255,0.03)}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;min-width:0}
+.name{min-width:0;font-size:18px;font-weight:600;color:var(--hi);letter-spacing:-0.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tick{font-family:var(--mono);font-size:13px;color:var(--dim);font-weight:400;margin-left:6px}
+.pills{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end;flex-shrink:0}
+.pill{font-family:var(--mono);font-size:10.5px;padding:2px 8px;border-radius:999px;white-space:nowrap;border:1px solid currentColor}
+.addr{display:flex;align-items:center;gap:8px;min-width:0;font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+.addr code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.copy{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;flex-shrink:0;border:1px solid var(--line2);
+  border-radius:7px;background:var(--card);color:var(--dim);cursor:pointer}
+.copy:hover{color:#fff;border-color:#2c353b}
+.copy svg{display:block}
+.verdict{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+.band{color:var(--red);border:1px solid rgba(255,77,77,0.55);background:rgba(255,77,77,0.08);padding:2px 8px;border-radius:6px;font-size:11.5px;letter-spacing:0.04em}
+.rug{color:var(--red)}
+.mcap{padding:14px 14px 12px;border:1px solid var(--line);border-radius:10px;background:var(--card2)}
+.mcap .k{font-family:var(--mono);font-size:11px;color:var(--mute);letter-spacing:0.04em}
+.mcap .row{margin-top:6px;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;font-family:var(--mono);font-variant-numeric:tabular-nums}
+.mcap .from{font-size:17px;color:var(--text)}
+.mcap .arrow{color:var(--mute)}
+.mcap .to{font-size:17px;color:var(--hi)}
+.mcap .pct{font-size:15px;color:var(--red)}
+.when{font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+.when b{color:var(--text);font-weight:500}
+.foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:12px;border-top:1px solid var(--line);font-family:var(--mono);font-size:12px;color:var(--mute)}
+.again{color:var(--blue);font-size:13px}
+.again:hover{color:#fff}
+.empty{padding:48px 24px;border:1px dashed var(--line2);border-radius:14px;background:var(--card2);text-align:center;font-family:var(--mono);font-size:14px;line-height:1.6;color:var(--dim)}
+.skel{height:240px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(90deg,#0b1013 0%,#10171b 50%,#0b1013 100%);background-size:200% 100%;animation:sk 1.4s linear infinite}
+@keyframes sk{from{background-position:200% 0}to{background-position:-200% 0}}
+.note{margin-top:40px;font-family:var(--mono);font-size:11.5px;color:var(--mute);line-height:1.6}
+@media (max-width:640px){
+  .wrap{padding:0 16px}
+  nav{gap:14px}
+  nav .wide{display:none}
+  main{padding:36px 0 56px}
+  h1{font-size:32px}
+  .lead{font-size:15px}
+  .grid{grid-template-columns:minmax(0,1fr)}
+  .card{padding:16px}
+  .top{flex-direction:column;gap:8px}
+  .pills{justify-content:flex-start}
+  .name{white-space:normal}
+}
+@media (prefers-reduced-motion:reduce){.skel{animation:none}}
+</style>
+</head>
+<body>
+<header><div class="wrap head">
+  <a class="logo" href="/" aria-label="CRAWLSCAN home">
+    <svg width="22" height="20" viewBox="0 0 30 26" fill="none" aria-hidden="true">
+      <g stroke="#00c805" stroke-width="1.3" stroke-linecap="round"><line x1="11" y1="9" x2="3" y2="3"></line><line x1="11" y1="13" x2="1" y2="13"></line><line x1="11" y1="17" x2="3" y2="23"></line><line x1="19" y1="9" x2="27" y2="3"></line><line x1="19" y1="13" x2="29" y2="13"></line><line x1="19" y1="17" x2="27" y2="23"></line></g>
+      <rect x="10.5" y="5.5" width="9" height="15" rx="3" fill="#0f1a14" stroke="#00c805" stroke-width="1.4"></rect>
+      <circle cx="15" cy="9.5" r="1.9" fill="#00c805"></circle>
+    </svg>
+    <span>CRAWLSCAN</span>
+  </a>
+  <nav>
+    <a class="wide" href="/">scanner</a>
+    <a class="on" href="/replay" aria-current="page">Rug Replay</a>
+    <a href="https://x.com/0x_Punisher" target="_blank" rel="noopener">X</a>
+    <a href="https://t.me/CrawlScanBot" target="_blank" rel="noopener" aria-label="Telegram bot" title="Telegram bot"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.5 3.5 2.5 11l7 2.6 2.6 7.4 9.4-17.5Z"></path><path d="m9.5 13.6 6.5-5.1"></path></svg></a>
+  </nav>
+</div></header>
+
+<main class="wrap">
+  <div class="kicker">rug replay · last 7 days</div>
+  <h1>Marked <span>DANGER</span>. Then it fell.</h1>
+  <p class="lead">Tokens CrawlScan marked DANGER whose market cap later fell 90% or more from the moment of the scan.</p>
+
+  <section class="stats" id="stats" aria-live="polite"></section>
+  <section id="list"><div class="grid"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div></section>
+
+  <p class="note">Facts only: market cap at the time of the scan vs now. Not financial advice.</p>
+</main>
+
+<script>
+(function(){
+  'use strict';
+  var ICON_COPY='<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"></rect><path d="M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5h-5A1.5 1.5 0 0 0 2.5 3v5a1.5 1.5 0 0 0 1.5 1.5h.5"></path></svg>';
+  var ICON_CHECK='<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#00c805" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5l3.2 3L13 4.5"></path></svg>';
+  var CHAIN={robinhood:['Robinhood','#00c805'],solana:['Solana','#9945FF']};
+  var PAD={flap:['Flap','#f472b6'],bankr:['Bankr','#ff8a3d']};
+  var esc=function(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});};
+  var short=function(a){a=String(a||'');return a.length>14?a.slice(0,6)+'…'+a.slice(-4):a;};
+  var usd=function(v){
+    if(v==null||!isFinite(v)) return '—';
+    var a=Math.abs(v);
+    if(a>=1e9) return '$'+(v/1e9).toFixed(2)+'B';
+    if(a>=1e6) return '$'+(v/1e6).toFixed(2)+'M';
+    if(a>=1e3) return '$'+(v/1e3).toFixed(1)+'K';
+    return '$'+Math.round(v);
+  };
+  var pct=function(x){return x==null||!isFinite(x)?'—':Math.round(x*100)+'%';};
+  var hours=function(h){
+    if(h==null||!isFinite(h)) return '';
+    if(h<1) return 'less than an hour after the scan';
+    var n=Math.round(h); return n+(n===1?' hour':' hours')+' after the scan';
+  };
+  var ago=function(ts){
+    if(!ts) return '';
+    var s=Math.max(0,Date.now()/1000-ts);
+    if(s<3600) return Math.max(1,Math.round(s/60))+'m ago';
+    if(s<86400) return Math.round(s/3600)+'h ago';
+    return Math.round(s/86400)+'d ago';
+  };
+
+  function statCard(label,g,color){
+    return '<div class="stat"><div class="k">'+label+'</div><div class="v '+color+'">'+pct(g.share)+'</div>'+
+      '<div class="s">'+g.fell+' of '+g.tokens+' tokens · scans older than 24 h, last 7 days</div></div>';
+  }
+  function renderStats(st){
+    var el=document.getElementById('stats');
+    if(!st){el.innerHTML='';return;}
+    if(!st.ready){
+      el.innerHTML='<div class="stat collect"><div class="k">DANGER vs CLEAN · tokens older than 24 h · last 7 days</div>'+
+        '<div class="v">collecting data</div><div class="s">'+st.danger.tokens+' DANGER · '+st.clean.tokens+
+        ' CLEAN/OK so far, '+st.min_tokens+' needed in each</div></div>';
+      return;
+    }
+    el.innerHTML=statCard('Marked DANGER · fell 90%+ after the scan',st.danger,'red')+
+      statCard('Marked CLEAN or OK · fell 90%+ after the scan',st.clean,'green');
+  }
+  function card(x){
+    var ch=CHAIN[x.chain]||[x.chain||'','#8a959c'];
+    var pad=PAD[x.launchpad]||(x.chain==='solana'?['pump.fun','#8a959c']:['Pons','#8a959c']);
+    var title=x.name||x.ticker||short(x.token);
+    var tick=x.name&&x.ticker?'<span class="tick">$'+esc(x.ticker)+'</span>':'';
+    var score=x.score!=null?'<span>score '+esc(x.score)+'</span>':'';
+    var rug=x.rug_drop!=null?'<span class="rug">▼ probably rug −'+Math.round(x.rug_drop*100)+'%</span>':'';
+    var nowPct=x.drop_now!=null?(x.drop_now>=0?'−'+pct(x.drop_now):'+'+pct(-x.drop_now)):'';
+    return '<article class="card">'+
+      '<div class="top"><div class="name" title="'+esc(title)+'">'+esc(title)+tick+'</div>'+
+        '<div class="pills"><span class="pill" style="color:'+ch[1]+'">'+esc(ch[0])+'</span>'+
+        '<span class="pill" style="color:'+pad[1]+'">'+esc(pad[0])+'</span></div></div>'+
+      '<div class="addr"><code title="'+esc(x.token)+'">'+esc(short(x.token))+'</code>'+
+        '<button class="copy" type="button" data-copy="'+esc(x.token)+'" title="copy contract address" aria-label="copy contract address">'+ICON_COPY+'</button></div>'+
+      '<div class="verdict"><span class="band">'+esc(x.band||'DANGER')+'</span>'+score+rug+'</div>'+
+      '<div class="mcap"><div class="k">market cap at scan → now</div><div class="row">'+
+        '<span class="from">'+usd(x.mcap_scan)+'</span><span class="arrow">→</span><span class="to">'+usd(x.mcap_now)+'</span>'+
+        '<span class="pct">'+nowPct+'</span></div></div>'+
+      '<div class="when">fell 90%+ <b>'+esc(hours(x.hours_after))+'</b></div>'+
+      '<div class="foot"><span>scanned '+esc(ago(x.scan_ts))+'</span>'+
+        '<a class="again" href="/?ca='+encodeURIComponent(x.token)+'">Scan again →</a></div>'+
+      '</article>';
+  }
+  function renderList(items){
+    var el=document.getElementById('list');
+    if(!items||!items.length){
+      el.innerHTML='<div class="empty">Tracking started today. Confirmed cases appear here as they happen.</div>';
+      return;
+    }
+    el.innerHTML='<div class="grid">'+items.map(card).join('')+'</div>';
+  }
+  function load(){
+    fetch('/api/replay',{cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(d){
+      if(!d){renderStats(null);renderList([]);return;}
+      try{renderStats(d.stats);renderList(d.items);}catch(e){console.warn('replay: render failed',e);}
+    }).catch(function(){renderStats(null);renderList([]);});
+  }
+  document.addEventListener('click',function(e){
+    var b=e.target.closest&&e.target.closest('button[data-copy]');
+    if(!b) return;
+    var v=b.getAttribute('data-copy'), done=function(){b.innerHTML=ICON_CHECK;setTimeout(function(){b.innerHTML=ICON_COPY;},1500);};
+    var legacy=function(){   // Clipboard API нет или отказал — через выделение
+      var t=document.createElement('textarea');t.value=v;t.setAttribute('readonly','');t.style.position='fixed';t.style.opacity='0';
+      document.body.appendChild(t);t.select();
+      try{if(document.execCommand('copy')) done();}catch(_){}
+      document.body.removeChild(t);
+    };
+    if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(v).then(done,legacy);
+    else legacy();
+  });
+  load();
+  setInterval(function(){if(!document.hidden) load();},60000);
+})();
+</script>
+</body></html>

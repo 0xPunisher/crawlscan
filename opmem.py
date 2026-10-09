@@ -11,7 +11,8 @@
 индекс холдеров строится) не закрывает интервал для полного: полный скан того же токена после него пишется.
 
 Таблицы:
-  scans(token, chain, launchpad, ts, band, score, limited, partial, holders_total, unread, deployer)
+  scans(token, chain, launchpad, ts, band, score, limited, partial, holders_total, unread, deployer,
+        mcap_usd, fdv_usd, price_usd, liquidity_usd, market_source, rug_drop, name, ticker)
   operators(token, ts, operator_id, wallets JSON, n_wallets, level, kinds, share, share_supply)
   wallets(wallet, token, ts, roles, operator_id, share, share_supply)
 operator_id — sha1 отсортированных кошельков (первые 16 hex): тот же набор кошельков в другом токене — тот же id.
@@ -19,6 +20,9 @@ roles — через запятую: top_holder, dev, early_buyer (вход в �
 transfer_received, linked (в операторе из ≥ 2 кошельков или раздатчик токена такого оператора).
 Bankr: dev — деплоер (получатель комиссий LP) и бенефициары вестинга; доля дева вне топа — из dev_holding.
 Доли: share — от оборота, share_supply — от сапплая.
+Рынок на момент скана (mcap_usd, fdv_usd, price_usd, liquidity_usd, market_source, имя и тикер — из шапки результата,
+rug_drop — падение probably rug, если был) — для Rug Replay (replay.py). Старая база дополняется колонками при
+открытии (migrate), строки не трогаются.
 """
 import hashlib, json, os, queue, sqlite3, threading, time
 
@@ -35,6 +39,7 @@ CREATE TABLE IF NOT EXISTS scans (
   token TEXT NOT NULL, chain TEXT NOT NULL, launchpad TEXT, ts INTEGER NOT NULL, band TEXT NOT NULL, score INTEGER,
   limited INTEGER NOT NULL, partial INTEGER NOT NULL, holders_total INTEGER, unread INTEGER, deployer TEXT);
 CREATE INDEX IF NOT EXISTS scans_token ON scans(token, ts);
+CREATE INDEX IF NOT EXISTS scans_ts ON scans(ts);
 CREATE TABLE IF NOT EXISTS operators (
   token TEXT NOT NULL, ts INTEGER NOT NULL, operator_id TEXT NOT NULL, wallets TEXT NOT NULL, n_wallets INTEGER NOT NULL,
   level TEXT, kinds TEXT, share REAL, share_supply REAL);
@@ -46,6 +51,24 @@ CREATE TABLE IF NOT EXISTS wallets (
 CREATE INDEX IF NOT EXISTS wallets_wallet ON wallets(wallet);
 CREATE INDEX IF NOT EXISTS wallets_token ON wallets(token);
 """
+# колонки scans, добавленные после первой версии (Rug Replay): рынок на момент скана; старая база — ALTER TABLE
+MARKET_COLUMNS = (("mcap_usd", "REAL"), ("fdv_usd", "REAL"), ("price_usd", "REAL"), ("liquidity_usd", "REAL"),
+                  ("market_source", "TEXT"), ("rug_drop", "REAL"), ("name", "TEXT"), ("ticker", "TEXT"))
+SCAN_COLUMNS = ("token", "chain", "launchpad", "ts", "band", "score", "limited", "partial", "holders_total", "unread",
+                "deployer") + tuple(c for c, _ in MARKET_COLUMNS)
+
+
+def migrate(con):
+    """Схема памяти операторов на соединении con: таблицы, индексы и недостающие колонки scans (данные не трогаются)."""
+    con.executescript(SCHEMA)
+    have = {r[1] for r in con.execute("PRAGMA table_info(scans)")}
+    for col, typ in MARKET_COLUMNS:
+        if col not in have:
+            try:
+                con.execute(f"ALTER TABLE scans ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError as e:   # другое соединение (поток Rug Replay) успело раньше
+                if "duplicate column" not in str(e):
+                    raise
 
 
 def enabled():
@@ -86,6 +109,14 @@ def _f(x):
     return round(float(x), 6) if isinstance(x, (int, float)) else None
 
 
+def _usd(x):
+    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+
+
+def _txt(x, n=64):
+    return x.strip()[:n] or None if isinstance(x, str) else None
+
+
 def rows(result, ts):
     """Результат engine.scan → (scan, [operators], [wallets]) для записи. Чистая функция, без сети."""
     token = result["token"]
@@ -96,6 +127,11 @@ def rows(result, ts):
             "ts": ts, "band": result["band"], "score": int(score) if isinstance(score, (int, float)) else None,
             "limited": int(bool(result.get("limited"))), "partial": int(bool(result.get("partial_scan"))),
             "holders_total": result.get("holders_total"), "unread": len(result.get("unread") or []), "deployer": dev}
+    head, rug = result.get("header") or {}, result.get("rug") or {}
+    scan |= {"mcap_usd": _usd(head.get("mcap_usd")), "fdv_usd": _usd(head.get("fdv_usd")),
+             "price_usd": _usd(head.get("price_usd")), "liquidity_usd": _usd(head.get("liquidity_usd")),
+             "market_source": result.get("market_source"), "rug_drop": _f(rug.get("drop")) if rug else None,
+             "name": _txt(head.get("name")), "ticker": _txt(head.get("ticker"), 32)}
 
     links = result.get("links") or []
     ops, op_of = [], {}
@@ -162,7 +198,7 @@ class Store:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.db = db.connect(path)
         with self.db:
-            self.db.executescript(SCHEMA)
+            migrate(self.db)
 
     def close(self):
         self.db.close()
@@ -180,8 +216,8 @@ class Store:
             return False
         scan, ops, wal = rows(result, ts)
         with self.db:
-            self.db.execute("INSERT INTO scans VALUES (:token, :chain, :launchpad, :ts, :band, :score, :limited, "
-                            ":partial, :holders_total, :unread, :deployer)", scan)
+            self.db.execute(f"INSERT INTO scans ({', '.join(SCAN_COLUMNS)}) "
+                            f"VALUES ({', '.join(':' + c for c in SCAN_COLUMNS)})", scan)
             self.db.executemany("INSERT INTO operators VALUES (:token, :ts, :operator_id, :wallets, :n_wallets, "
                                 ":level, :kinds, :share, :share_supply)", ops)
             self.db.executemany("INSERT INTO wallets VALUES (:wallet, :token, :ts, :roles, :operator_id, :share, "

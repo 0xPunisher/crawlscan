@@ -65,6 +65,7 @@
   - Flap (только при /api/config → flap и только у токенов Flap): бейдж Flap у сети, фаза, налог,
     «tax goes to the dev», flap.sh в шапке; факт pool; карточка «chart appears after the token graduates»
     у токена на кривой; бейдж в ленте; «Robinhood (Pons, Flap) and Solana» и карточка роадмапа.
+  - Rug Replay (только при /api/config → replay): ссылка «Rug Replay» на /replay в шапке (на телефоне — в меню).
   - Bankr (только при /api/config → bankr и только у токенов Bankr): бейдж и пара в шапке, факт pool, вестинг дева
     у критерия операторов, сообщение частичного скана и перескан по готовому индексу (/api/index), бейдж в ленте,
     Bankr в тексте площадок и карточка роадмапа.
@@ -1863,6 +1864,20 @@ rep("      flapOn2:!!this.state.flapOn,", "      flapOn2:!!this.state.flapOn, ba
 bankr_card = (f'<sc-if value="{{{{bankrOn2}}}}" hint-placeholder-val="{{{{false}}}}">' + ITEM + TITLE + 'Bankr launchpad</span>' + DESC
               + 'Bankr tokens on Robinhood Chain: ETH or stock token pair, dev vesting, full holder history, early buyers, same verdict.</span></div></sc-if>\n')
 rep(flap_card, flap_card + bankr_card)
+
+# Rug Replay (только при REPLAY_ENABLED: /api/config → replay): ссылка /replay в шапке первой, на телефоне — в меню
+REPLAY_LINK = ('<sc-if value="{{replayOn}}" hint-placeholder-val="{{false}}"><a class="cs-wide" href="/replay" data-replay="1" '
+               'data-grip="1" style="color:#8a959c" style-hover="color:#ffffff">Rug Replay</a></sc-if>\n        ')
+rep('<a class="cs-wide" href="#how" sc-camel-on-click="{{navHow}}" data-grip="1"',
+    REPLAY_LINK + '<a class="cs-wide" href="#how" sc-camel-on-click="{{navHow}}" data-grip="1"')
+rep(menu_link("navToken", "#token", "the token"),
+    '<sc-if value="{{replayOn}}" hint-placeholder-val="{{false}}"><a href="/replay" style="display:block;padding:10px 12px;'
+    'border-radius:6px;color:#c9d1d6" style-hover="background:#121a1f;color:#ffffff">Rug Replay</a></sc-if>'
+    + menu_link("navToken", "#token", "the token"))
+rep(".then(d=>this.setState({solanaOn:!!d.solana,trade:d.trade||null,flapOn:!!d.flap,bankrOn:!!d.bankr}))",
+    ".then(d=>this.setState({solanaOn:!!d.solana,trade:d.trade||null,flapOn:!!d.flap,bankrOn:!!d.bankr,replayOn:!!d.replay}))")
+rep("      flapOn2:!!this.state.flapOn, bankrOn2:!!this.state.bankrOn,\n",
+    "      flapOn2:!!this.state.flapOn, bankrOn2:!!this.state.bankrOn, replayOn:!!this.state.replayOn,\n")
 
 enc = encode(t)
 TITLE_OLD = '<title>Bundled Page</title>'

@@ -133,7 +133,7 @@ def reserve_seen(reserve, supply, gt):
 def _header(gt, meta=None, age_h=None):
     meta = meta or {}
     return {"name": gt.get("name") or meta.get("name"), "ticker": gt.get("ticker") or meta.get("symbol"),
-            "price_usd": gt.get("price_usd"), "mcap_usd": gt.get("mcap_usd"),
+            "price_usd": gt.get("price_usd"), "mcap_usd": gt.get("mcap_usd"), "fdv_usd": gt.get("fdv_usd"),
             "liquidity_usd": gt.get("liquidity_usd"), "vol24h_usd": gt.get("vol24h_usd"), "age_h": age_h}
 
 
