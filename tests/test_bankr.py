@@ -1140,5 +1140,4 @@ class TestB2Frontend(unittest.TestCase):
         self.assertIn("'/api/index?token='", t)
         self.assertIn("dev vesting: ${bankrPct(v.total_share_supply)} (${bankrPct(v.unlocked_share_supply)} unlocked)", t)
         self.assertIn('<sc-if value="{{partialOn}}"', t)
-        m = t.index("Bankr launchpad</span>")
-        self.assertIn('<sc-if value="{{bankrOn2}}"', t[m - 600:m])
+        self.assertNotIn("Bankr launchpad</span>", t)                            # роадмап заменён таймлайном
