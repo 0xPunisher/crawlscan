@@ -62,11 +62,13 @@ class CrawlScan:
         except (OSError, ValueError) as e:
             raise ApiError(f"{path}: {e}") from None
 
-    def scan(self, token):
+    def scan(self, token, user_id=None):
         """Запустить скан (или получить кэш сайта) → job id. С секретом алертов сайт не ограничивает частоту сканов
-        бота (лимит новых сканов по IP — для остальных)."""
+        бота (лимит новых сканов по IP — для остальных). user_id (Telegram ID, только с секретом) — сайт сам
+        проверяет премиум и при PREMIUM_PRIORITY ставит скан первым в очередь ожидания."""
         headers = {"X-Alerts-Secret": self.alerts_secret} if self.alerts_secret else None
-        job = self._req("/api/scan", {"token": token}, headers=headers).get("job")
+        body = {"token": token} | ({"user_id": user_id} if user_id is not None and self.alerts_secret else {})
+        job = self._req("/api/scan", body, headers=headers).get("job")
         if not job:
             raise ApiError("no job in /api/scan response")
         return job
@@ -114,3 +116,19 @@ class CrawlScan:
 
     def premium_admin_unlink(self, wallet):
         return self._premium("/api/premium/admin_unlink", {"wallet": wallet})
+
+    def premium_import(self, user_id):
+        """Импорт из кошелька: {"items": [{"token", "ticker", "launchpad", "value_usd", "status", "watching"}],
+        "watch_count", "limit", "cached"} | {"status": 403 (не премиум) | 429 ("retry_in")}."""
+        return self._req("/api/premium/import", {"user_id": user_id}, headers={"X-Alerts-Secret": self.alerts_secret},
+                         ok=(403, 429))
+
+    def premium_import_add(self, user_id, tokens):
+        """tokens — список адресов или "all": {"added", "already", "full", "skipped", "watch_count", "limit"} |
+        {"status": 410} (просмотр устарел) | {"status": 403}."""
+        return self._req("/api/premium/import_add", {"user_id": user_id, "tokens": tokens},
+                         headers={"X-Alerts-Secret": self.alerts_secret}, ok=(403, 410))
+
+    def premium_digest(self, user_id, on=None):
+        """/digest: {"digest": bool, "hour", "premium"}; on=None — только узнать."""
+        return self._premium("/api/premium/digest", {"user_id": user_id} | ({} if on is None else {"on": on}))

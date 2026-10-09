@@ -13,7 +13,9 @@ PREMIUM_ADMIN_ID — Telegram ID админов Premium через запяту�
 ALERTS_API_SECRET): /watch <адрес>, /watchlist, /unwatch <адрес>, кнопка [Watch] под вердиктом, [Unwatch] под
 уведомлением (уведомления шлёт сайт); иначе — «coming soon». Premium (только личка, если /api/config → premium):
 /verify [кошелёк] — бронь кошелька на 15 минут (покупку ищет и сообщение шлёт сайт), /premium, /unlink,
-/admin_unlink <кошелёк> (только PREMIUM_ADMIN_ID); значок ⭐ Premium под вердиктом. Выключен — как раньше (подсказка). /rewards — статус наград и сжиганий с сайта (/api/rewards/status). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
+/admin_unlink <кошелёк> (только PREMIUM_ADMIN_ID); значок ⭐ Premium под вердиктом. Функции премиума — по полям
+/api/config: premium_priority (Telegram ID в /api/scan), premium_import ([📥 Import from wallet] в /premium и Watchlist),
+premium_digest (/digest on|off). Выключен — как раньше (подсказка). /rewards — статус наград и сжиганий с сайта (/api/rewards/status). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
 Лимиты: 1 скан на пользователя в USER_COOLDOWN секунд, не больше WORKERS сканов одновременно (остальные — в очереди).
 """
 import math, os, queue, sys, threading, time, traceback
@@ -45,7 +47,10 @@ WATCH_COMMANDS = [{"command": "watch", "description": "Get alerts for a token: /
 PREMIUM_COMMANDS = [{"command": "verify", "description": "Link your $CrawlScan wallet for Premium"},
                     {"command": "premium", "description": "Your Premium status"},
                     {"command": "unlink", "description": "Unlink your wallet"}]
-PREMIUM_CMDS = ("verify", "premium", "unlink", "admin_unlink")
+DIGEST_COMMAND = {"command": "digest", "description": "Morning digest of your watchlist: /digest on|off"}
+PREMIUM_CMDS = ("verify", "premium", "unlink", "admin_unlink", "digest")
+PREMIUM_FEATURES = ("premium_priority", "premium_import", "premium_digest")   # поля /api/config (только включённые)
+WATCHLIST_BUTTON = {"inline_keyboard": [[{"text": "🔔 Watchlist", "callback_data": "watchlist"}]]}
 ALERTS_CHECK_TTL = 60  # секунд: сколько помнить, включены ли алерты на сайте
 PREMIUM_TTL = 300      # секунд: сколько помнить, премиум ли пользователь (значок под вердиктом)
 AWAIT_WATCH = 300      # секунд: после [➕ New] следующий адрес от чата — подписка, а не скан
@@ -89,6 +94,7 @@ class Bot:
         self.awaiting = {}           # chat_id -> clock() до которого ждём адрес для подписки ([➕ New])
         self.tickers = {}            # адрес токена -> тикер из последнего скана (сайт тикеры подписок не хранит)
         self.premium_seen = None     # (clock(), включён ли Premium на сайте) — вместе с alerts_seen
+        self.premium_feats = set()   # включённые функции премиума (/api/config: premium_priority, ...) — с alerts_seen
         self.premium_users = {}      # user_id -> (clock(), премиум ли): значок под вердиктом
         self.awaiting_wallet = {}    # chat_id -> clock() до которого ждём адрес кошелька после /verify
         self.admin_ids = admin_ids if admin_ids is not None else admin_ids_env()
@@ -203,6 +209,13 @@ class Bot:
                 self.alerts_command(chat_id, "remove" if cmd == "rm" else cmd, found[1], edit=mid)
         elif data == "watchlist" and private:
             self.alerts_command(chat_id, "watchlist", "")
+        elif data == "imp" and private:
+            self.import_command(chat_id, (cq.get("from") or {}).get("id", chat_id))
+        elif cmd == "ia" and addr and private:
+            found = T.find_address(addr) if addr != "all" else (None, "all")
+            if found:
+                self.import_command(chat_id, (cq.get("from") or {}).get("id", chat_id),
+                                    "all" if addr == "all" else [found[1]])
         elif data == "new" and private:
             self.awaiting[chat_id] = self.clock() + AWAIT_WATCH    # сразу: адрес может прийти раньше ответа сайта
             self.awaiting_wallet.pop(chat_id, None)
@@ -248,10 +261,12 @@ class Bot:
         try:
             cfg = self.api.config()
             on, prem = bool(cfg.get("alerts")), bool(cfg.get("premium"))
+            feats = {k for k in PREMIUM_FEATURES if cfg.get(k)} if prem else set()
         except (ApiError, Rejected, AttributeError) as e:
             self.log(f"api config: {e}")
             on = prem = False
-        self.alerts_seen, self.premium_seen = (now, on), (now, prem)
+            feats = set()
+        self.alerts_seen, self.premium_seen, self.premium_feats = (now, on), (now, prem), feats
         return on
 
     def launchpads(self):
@@ -305,7 +320,7 @@ class Bot:
             return (T.UNWATCH_USAGE if cmd == "unwatch" else T.WATCH_USAGE), None
         try:
             if cmd == "watchlist":
-                return T.watchlist_view(self.api.watch_list(chat_id), now, self.tickers)
+                return self.with_import(chat_id, T.watchlist_view(self.api.watch_list(chat_id), now, self.tickers))
             if cmd == "ask":
                 r = self.api.watch_list(chat_id)
                 if len(r.get("items") or []) >= r.get("limit", 3):
@@ -317,7 +332,7 @@ class Bot:
             if cmd == "remove":
                 self.api.unwatch(chat_id, found[1])
                 self.log(f"unwatch {found[1]} chat {chat_id}")
-                return T.watchlist_view(self.api.watch_list(chat_id), now, self.tickers)
+                return self.with_import(chat_id, T.watchlist_view(self.api.watch_list(chat_id), now, self.tickers))
             r = self.api.watch(chat_id, found[1])
             if r.get("status") == 409:
                 if cmd == "new":
@@ -354,6 +369,11 @@ class Bot:
             self.alerts_seen = None
             self.alerts_on()
         return bool(self.premium_seen and self.premium_seen[1])
+
+    def feature(self, name):
+        """Функция премиума включена на сайте (premium_priority / premium_import / premium_digest): тот же запрос
+        /api/config и кэш, что у premium_on. Выключена — бот ведёт себя как раньше."""
+        return self.premium_on() and name in self.premium_feats
 
     def is_premium(self, user_id):
         """Премиум ли пользователь (значок под вердиктом): /api/premium/status, помним PREMIUM_TTL секунд.
@@ -398,10 +418,20 @@ class Bot:
         if not self.premium_on():
             self.awaiting_wallet.pop(chat_id, None)
             return T.HINT, None
+        if cmd == "digest" and not self.feature("premium_digest"):
+            return T.HINT, None
         now = time.time() if now is None else now
         wallet = (arg or "").strip()
         valid = bool(T.ADDR_RE.match(wallet))
         try:
+            if cmd == "digest":
+                want = {"on": True, "off": False, "": None}.get(wallet.lower(), "usage")
+                if want == "usage":
+                    return T.DIGEST_USAGE, None
+                r = self.api.premium_digest(user_id, want)
+                if want is not None:
+                    self.log(f"digest {'on' if want else 'off'}")
+                return T.digest_state(r), None
             if cmd == "verify":
                 if not valid:
                     self.awaiting_wallet[chat_id] = self.clock() + AWAIT_WATCH
@@ -440,6 +470,52 @@ class Bot:
         except Exception:
             self.log(f"{cmd} text:\n" + self.tg.redact(traceback.format_exc()))
             return T.UNREACHABLE, None
+
+    # --- Premium: импорт из кошелька (сайт смотрит кошелёк и добавляет; бот только просит) --------------
+
+    def import_command(self, chat_id, user_id, tokens=None):
+        """[📥 Import from wallet] (tokens=None) и [➕ …] / [➕ Add all] (tokens — список адресов или "all")."""
+        def run():
+            html, markup = self.import_text(user_id, tokens)
+            self.send(chat_id, html, markup)
+        self.spawn(run)
+
+    def import_text(self, user_id, tokens=None):
+        """→ (html, кнопки). PREMIUM_IMPORT выключен — подсказка, как раньше."""
+        if not self.feature("premium_import"):
+            return T.HINT, None
+        try:
+            if tokens is None:
+                r = self.api.premium_import(user_id)
+                if r.get("status") == 429:
+                    return T.import_wait(r.get("retry_in") or 600), None
+                if r.get("status") == 403:
+                    return (T.IMPORT_NOT_PREMIUM if r.get("error") == "not premium" else T.UNREACHABLE), None
+                self.log(f"import {len(r.get('items') or [])} shown" + (" cached" if r.get("cached") else ""))
+                return T.import_view(r)
+            r = self.api.premium_import_add(user_id, tokens)
+            if r.get("status") == 410:
+                return T.IMPORT_EXPIRED, {"inline_keyboard": [[T.IMPORT_BUTTON]]}
+            if r.get("status") == 403:
+                return (T.IMPORT_NOT_PREMIUM if r.get("error") == "not premium" else T.UNREACHABLE), None
+            self.log(f"import added {len(r.get('added') or [])}")
+            return T.import_added(r), WATCHLIST_BUTTON
+        except PremiumOff:
+            self.alerts_seen = self.premium_seen = None
+            return T.HINT, None
+        except (ApiError, Rejected) as e:
+            self.log(f"api import: {e}")
+            return T.UNREACHABLE, None
+        except Exception:
+            self.log("import text:\n" + self.tg.redact(traceback.format_exc()))
+            return T.UNREACHABLE, None
+
+    def with_import(self, chat_id, view):
+        """Watchlist премиум-холдера при PREMIUM_IMPORT — ещё ряд [📥 Import from wallet]; иначе как был."""
+        html, markup = view
+        if markup is not None and self.feature("premium_import") and self.is_premium(chat_id):
+            markup = {"inline_keyboard": markup["inline_keyboard"] + [[T.IMPORT_BUTTON]]}
+        return html, markup
 
     # --- сканы ------------------------------------------------------------------------------------
 
@@ -484,17 +560,20 @@ class Bot:
     def run_scan(self, chat_id, mid, addr, was_queued, private=False, user_id=None):
         if was_queued:
             self.edit(chat_id, mid, T.crawling(addr))
-        html, markup = self.scan_text(addr, watch=private)
+        html, markup = self.scan_text(addr, watch=private, user_id=user_id)
         if markup is not None and self.is_premium(user_id):     # вердикт (не ошибка) премиум-пользователю
             html += "\n\n" + T.PREMIUM_BADGE
         self.edit(chat_id, mid, html, markup)
 
-    def scan_text(self, addr, watch=False):
+    def scan_text(self, addr, watch=False, user_id=None):
         """Скан через API сайта → (html, кнопки). watch — личка: кнопка [Watch], если алерты включены
-        и токен не too established."""
+        и токен не too established. user_id — при PREMIUM_PRIORITY уходит на сайт (премиум проверяет сайт)."""
         deadline = self.clock() + self.scan_timeout
         try:
-            job = self.api.scan(addr)
+            if user_id is not None and self.feature("premium_priority"):
+                job = self.api.scan(addr, user_id=user_id)
+            else:
+                job = self.api.scan(addr)
             while True:
                 r = self.api.result(job)
                 if r.get("done"):
@@ -550,7 +629,8 @@ class Bot:
             else:
                 self.sleep(5)
         self.call("setMyCommands", commands=COMMANDS + (WATCH_COMMANDS if self.alerts_on() else [])
-                  + (PREMIUM_COMMANDS if self.premium_on() else []))
+                  + (PREMIUM_COMMANDS if self.premium_on() else [])
+                  + ([DIGEST_COMMAND] if self.feature("premium_digest") else []))
         self.start_workers()
         self.log(f"@{self.username} polling, site {self.api.base}")
         offset, backoff = None, 1

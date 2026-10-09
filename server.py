@@ -58,6 +58,12 @@ Premium для бота (только при PREMIUM_ENABLED=true, иначе 40
                                                    "next_check_at", "grace_until", "reservation", "watch_limit", ...}
   POST /api/premium/unlink {"user_id"}            -> {"ok", "wallet" | null, "removed": [токены, снятые с Watchlist]}
   POST /api/premium/admin_unlink {"wallet"}       -> {"ok", "found", "removed"} (бот пускает только PREMIUM_ADMIN_ID)
+  POST /api/premium/import {"user_id"}            -> топ-5 мемкоинов привязанного кошелька (PREMIUM_IMPORT, иначе 404;
+                                                   403 — не премиум; чаще раза в 10 мин — тот же список или 429)
+  POST /api/premium/import_add {"user_id", "tokens": [...] | "all"} -> {"added", "already", "full", "skipped"};
+                                                   410 — просмотра нет или устарел
+  POST /api/premium/digest {"user_id"[, "on"]}    -> {"digest", "hour", "premium"} (PREMIUM_DIGEST, иначе 404)
+  PREMIUM_PRIORITY: POST /api/scan с X-Alerts-Secret и {"user_id"} премиум-холдера — первым в очереди слотов (scan_gate).
 
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
@@ -97,8 +103,11 @@ import market
 import memguard
 import opmem
 import premium
+import premium_digest
+import premium_import
 import premium_service
 import replay
+import scan_gate
 import trade
 import draw_service as ds
 import rewards_service as rs
@@ -151,6 +160,7 @@ def _env_int(name, default):
 
 MAX_CONCURRENT = _env_int("MAX_CONCURRENT", MAX_CONCURRENT)
 _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
+_gate = scan_gate.FairGate(MAX_CONCURRENT)   # те же MAX_CONCURRENT слотов с приоритетом премиума (PREMIUM_PRIORITY)
 SCAN_QUEUE_MAX = 6         # новых сканов ждут слота сверх MAX_CONCURRENT (env SCAN_QUEUE_MAX); дальше — 503 busy
 SCAN_QUEUE_MAX = _env_int("SCAN_QUEUE_MAX", SCAN_QUEUE_MAX)
 _ACTIVE = [0]              # сканов идёт или ждёт слота (под _lock)
@@ -198,23 +208,28 @@ def _rate_take(client, now):
     _RATE[key] = hits
 
 
-def _run(job_id, token):
+def _run(job_id, token, prio=False):
     try:
         with priority.live():   # живой скан: фоновые перепроверки alerts ждут и не стартуют
-            _run_job(job_id, token)
+            _run_job(job_id, token, prio)
     finally:
         with _lock:
             _ACTIVE[0] -= 1
 
 
-def _run_job(job_id, token):
+def _slot(prio):
+    """Слот скана: PREMIUM_PRIORITY включён — очередь с приоритетом премиума (scan_gate), иначе прежний семафор."""
+    return _gate.slot(prio) if premium.priority_enabled() else _sem
+
+
+def _run_job(job_id, token, prio=False):
     job = JOBS[job_id]
 
     def emit(e):
         with _lock:
             job["events"].append(e)
 
-    with _sem:
+    with _slot(prio):
         try:
             res = engine.scan(token, emit)
             with _lock:
@@ -267,10 +282,11 @@ def scan_stats():
     return active, f", last min: {started} started, {busy} busy"
 
 
-def start_scan(token, client=None):
+def start_scan(token, client=None, prio=False):
     """job_id: свежий кэш по токену или уже идущий скан того же токена, иначе новый.
     Новый — только если в очереди есть место и память ниже порога, иначе Busy; и если client (ключ, лимит в минуту)
-    не исчерпал лимит новых сканов, иначе RateLimited. Кэш и подключение к идущему скану лимит не тратят."""
+    не исчерпал лимит новых сканов, иначе RateLimited. Кэш и подключение к идущему скану лимит не тратят.
+    prio — скан премиум-холдера (scan_priority): при PREMIUM_PRIORITY первым берёт освободившийся слот."""
     chain, token = engine.chain_of(token)
     now = time.time()
     with _lock:
@@ -301,7 +317,7 @@ def start_scan(token, client=None):
                      "ts": now}
         BY_TOKEN[token] = jid
     try:
-        threading.Thread(target=_run, args=(jid, token), daemon=True).start()
+        threading.Thread(target=_run, args=(jid, token) + ((True,) if prio else ()), daemon=True).start()
     except RuntimeError:   # can't start new thread: как полная очередь
         with _lock:
             _ACTIVE[0] -= 1
@@ -310,6 +326,23 @@ def start_scan(token, client=None):
                 del BY_TOKEN[token]
         raise Busy("thread") from None
     return jid
+
+
+def scan_priority(headers, body):
+    """Скан премиум-холдера (только PREMIUM_PRIORITY): запрос от нашего бота (верный X-Alerts-Secret) с user_id,
+    у которого премиум активен (premium.db). Выключено, сайт, нет секрета или сбой базы — обычный скан."""
+    if not premium.priority_enabled() or not isinstance(body, dict) or body.get("user_id") is None:
+        return False
+    if not alerts_secret_ok(headers.get("X-Alerts-Secret")):
+        return False
+    try:
+        link = premium_store().link_of(_chat_id(body["user_id"]))
+    except (ValueError, TypeError):
+        return False
+    except Exception as e:
+        print(f"premium: priority not read: {type(e).__name__}: {e}", flush=True)
+        return False
+    return bool(link and link["premium"])
 
 
 def scan_flags(token):
@@ -708,11 +741,79 @@ def premium_status(user_id, now):
     out = {"user_id": user_id, "linked": bool(link), "premium": bool(link and link["premium"]),
            "min_tokens": premium.min_tokens(), "watch_limit": limit, "watch_days": days,
            "reservation": {"wallet": res["wallet"], "expires_at": res["expires_at"]} if res else None}
+    out |= premium.features()   # включённые функции (priority / import / digest); выключенных полей нет
+    if premium.digest_enabled():
+        out |= {"digest": st.digest_on(user_id), "digest_hour": premium.digest_hour()}
     if link:
         out |= {"wallet": link["wallet"], "balance_tokens": link["balance"] // 10 ** premium_svc().decimals(),
                 "linked_at": link["linked_at"], "checked_at": link["checked_at"], "next_check_at": link["next_check_at"],
                 "grace_until": link["below_since"] + premium.GRACE_DAYS * 86400 if premium.in_grace(link, now) else None}
     return out
+
+
+PREMIUM_IMPORTS = premium_import.Imports()
+NOT_PREMIUM = {"error": "not premium", "message": "This is a Premium feature."}
+
+
+def import_established(token, mkt):
+    """Импорт: токен too established — последний снимок, кэш вердикта или данные DexScreener (без сети)."""
+    try:
+        _, cur = alerts_store().get(token)
+    except Exception:
+        cur = None
+    if cur and cur.get("band") == detect.TOO_ESTABLISHED:
+        return True
+    limits = engine.established_limits()
+    cached = market.established_get(token, "robinhood")
+    return detect.too_established(cached if cached is not None else mkt, limits)
+
+
+def premium_import_api(path, user_id, body, now):
+    """POST /api/premium/import {user_id} — просмотр кошелька (не чаще premium.IMPORT_EVERY; раньше — тот же
+    результат из памяти); POST /api/premium/import_add {user_id, tokens: [...] | "all"} — в Watchlist из него."""
+    if not premium.import_enabled() or not alerts.enabled():
+        return 404, {"error": "not found"}
+    link = premium_store().link_of(user_id)
+    if not link or not link["premium"]:
+        return 403, NOT_PREMIUM
+    limit, days = premium.watch_terms(link, now)
+    store = alerts_store()
+    watching = {w["token"] for w in store.watches(user_id, now)}
+    if path == "/api/premium/import_add":
+        hit = PREMIUM_IMPORTS.get(user_id, now)
+        want = body.get("tokens")
+        if not hit or hit["wallet"] != link["wallet"]:
+            return 410, {"error": "import expired", "message": "Tap Import from wallet again."}
+        if want != "all" and not (isinstance(want, list) and all(isinstance(t, str) for t in want)):
+            return 400, {"error": "need tokens"}
+        out = premium_import.add(hit, want, lambda t: store.watch(user_id, t, "robinhood", now, limit=limit,
+                                                                  days=days)[0], watching, limit)
+        if out["added"]:
+            print(f"premium: imported {len(out['added'])} tokens {premium.log_user(user_id)}", flush=True)
+        return 200, {"ok": True, **out, "watch_count": len(watching), "limit": limit,
+                     "items": store.watches(user_id, now)}
+    hit, wait = PREMIUM_IMPORTS.begin(user_id, link["wallet"], now)
+    if wait is not None:
+        return 429, {"error": "too soon", "retry_in": wait,
+                     "message": f"You can import once every {premium.IMPORT_EVERY // 60} minutes."}
+    cached = hit is not None
+    if not cached:
+        from chains import robinhood
+        result = None
+        try:
+            result = premium_import.lookup(robinhood, link["wallet"], lambda toks: market.ds_batch(toks, "robinhood"),
+                                           import_established, bankr.recently_active, skip=[premium.token()])
+        except Exception as e:
+            print(f"premium: import {premium.short(link['wallet'])} failed: {type(e).__name__}: {e}", flush=True)
+            return 502, {"error": "wallet not read"}
+        finally:
+            PREMIUM_IMPORTS.done(user_id, link["wallet"], now, result)
+        st = result["stats"]
+        print(f"premium: import {premium.short(link['wallet'])} {premium.log_user(user_id)}: {result['tokens']} tokens, "
+              f"{len(result['items'])} shown, rpc {st['rpc']} (eth_call {st['eth_calls']}), dexscreener {st['ds']}",
+              flush=True)
+        hit = PREMIUM_IMPORTS.get(user_id, now)
+    return 200, premium_import.view(hit, watching, limit, now) | {"cached": cached}
 
 
 def premium_api(method, path, body, q):
@@ -734,6 +835,17 @@ def premium_api(method, path, body, q):
         return 400, {"error": "need user_id"}
     if method == "GET" and path == "/api/premium/status":
         return 200, premium_status(user_id, now)
+    if method == "POST" and path in ("/api/premium/import", "/api/premium/import_add"):
+        return premium_import_api(path, user_id, body, now)
+    if method == "POST" and path == "/api/premium/digest":
+        if not premium.digest_enabled():
+            return 404, {"error": "not found"}
+        st = premium_store()
+        if "on" in body:
+            st.set_digest(user_id, bool(body["on"]))
+        link = st.link_of(user_id)
+        return 200, {"ok": True, "digest": st.digest_on(user_id), "hour": premium.digest_hour(),
+                     "premium": bool(link and link["premium"])}
     if method != "POST" or path not in ("/api/premium/reserve", "/api/premium/unlink"):
         return 404, {"error": "not found"}
     st = premium_store()
@@ -1019,7 +1131,8 @@ class H(BaseHTTPRequestHandler):
             n = int(self.headers.get("content-length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
             return self._send(200, {"job": start_scan(body.get("token"),
-                                                      scan_client(self.headers, self.client_address[0]))})
+                                                      scan_client(self.headers, self.client_address[0]),
+                                                      prio=scan_priority(self.headers, body))})
         except Busy:
             return self._send(503, BUSY, headers={"retry-after": str(RETRY_AFTER)})
         except RateLimited as e:
@@ -1049,11 +1162,12 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/config":  # фронт и бот: какие сети включены (SOLANA_ENABLED), алерты (ALERTS_ENABLED), Trade on Axiom
             env = tuple(os.environ.get(k) for k in ("SOLANA_ENABLED", "ALERTS_ENABLED", "FLAP_ENABLED", "BANKR_ENABLED",
                                                     "REPLAY_ENABLED", "TRADE_URL_ROBINHOOD", "TRADE_URL_SOLANA",
-                                                    "PREMIUM_ENABLED"))
+                                                    "PREMIUM_ENABLED", "PREMIUM_PRIORITY", "PREMIUM_IMPORT",
+                                                    "PREMIUM_DIGEST"))
             body = cached_response(("config",) + env, STATUS_TTL, lambda: {
                 "solana": engine.solana_enabled(), "alerts": alerts.enabled(), "flap": flap.enabled(),
                 "bankr": bankr.enabled(), "replay": replay.enabled(), "trade": trade.templates()}
-                | ({"premium": True} if premium.enabled() else {}))   # выключен — ответ как раньше, без поля
+                | ({"premium": True} | premium.features() if premium.enabled() else {}))   # выключен — без полей
             return self._send(200, body, cache=STATUS_CACHE)
         if u.path == "/api/index":   # Bankr: готов ли полный индекс холдеров (сайт перескан делает, когда ready)
             token = (q.get("token") or [""])[0]
@@ -1184,8 +1298,25 @@ def start_premium():
     """Premium: поток броней и проверки балансов — только при PREMIUM_ENABLED=true."""
     if not premium.enabled():
         return None
-    print(f"premium: on, min {premium.min_tokens():,} tokens, db {premium.db_path()}", flush=True)
-    return premium_svc().start()
+    print(f"premium: on, min {premium.min_tokens():,} tokens, db {premium.db_path()}"
+          + "".join(f", {k}" for k in premium.features()), flush=True)
+    svc = premium_svc().start()
+    start_premium_digest()
+    return svc
+
+
+_digest = {"obj": None}
+
+
+def start_premium_digest():
+    """Утренняя сводка — только при PREMIUM_DIGEST (и PREMIUM_ENABLED): свой поток, без сканов и RPC."""
+    if not premium.digest_enabled():
+        return None
+    if _digest["obj"] is None:
+        print(f"premium: digest daily at {premium.digest_hour():02d}:00 UTC", flush=True)
+        _digest["obj"] = premium_digest.Digest(premium_store(), alerts_store, notify_message,
+                                               lambda chain, toks: market.ds_batch(toks, chain)).start()
+    return _digest["obj"]
 
 
 def start_replay_checker():

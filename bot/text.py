@@ -568,7 +568,11 @@ def premium_view(st, now):
         lines.append(f"Your watchlist stays as it is until {_day(grace)}, then goes back to 3 tokens, 7 days each.")
     else:
         lines.append(f"Hold at least {need} $CrawlScan in this wallet to turn it on.")
+    if st.get("premium_digest"):
+        lines.append(digest_line(st.get("digest", True), st.get("digest_hour", 8)))
     lines.append("/unlink unlinks the wallet.")
+    if st.get("premium") and st.get("premium_import"):
+        return "\n".join(lines), {"inline_keyboard": [[IMPORT_BUTTON]]}
     return "\n".join(lines), (None if st.get("premium") else BUY_BUTTONS)
 
 
@@ -590,3 +594,92 @@ def admin_unlinked(r):
     if not r.get("found"):
         return f"No account is linked to {w}."
     return f"🔓 Unlinked {w}. The account was told, {r.get('removed', 0)} watched tokens removed."
+
+
+# ---------- Premium: импорт из кошелька (PREMIUM_IMPORT) ----------
+IMPORT_BUTTON = {"text": "📥 Import from wallet", "callback_data": "imp"}
+IMPORT_NOT_PREMIUM = "📥 Import from wallet is a Premium feature. /premium shows your status."
+IMPORT_EXPIRED = "This list is out of date. Tap 📥 Import from wallet again."
+IMPORT_EMPTY = ("No supported memecoins (Pons, Flap, Bankr) with a market price in your wallet "
+                "<code>{wallet}</code>.")
+IMPORT_SKIP = {"established": "too established for CrawlScan, can't be watched",
+               "active": "too many trades for a full scan right now, can't be watched"}
+PADS = {"pons": "Pons", "flap": "Flap", "bankr": "Bankr"}
+
+
+def import_wait(seconds):
+    m = -(-int(seconds) // 60)
+    return f"📥 You can import once every 10 minutes. Try again in {m} min."
+
+
+def _tick(it):
+    return f"${it['ticker']}" if it.get("ticker") else short(it["token"])
+
+
+def import_view(r):
+    """Ответ /api/premium/import → (html, кнопки): топ-5 мемкоинов кошелька по стоимости; [➕ $TICKER] на каждый,
+    который можно добавить (callback ia:<адрес>), и [➕ Add all (N)] (ia:all)."""
+    items = r.get("items") or []
+    if not items:
+        return IMPORT_EMPTY.format(wallet=e(r.get("wallet", ""))), None
+    lines = [f"📥 <b>Your top memecoins</b> in <code>{e(r['wallet'])}</code>", ""]
+    rows, addable = [], 0
+    free = max(0, r.get("limit", 10) - r.get("watch_count", 0))
+    for i, it in enumerate(items, 1):
+        meta = f"{e(_tick(it))} · {PADS.get(it.get('launchpad'), '')} · {_usd(it.get('value_usd') or 0)}"
+        lines.append(f"{i}. {meta}")
+        if it.get("status") in IMPORT_SKIP:
+            lines.append(f"   {'🏛' if it['status'] == 'established' else '🌊'} {IMPORT_SKIP[it['status']]}")
+        elif it.get("watching"):
+            lines.append("   🔔 already watching")
+        else:
+            addable += 1
+            rows.append([{"text": f"➕ {_tick(it)}", "callback_data": f"ia:{it['token']}"}])
+    lines += ["", f"Watchlist: {r.get('watch_count', 0)}/{r.get('limit', 10)}."]
+    if addable and addable > free:
+        lines.append(f"Only {free} more fit{'s' if free == 1 else ''}: remove a token to add more." if free
+                     else "Your watchlist is full: remove a token to add more.")
+    if addable > 1:
+        rows.append([{"text": f"➕ Add all ({addable})", "callback_data": "ia:all"}])
+    return "\n".join(lines), ({"inline_keyboard": rows} if rows else None)
+
+
+def import_added(r):
+    """Ответ /api/premium/import_add → HTML."""
+    out = []
+    name = lambda t: f"<code>{e(short(t))}</code>"
+    if r.get("added"):
+        out.append("🔔 Added to your watchlist: " + ", ".join(name(t) for t in r["added"]) + ".")
+    if r.get("already"):
+        out.append("Already watching: " + ", ".join(name(t) for t in r["already"]) + ".")
+    if r.get("full"):
+        out.append(f"Your watchlist is full ({r.get('limit', 10)} tokens), not added: "
+                   + ", ".join(name(t) for t in r["full"]) + ". Remove a token to add more.")
+    for sk in r.get("skipped") or []:
+        if sk.get("reason") in IMPORT_SKIP:
+            out.append(f"{name(sk['token'])} is {IMPORT_SKIP[sk['reason']]}.")
+    if not out:
+        out.append("Nothing to add.")
+    out.append(f"Watching {r.get('watch_count', 0)}/{r.get('limit', 10)} tokens.")
+    return "\n\n".join(out)
+
+
+# ---------- Premium: утренняя сводка (PREMIUM_DIGEST) ----------
+DIGEST_USAGE = "Usage: /digest on or /digest off"
+
+
+def digest_line(on, hour):
+    return (f"Morning digest: on, daily at {hour:02d}:00 UTC (/digest off)" if on
+            else "Morning digest: off (/digest on)")
+
+
+def digest_state(r):
+    """Ответ /api/premium/digest → HTML."""
+    hour = r.get("hour", 8)
+    if r.get("digest"):
+        text = (f"☀️ Morning digest is on: every day at {hour:02d}:00 UTC I'll send one message with the verdict "
+                "of each watched token and what changed in 24 hours. /digest off stops it.")
+        if not r.get("premium"):
+            text += "\n\nIt's for Premium holders: it starts when your Premium is active. /premium shows your status."
+        return text
+    return "Morning digest is off. /digest on turns it back on."

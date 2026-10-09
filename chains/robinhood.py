@@ -720,6 +720,49 @@ def wallet_distinct_tokens(wallet, before_block, skip_token, window=FRESH_WINDOW
     return min(count(), cap)
 
 
+def _nonzero_balances(res):
+    """Ответ alchemy_getTokenBalances → {токен: сырой баланс > 0}."""
+    out = {}
+    for t in (res or {}).get("tokenBalances") or []:
+        raw = t.get("tokenBalance") or "0x0"
+        try:
+            v = int(raw, 16) if raw not in ("0x", "") else 0
+        except ValueError:
+            v = 0
+        if v > 0 and not t.get("error"):
+            out[t["contractAddress"].lower()] = v
+    return out
+
+
+def wallet_token_balances(wallet, recent=1000, list_max=300):
+    """ERC-20 кошелька с ненулевым балансом (RPC Alchemy) для импорта Watchlist премиума (premium_import.py).
+    → ({токен: сырой баланс > 0}, прочитан ли список целиком).
+    1) alchemy_getTokenBalances(wallet, "erc20") — первая страница (100 токенов, в том числе с нулевым балансом:
+       Alchemy отдаёт всё, чем кошелёк когда-либо владел). Страница последняя — готово: 1 RPC.
+    2) Иначе (длинная история: у активных кошельков — тысячи записей) страницы не листаем, а берём контракты из
+       последних recent входящих переводов (alchemy_getAssetTransfers, erc20, новые первыми) и их балансы одним
+       alchemy_getTokenBalances(wallet, [контракты]) — ещё 2 RPC, всего 3. Старые покупки вне этих переводов
+       и вне первой страницы не видны."""
+    wallet = wallet.lower()
+    first = rpc("alchemy_getTokenBalances", [wallet, "erc20", {"maxCount": 100}])
+    out = _nonzero_balances(first)
+    if not first.get("pageKey"):
+        return out, True
+    seen = {(t.get("contractAddress") or "").lower() for t in first.get("tokenBalances") or []}
+    res = rpc("alchemy_getAssetTransfers", [{"category": ["erc20"], "toAddress": wallet, "fromBlock": "0x0",
+                                             "toBlock": "latest", "order": "desc", "maxCount": hex(recent),
+                                             "excludeZeroValue": True, "withMetadata": False}])
+    contracts = []
+    for t in res.get("transfers") or []:
+        a = ((t.get("rawContract") or {}).get("address") or "").lower()
+        if a and a not in seen:
+            seen.add(a)
+            contracts.append(a)
+    if contracts:
+        out |= _nonzero_balances(rpc("alchemy_getTokenBalances", [wallet, contracts[:list_max]]))
+    return out, False
+
+
 _CODE = {}  # addr -> bool, кэш is_contract в памяти процесса
 
 def is_contract(addresses, chunk=100):
@@ -735,6 +778,17 @@ def is_contract(addresses, chunk=100):
 
 
 LAUNCH_PHASES = {0: "curve", 1: "swept", 2: "pool", 3: "rescued"}  # поле phase фабрики
+SEL_LAUNCHED = "0x3cf28b5a"  # factory.getLaunchedToken(address)
+
+
+def launched_call(token):
+    """eth_call factory.getLaunchedToken(token) для rpc_batch."""
+    return ("eth_call", [{"to": FACTORY, "data": SEL_LAUNCHED + "0" * 24 + token.lower()[2:]}, "latest"])
+
+
+def is_launched(r):
+    """Ответ getLaunchedToken: токен из фабрики Pons V2."""
+    return bool(r) and len(r) >= 2 + 15 * 64 and u256(r, 14) == 1
 
 
 def launched_token(token):
@@ -742,8 +796,8 @@ def launched_token(token):
     pair: 0x0 = нативный ETH, иначе ERC-20 (токенизированная акция и т.п.).
     phase: "curve" — на кривой, "pool" — мигрировал в пул V4 (+ "swept", "rescued").
     Не кэшируется: phase меняется при миграции."""
-    r = rpc("eth_call", [{"to": FACTORY, "data": "0x3cf28b5a" + "0" * 24 + token.lower()[2:]}, "latest"])
-    if not (len(r) >= 2 + 15 * 64 and u256(r, 14) == 1):
+    r = rpc(*launched_call(token))
+    if not is_launched(r):
         return None
     return {"pair": addr_from_topic(r[2 + 4 * 64 : 2 + 5 * 64]),
             "phase": LAUNCH_PHASES.get(u256(r, 10), str(u256(r, 10)))}

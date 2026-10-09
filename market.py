@@ -274,6 +274,50 @@ def _ds_market(tok, network, now=None, budget=DS_BUDGET):
             "pool": max(pairs, key=liq).get("pairAddress"), "source": "dexscreener"}
 
 
+DS_BATCH = 30   # адресов в одном запросе DexScreener /tokens/v1
+
+
+def ds_batch(tokens, network="robinhood", budget=DS_BUDGET):
+    """Рынок многих токенов одной сети: один запрос DexScreener на DS_BATCH адресов. → {токен: {"ticker", "name",
+    "price_usd", "change_24h", "mcap_usd", "liquidity_usd", "age_days"}}; поля как у _ds_market (цена, изменение цены
+    за 24 ч в процентах и капа — из самой ликвидной пары, где токен base; ликвидность — сумма пар; возраст — от самой
+    ранней пары). Токена нет в ответе — нет и в словаре. Ошибка части — эта часть пропускается (в лог), остальные идут.
+    Для премиума: импорт из кошелька и утренняя сводка (без кэша: им нужна свежая цена)."""
+    chain = DS_CHAIN.get(network)
+    if not chain or not tokens:
+        return {}
+    key = str.lower if network == "robinhood" else (lambda x: x)
+    want = {key(t): t for t in tokens}
+    f = lambda v: float(v) if v not in (None, "") else None
+    liq = lambda p: f((p.get("liquidity") or {}).get("usd")) or 0.0
+    pairs = {}
+    toks = list(want.values())
+    for i in range(0, len(toks), DS_BATCH):
+        part = toks[i:i + DS_BATCH]
+        try:
+            got = _ds(f"{DS}/{chain}/{','.join(part)}", budget) or []
+        except Exception as e:
+            print(f"market: dexscreener batch {network} ({len(part)} tokens) failed: {_why(e)}", flush=True)
+            continue
+        for p in got:
+            if not isinstance(p, dict) or p.get("chainId") != chain:
+                continue
+            tok = want.get(key((p.get("baseToken") or {}).get("address") or ""))
+            if tok is not None:
+                pairs.setdefault(tok, []).append(p)
+    now, out = time.time(), {}
+    for tok, ps in pairs.items():
+        best = max(ps, key=liq)
+        me = best.get("baseToken") or {}
+        born = [p["pairCreatedAt"] / 1000 for p in ps if isinstance(p.get("pairCreatedAt"), (int, float))]
+        out[tok] = {"ticker": (me.get("symbol") or "").strip() or None, "name": (me.get("name") or "").strip() or None,
+                    "price_usd": f(best.get("priceUsd")), "change_24h": f((best.get("priceChange") or {}).get("h24")),
+                    "mcap_usd": f(best.get("marketCap")) or f(best.get("fdv")),
+                    "liquidity_usd": sum(liq(p) for p in ps) or None,
+                    "age_days": round((now - min(born)) / 86400, 1) if born else None}
+    return out
+
+
 def _ts(iso):
     try:
         return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()

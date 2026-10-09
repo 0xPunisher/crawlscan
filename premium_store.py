@@ -4,8 +4,11 @@
 
   premium_reservations — брони: один кошелёк — одна бронь, у пользователя одна бронь; живёт RESERVE_MIN минут.
   premium_links        — привязки: один кошелёк — один Telegram ID, один Telegram ID — один кошелёк.
+  premium_prefs        — /digest on|off (нет строки — сводка включена).
+  premium_digest_base  — снимок alerts каждого токена на момент прошлой утренней сводки (с чем сравнивать «за сутки»).
+  premium_meta         — день последней сводки (после рестарта второй раз не уходит).
 """
-import os, threading
+import json, os, threading
 
 import db
 import premium
@@ -19,6 +22,9 @@ CREATE TABLE IF NOT EXISTS premium_links (
   balance TEXT NOT NULL, checked_at INTEGER NOT NULL, next_check_at INTEGER NOT NULL,
   premium INTEGER NOT NULL, below_since INTEGER, downgraded INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS premium_links_due ON premium_links(next_check_at);
+CREATE TABLE IF NOT EXISTS premium_prefs (user_id INTEGER PRIMARY KEY, digest INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS premium_digest_base (token TEXT PRIMARY KEY, ts INTEGER NOT NULL, snap TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS premium_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 LINK_FIELDS = ("premium", "below_since", "downgraded")
 
@@ -155,3 +161,49 @@ class PremiumStore:
         """(лимит, дней | None) Watchlist пользователя — см. premium.watch_terms."""
         return premium.watch_terms(self.link_of(user_id), now)
 
+    def premium_users(self):
+        """Telegram ID с активным премиумом (баланс ≥ порога)."""
+        with self._lock:
+            return [r["user_id"] for r in self.db.execute(
+                "SELECT user_id FROM premium_links WHERE premium = 1 ORDER BY linked_at")]
+
+    # --- утренняя сводка -----------------------------------------------------------------------------
+
+    def digest_on(self, user_id):
+        """Включена ли сводка у пользователя (по умолчанию — да)."""
+        with self._lock:
+            r = self.db.execute("SELECT digest FROM premium_prefs WHERE user_id = ?", (user_id,)).fetchone()
+        return True if r is None else bool(r["digest"])
+
+    def set_digest(self, user_id, on):
+        with self._lock, self.db:
+            self.db.execute("INSERT INTO premium_prefs(user_id, digest) VALUES (?, ?) "
+                            "ON CONFLICT(user_id) DO UPDATE SET digest = excluded.digest", (user_id, int(bool(on))))
+
+    def digest_bases(self, tokens):
+        """{токен: снимок на момент прошлой сводки}."""
+        tokens = list(tokens)
+        out = {}
+        with self._lock:
+            for i in range(0, len(tokens), 500):
+                part = tokens[i:i + 500]
+                for r in self.db.execute(f"SELECT token, snap FROM premium_digest_base WHERE token IN "
+                                         f"({','.join('?' * len(part))})", part):
+                    out[r["token"]] = json.loads(r["snap"])
+        return out
+
+    def set_digest_bases(self, snaps):
+        """{токен: снимок} — база для следующей сводки."""
+        with self._lock, self.db:
+            self.db.executemany("INSERT OR REPLACE INTO premium_digest_base(token, ts, snap) VALUES (?, ?, ?)",
+                                [(t, int(s.get("ts") or 0), json.dumps(s, separators=(",", ":")))
+                                 for t, s in snaps.items()])
+
+    def meta(self, key):
+        with self._lock:
+            r = self.db.execute("SELECT value FROM premium_meta WHERE key = ?", (key,)).fetchone()
+        return r["value"] if r else None
+
+    def set_meta(self, key, value):
+        with self._lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO premium_meta(key, value) VALUES (?, ?)", (key, str(value)))

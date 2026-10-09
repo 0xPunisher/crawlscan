@@ -21,12 +21,52 @@ WATCH_LIMIT = 10             # токенов в Watchlist у премиума (
 GRACE_DAYS = 7               # дней после падения баланса ниже порога, пока Watchlist остаётся премиальным
 CHECK_EVERY = 86400          # секунд между проверками баланса
 ATTEMPTS_PER_HOUR = 5        # броней в час на одного пользователя
+IMPORT_EVERY = 600           # секунд: импорт из кошелька не чаще раза в 10 минут на пользователя
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
 def enabled():
     return os.environ.get("PREMIUM_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+
+def _flag(name):
+    """Выключатель функции премиума: только вместе с PREMIUM_ENABLED, по умолчанию выключен."""
+    return enabled() and os.environ.get(name, "false").strip().lower() in ("1", "true", "yes")
+
+
+def priority_enabled():
+    """PREMIUM_PRIORITY: скан премиум-холдера из бота первым берёт освободившийся слот (scan_gate.py)."""
+    return _flag("PREMIUM_PRIORITY")
+
+
+def import_enabled():
+    """PREMIUM_IMPORT: импорт мемкоинов привязанного кошелька в Watchlist (premium_import.py)."""
+    return _flag("PREMIUM_IMPORT")
+
+
+def digest_enabled():
+    """PREMIUM_DIGEST: утренняя сводка по Watchlist (premium_digest.py)."""
+    return _flag("PREMIUM_DIGEST")
+
+
+DIGEST_HOUR = 8              # по умолчанию PREMIUM_DIGEST_HOUR_UTC
+
+
+def digest_hour():
+    """PREMIUM_DIGEST_HOUR_UTC (0–23); пусто или неверно — DIGEST_HOUR."""
+    try:
+        v = int(os.environ.get("PREMIUM_DIGEST_HOUR_UTC", "").strip())
+        return v if 0 <= v <= 23 else DIGEST_HOUR
+    except ValueError:
+        return DIGEST_HOUR
+
+
+def features():
+    """Включённые функции премиума для /api/config и /api/premium/status: {"premium_priority": True, ...};
+    выключенных полей нет (ответ при выключенных — прежний)."""
+    return {k: True for k, on in (("premium_priority", priority_enabled()), ("premium_import", import_enabled()),
+                                  ("premium_digest", digest_enabled())) if on}
 
 
 def min_tokens():
