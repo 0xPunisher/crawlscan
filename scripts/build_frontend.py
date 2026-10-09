@@ -1909,7 +1909,7 @@ if not ms_ or t.count('<section id="roadmap"') != 1:
 t = (t[:ms_.start()]
      + '''      <section id="timeline" class="cs-wrap" style="max-width:1280px;margin:0 auto;padding:40px 32px 140px;box-sizing:border-box">
         <div style="display:flex;align-items:baseline;justify-content:space-between;gap:24px;border-top:1px solid #12181c;padding-top:22px;margin-bottom:56px">
-          <h2 data-grip="1" style="margin:0;font-size:34px;font-weight:500;letter-spacing:-0.03em;color:#eef1f3">Timeline</h2>
+          <h2 data-grip="1" style="margin:0;font-size:34px;font-weight:500;letter-spacing:-0.03em;color:#eef1f3">timeline</h2>
           <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#5f6b72">{{numRoadmap}}</span>
         </div>
         <div ref="{{tlRef}}" data-timeline="1" style="min-width:0"></div>
@@ -1978,7 +1978,7 @@ function timelineHtml(tl){
   const h=`<div class="cs-tl-h"><div class="cs-tl-scroll"><ol class="cs-tl-track"><li class="cs-tl-start" aria-hidden="true"></li>${ms.map((m,i)=>`<li>${btn(m,i,'cs-tl-card')}</li>`).join('')}</ol></div>`
     +`<div class="cs-tl-card" id="cs-tl-card" role="region" aria-live="polite" hidden></div></div>`;
   const v=`<div class="cs-tl-v"><ol class="cs-tl-vlist"><li class="cs-tl-start" aria-hidden="true"></li>${ms.map((m,i)=>`<li>${btn(m,i,'cs-tl-p'+i)}<div class="cs-tl-panel" id="cs-tl-p${i}" hidden><p class="cs-tl-x">${tlEsc(m.text)}</p>${tlGo(m)}</div></li>`).join('')}</ol><div class="cs-tl-varrow" aria-hidden="true"></div></div>`;
-  const n=(tl.next||[]).length?`<div class="cs-tl-next"><h3 data-grip="1">What comes next</h3><ul>${tl.next.map(s=>`<li data-grip="1">${tlEsc(s)}</li>`).join('')}</ul></div>`:'';
+  const n=(tl.next||[]).length?`<div class="cs-tl-next"><h3 data-grip="1">what comes next</h3><ul>${tl.next.map(s=>`<li data-grip="1">${tlEsc(s)}</li>`).join('')}</ul></div>`:'';
   return h+v+n;
 }
 class Component extends DCLogic {''')

@@ -30,8 +30,8 @@ class TestTimeline(unittest.TestCase):
         self.assertIsNotNone(mt)
         self.assertEqual(json.loads(mt.group(1).replace("<\\/", "</")), self.data)   # страница = файл
         self.assertIn('<section id="timeline"', t)
-        self.assertIn(">Timeline</h2>", t)
-        self.assertIn("What comes next", t)
+        self.assertIn(">timeline</h2>", t)
+        self.assertIn(">what comes next</h3>", t)
         self.assertIn('target="_blank" rel="noopener noreferrer">Read the post on X ↗</a>', t)
         self.assertEqual(t.count('href="#timeline"'), 2)                              # шапка и меню
         for old in ('id="roadmap"', ">SHIPPED<", ">NEXT<", ">LATER<", "in progress</span>", 'href="#roadmap"'):
