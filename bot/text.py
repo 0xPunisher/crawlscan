@@ -81,12 +81,15 @@ START_BUTTONS = {"inline_keyboard": [
 ]}
 
 
-def start_buttons(alerts=False):
-    """Кнопки /start; алерты включены — [🔔 Watchlist] в первом ряду рядом со Scan a token / Help."""
-    if not alerts:
+def start_buttons(alerts=False, premium=False):
+    """Кнопки /start; алерты включены — [🔔 Watchlist] в первом ряду рядом со Scan a token / Help;
+    Premium включён — ряд [⭐ Premium features]."""
+    if not alerts and not premium:
         return START_BUTTONS
     first, *rest = START_BUTTONS["inline_keyboard"]
-    return {"inline_keyboard": [first + [{"text": "🔔 Watchlist", "callback_data": "watchlist"}], *rest]}
+    if alerts:
+        first = first + [{"text": "🔔 Watchlist", "callback_data": "watchlist"}]
+    return {"inline_keyboard": [first, *rest] + ([[PREMIUM_START_BUTTON]] if premium else [])}
 
 HELP = (
     "<b>How to read a verdict?</b>\n\n"
@@ -540,40 +543,78 @@ def reserved(r):
             f"I'll message you as soon as I see the buy (until {_hm(r['expires_at'])}).")
 
 
-def premium_view(st, now):
-    """/premium: ответ /api/premium/status → (html, кнопки)."""
-    need = f"{st.get('min_tokens', 0):,}"
+PREMIUM_START_BUTTON = {"text": "⭐ Premium features", "callback_data": "premium"}
+
+
+def premium_lines(st):
+    """Список функций Premium: команда — пояснение. Pick tokens, digest и Priority — только если включены на сайте."""
+    lines = ["/verify — link your wallet: buy any amount of $CrawlScan within 15 minutes"]
+    if st.get("premium_import"):
+        lines.append("/picktokens — choose tokens from your linked wallet to watch (we only read public balances, "
+                     "no keys or wallet connection)")
+    lines.append("<b>Watchlist</b> — up to 10 tokens with no time limit (3 without Premium)")
+    if st.get("premium_digest"):
+        lines.append("/digest — a daily morning summary of your Watchlist (on/off)")
+    if st.get("premium_priority"):
+        lines.append("<b>Priority</b> — your scans skip the queue when the scanner is busy")
+    lines.append("/unlink — unlink your wallet")
+    return lines
+
+
+def premium_status_lines(st, now):
+    """Статус пользователя: не привязан (и идущая верификация) / кошелёк, баланс, премиум, следующая проверка."""
     res = st.get("reservation")
     if not st.get("linked"):
-        text = (f"⭐ <b>Premium for $CrawlScan holders</b>\n\nHold at least {need} $CrawlScan and get:\n"
-                "- Watchlist up to 10 tokens instead of 3\n- No 7-day limit on watched tokens\n"
-                "- Premium badge on your scans\n\n")
+        out = ["Your status: no wallet linked."]
         if res:
-            text += (f"Verifying <code>{e(res['wallet'])}</code> until {_hm(res['expires_at'])}: "
-                     "buy any amount of $CrawlScan to it.")
-        else:
-            text += "Send /verify to link your wallet."
-        return text, BUY_BUTTONS
+            out.append(f"Verifying <code>{e(res['wallet'])}</code> until {_hm(res['expires_at'])}: "
+                       "buy any amount of $CrawlScan to it.")
+        return out
     grace = st.get("grace_until")
-    status = "active" if st.get("premium") else ("paused" if grace else "not active")
-    nxt = st.get("next_check_at")
-    lines = [f"⭐ <b>Premium</b> · {status}", f"Wallet: <code>{e(st['wallet'])}</code>",
-             f"Balance: {st.get('balance_tokens', 0):,} $CrawlScan", f"Required: {need} $CrawlScan"]
-    if nxt:
-        lines.append(f"Next balance check: {_hm(nxt)} ({until(nxt, now)})")
-    lines.append("")
     if st.get("premium"):
-        lines.append("Watchlist: up to 10 tokens, no expiry.")
+        prem = "✅ active"
     elif grace:
-        lines.append(f"Your watchlist stays as it is until {_day(grace)}, then goes back to 3 tokens, 7 days each.")
+        prem = f"⏸ paused: your watchlist stays as it is until {_day(grace)}"
     else:
-        lines.append(f"Hold at least {need} $CrawlScan in this wallet to turn it on.")
+        prem = "❌ not active"
+    out = [f"Wallet: <code>{e(st['wallet'])}</code>", f"Balance: {st.get('balance_tokens', 0):,} $CrawlScan",
+           f"Premium: {prem}"]
+    if st.get("next_check_at"):
+        out.append(f"Next balance check: {_hm(st['next_check_at'])} ({until(st['next_check_at'], now)})")
+    return out
+
+
+def premium_buttons(st, buy_url=None):
+    """Кнопки по статусу: не привязан — [Verify wallet]; привязан без премиума — [Buy $CrawlScan] (Trade on Axiom)
+    и [Unlink]; премиум — [Pick tokens] [Daily digest: on/off] [Unlink] (Pick tokens и digest — если включены)."""
+    unlink = {"text": "Unlink", "callback_data": "unlink"}
+    if not st.get("linked"):
+        return {"inline_keyboard": [[{"text": "Verify wallet", "callback_data": "verify"}]]}
+    if not st.get("premium"):
+        return {"inline_keyboard": [[{"text": "Buy $CrawlScan", "url": buy_url or BUY_URL}, unlink]]}
+    row = []
+    if st.get("premium_import"):
+        row.append(PICK_BUTTON)
     if st.get("premium_digest"):
-        lines.append(digest_line(st.get("digest", True), st.get("digest_hour", 8)))
-    lines.append("/unlink unlinks the wallet.")
-    if st.get("premium") and st.get("premium_import"):
-        return "\n".join(lines), {"inline_keyboard": [[IMPORT_BUTTON]]}
-    return "\n".join(lines), (None if st.get("premium") else BUY_BUTTONS)
+        on = st.get("digest", True)
+        row.append({"text": f"Daily digest: {'on' if on else 'off'}", "callback_data": f"digest:{'off' if on else 'on'}"})
+    return {"inline_keyboard": ([row] if row else []) + [[unlink]]}
+
+
+def premium_view(st, now, buy_url=None):
+    """/premium и [⭐ Premium features]: ответ /api/premium/status → (html, кнопки)."""
+    need = f"{st.get('min_tokens', 0):,}"
+    text = "\n".join([
+        "⭐ <b>Premium features for $CrawlScan holders</b>", "",
+        f"Hold {need}+ $CrawlScan in a linked wallet to unlock everything below.", "",
+        *premium_lines(st), "", *premium_status_lines(st, now)])
+    return text, premium_buttons(st, buy_url)
+
+
+UNLINK_CONFIRM = ("Unlink <code>{wallet}</code>? Premium turns off and your watchlist goes back to 3 tokens. "
+                  "To link it again you'll need a new $CrawlScan buy.")
+UNLINK_BUTTONS = {"inline_keyboard": [[{"text": "Yes, unlink", "callback_data": "unlink:yes"},
+                                       {"text": "Cancel", "callback_data": "premium"}]]}
 
 
 def _removed(tokens):
@@ -596,10 +637,11 @@ def admin_unlinked(r):
     return f"🔓 Unlinked {w}. The account was told, {r.get('removed', 0)} watched tokens removed."
 
 
-# ---------- Premium: импорт из кошелька (PREMIUM_IMPORT) ----------
-IMPORT_BUTTON = {"text": "📥 Import from wallet", "callback_data": "imp"}
-IMPORT_NOT_PREMIUM = "📥 Import from wallet is a Premium feature. /premium shows your status."
-IMPORT_EXPIRED = "This list is out of date. Tap 📥 Import from wallet again."
+# ---------- Premium: Pick tokens — импорт из кошелька (PREMIUM_IMPORT) ----------
+PICK_BUTTON = {"text": "Pick tokens", "callback_data": "pick"}
+IMPORT_BUTTON = PICK_BUTTON           # прежнее имя
+IMPORT_NOT_PREMIUM = "Pick tokens is a Premium feature. /premium shows your status."
+IMPORT_EXPIRED = "This list is out of date. Tap Pick tokens again."
 IMPORT_EMPTY = ("No supported memecoins (Pons, Flap, Bankr) with a market price in your wallet "
                 "<code>{wallet}</code>.")
 IMPORT_SKIP = {"established": "too established for CrawlScan, can't be watched",
@@ -609,7 +651,7 @@ PADS = {"pons": "Pons", "flap": "Flap", "bankr": "Bankr"}
 
 def import_wait(seconds):
     m = -(-int(seconds) // 60)
-    return f"📥 You can import once every 10 minutes. Try again in {m} min."
+    return f"You can pick tokens once every 10 minutes. Try again in {m} min."
 
 
 def _tick(it):
@@ -622,7 +664,7 @@ def import_view(r):
     items = r.get("items") or []
     if not items:
         return IMPORT_EMPTY.format(wallet=e(r.get("wallet", ""))), None
-    lines = [f"📥 <b>Your top memecoins</b> in <code>{e(r['wallet'])}</code>", ""]
+    lines = [f"<b>Pick tokens</b> from <code>{e(r['wallet'])}</code>: your top memecoins by value", ""]
     rows, addable = [], 0
     free = max(0, r.get("limit", 10) - r.get("watch_count", 0))
     for i, it in enumerate(items, 1):

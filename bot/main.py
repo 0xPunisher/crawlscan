@@ -14,7 +14,7 @@ ALERTS_API_SECRET): /watch <адрес>, /watchlist, /unwatch <адрес>, кн
 уведомлением (уведомления шлёт сайт); иначе — «coming soon». Premium (только личка, если /api/config → premium):
 /verify [кошелёк] — бронь кошелька на 15 минут (покупку ищет и сообщение шлёт сайт), /premium, /unlink,
 /admin_unlink <кошелёк> (только PREMIUM_ADMIN_ID); значок ⭐ Premium под вердиктом. Функции премиума — по полям
-/api/config: premium_priority (Telegram ID в /api/scan), premium_import ([📥 Import from wallet] в /premium и Watchlist),
+/api/config: premium_priority (Telegram ID в /api/scan), premium_import ([Pick tokens] и /picktokens в /premium и Watchlist),
 premium_digest (/digest on|off). Выключен — как раньше (подсказка). /rewards — статус наград и сжиганий с сайта (/api/rewards/status). Скан: сразу ответ "crawling…", потом это же сообщение редактируется в вердикт.
 Лимиты: 1 скан на пользователя в USER_COOLDOWN секунд, не больше WORKERS сканов одновременно (остальные — в очереди).
 """
@@ -45,10 +45,12 @@ WATCH_COMMANDS = [{"command": "watch", "description": "Get alerts for a token: /
                   {"command": "watchlist", "description": "Tokens you watch"},
                   {"command": "unwatch", "description": "Stop alerts: /unwatch <address>"}]
 PREMIUM_COMMANDS = [{"command": "verify", "description": "Link your $CrawlScan wallet for Premium"},
-                    {"command": "premium", "description": "Your Premium status"},
+                    {"command": "premium", "description": "Premium features and your status"},
                     {"command": "unlink", "description": "Unlink your wallet"}]
 DIGEST_COMMAND = {"command": "digest", "description": "Morning digest of your watchlist: /digest on|off"}
+PICK_COMMAND = {"command": "picktokens", "description": "Pick tokens from your wallet to watch"}
 PREMIUM_CMDS = ("verify", "premium", "unlink", "admin_unlink", "digest")
+PICK_CMDS = ("picktokens", "import")   # /import — прежнее название (Import from wallet)
 PREMIUM_FEATURES = ("premium_priority", "premium_import", "premium_digest")   # поля /api/config (только включённые)
 WATCHLIST_BUTTON = {"inline_keyboard": [[{"text": "🔔 Watchlist", "callback_data": "watchlist"}]]}
 ALERTS_CHECK_TTL = 60  # секунд: сколько помнить, включены ли алерты на сайте
@@ -126,7 +128,7 @@ class Bot:
         """Баннер с приветствием в подписи; по file_id, если баннер уже загружали.
         Нет файла или sendPhoto не прошёл — то же приветствие обычным сообщением.
         Алерты включены — кнопка [🔔 Watchlist]."""
-        buttons = T.start_buttons(self.alerts_on())
+        buttons = T.start_buttons(self.alerts_on(), self.premium_on())
         params = dict(chat_id=chat_id, caption=T.START, parse_mode="HTML", reply_markup=buttons)
         msg = None
         if self.banner_id:
@@ -168,6 +170,8 @@ class Bot:
                 return self.premium_command(chat_id, user.get("id"), "verify", txt)
             if cmd in PREMIUM_CMDS:
                 return self.premium_command(chat_id, user.get("id"), cmd, arg)
+            if cmd in PICK_CMDS:   # выключено (или Premium выключен) — подсказка, как у неизвестной команды
+                return self.import_command(chat_id, user.get("id"))
             if cmd is None and self.awaiting_watch(chat_id):       # после [➕ New]: адрес — подписка, не скан
                 found = T.find_address(txt)
                 if not found:
@@ -209,8 +213,25 @@ class Bot:
                 self.alerts_command(chat_id, "remove" if cmd == "rm" else cmd, found[1], edit=mid)
         elif data == "watchlist" and private:
             self.alerts_command(chat_id, "watchlist", "")
-        elif data == "imp" and private:
+        elif data in ("pick", "imp") and private:     # imp — кнопка прежних сообщений (Import from wallet)
             self.import_command(chat_id, (cq.get("from") or {}).get("id", chat_id))
+        elif cmd in ("premium", "verify", "unlink", "digest") and private:
+            # [⭐ Premium features] в /start, кнопки под /premium: [Verify wallet], [Unlink] → подтверждение,
+            # [Daily digest: on/off], [Cancel] под подтверждением (premium:cancel — это же сообщение)
+            uid = (cq.get("from") or {}).get("id", chat_id)
+            mid = (cq.get("message") or {}).get("message_id")
+            if data == "premium":
+                self.premium_command(chat_id, uid, "premium", "")
+            elif data == "premium:cancel":
+                self.premium_command(chat_id, uid, "premium", "", edit=mid)
+            elif data == "verify":
+                self.premium_command(chat_id, uid, "verify", "")
+            elif data == "unlink":
+                self.premium_command(chat_id, uid, "unlink_ask", "")
+            elif data == "unlink:yes":
+                self.premium_command(chat_id, uid, "unlink", "", edit=mid)
+            elif data in ("digest:on", "digest:off"):
+                self.premium_command(chat_id, uid, "digest_toggle", addr, edit=mid)
         elif cmd == "ia" and addr and private:
             found = T.find_address(addr) if addr != "all" else (None, "all")
             if found:
@@ -404,12 +425,20 @@ class Bot:
             return False
         return True
 
-    def premium_command(self, chat_id, user_id, cmd, arg):
-        """/verify, /premium, /unlink, /admin_unlink — запрос к сайту в отдельном потоке."""
+    def premium_command(self, chat_id, user_id, cmd, arg, edit=None):
+        """/verify, /premium, /unlink, /admin_unlink, /digest и кнопки Premium — запрос к сайту в отдельном потоке.
+        edit — message_id: обновить это сообщение (подтверждение Unlink, переключатель digest)."""
         def run():
             html, markup = self.premium_text(chat_id, user_id, cmd, arg)
-            self.send(chat_id, html, markup)
+            if edit:
+                self.edit(chat_id, edit, html, markup)
+            else:
+                self.send(chat_id, html, markup)
         self.spawn(run)
+
+    def buy_url(self):
+        """[Buy $CrawlScan] под /premium: Trade on Axiom для $CrawlScan (шаблон trade.py)."""
+        return trade.url("robinhood", T.OFFICIAL_CA.lower(), self.trade_urls)
 
     def premium_text(self, chat_id, user_id, cmd, arg, now=None):
         """→ (html, кнопки). Premium выключен или /admin_unlink не от админа — подсказка, как раньше."""
@@ -418,12 +447,21 @@ class Bot:
         if not self.premium_on():
             self.awaiting_wallet.pop(chat_id, None)
             return T.HINT, None
-        if cmd == "digest" and not self.feature("premium_digest"):
+        if cmd in ("digest", "digest_toggle") and not self.feature("premium_digest"):
             return T.HINT, None
         now = time.time() if now is None else now
         wallet = (arg or "").strip()
         valid = bool(T.ADDR_RE.match(wallet))
         try:
+            if cmd == "digest_toggle":            # [Daily digest: on/off] → обновлённый /premium в том же сообщении
+                self.api.premium_digest(user_id, arg == "on")
+                self.log(f"digest {arg}")
+                return T.premium_view(self.api.premium_status(user_id), now, self.buy_url())
+            if cmd == "unlink_ask":
+                st = self.api.premium_status(user_id)
+                if not st.get("linked"):
+                    return T.NO_WALLET, None
+                return T.UNLINK_CONFIRM.format(wallet=T.e(st["wallet"])), T.UNLINK_BUTTONS
             if cmd == "digest":
                 want = {"on": True, "off": False, "": None}.get(wallet.lower(), "usage")
                 if want == "usage":
@@ -448,7 +486,7 @@ class Bot:
             if cmd == "premium":
                 st = self.api.premium_status(user_id)
                 self.premium_users[user_id] = (self.clock(), bool(st.get("premium")))
-                return T.premium_view(st, now)
+                return T.premium_view(st, now, self.buy_url())
             if cmd == "unlink":
                 r = self.api.premium_unlink(user_id)
                 self.premium_users.pop(user_id, None)
@@ -474,7 +512,7 @@ class Bot:
     # --- Premium: импорт из кошелька (сайт смотрит кошелёк и добавляет; бот только просит) --------------
 
     def import_command(self, chat_id, user_id, tokens=None):
-        """[📥 Import from wallet] (tokens=None) и [➕ …] / [➕ Add all] (tokens — список адресов или "all")."""
+        """[Pick tokens] и /picktokens (tokens=None), [➕ …] / [➕ Add all] (tokens — список адресов или "all")."""
         def run():
             html, markup = self.import_text(user_id, tokens)
             self.send(chat_id, html, markup)
@@ -511,7 +549,7 @@ class Bot:
             return T.UNREACHABLE, None
 
     def with_import(self, chat_id, view):
-        """Watchlist премиум-холдера при PREMIUM_IMPORT — ещё ряд [📥 Import from wallet]; иначе как был."""
+        """Watchlist премиум-холдера при PREMIUM_IMPORT — ещё ряд [Pick tokens]; иначе как был."""
         html, markup = view
         if markup is not None and self.feature("premium_import") and self.is_premium(chat_id):
             markup = {"inline_keyboard": markup["inline_keyboard"] + [[T.IMPORT_BUTTON]]}
@@ -630,6 +668,7 @@ class Bot:
                 self.sleep(5)
         self.call("setMyCommands", commands=COMMANDS + (WATCH_COMMANDS if self.alerts_on() else [])
                   + (PREMIUM_COMMANDS if self.premium_on() else [])
+                  + ([PICK_COMMAND] if self.feature("premium_import") else [])
                   + ([DIGEST_COMMAND] if self.feature("premium_digest") else []))
         self.start_workers()
         self.log(f"@{self.username} polling, site {self.api.base}")

@@ -783,7 +783,7 @@ def premium_import_api(path, user_id, body, now):
         hit = PREMIUM_IMPORTS.get(user_id, now)
         want = body.get("tokens")
         if not hit or hit["wallet"] != link["wallet"]:
-            return 410, {"error": "import expired", "message": "Tap Import from wallet again."}
+            return 410, {"error": "import expired", "message": "Tap Pick tokens again."}
         if want != "all" and not (isinstance(want, list) and all(isinstance(t, str) for t in want)):
             return 400, {"error": "need tokens"}
         out = premium_import.add(hit, want, lambda t: store.watch(user_id, t, "robinhood", now, limit=limit,

@@ -447,11 +447,11 @@ class TestBotExtras(unittest.TestCase):
     def test_import_button_and_flow(self):
         bot, tg, api = self.make(["premium_import"], premium_users=[U1])
         text, markup = bot.premium_text(U1, U1, "premium", "", now=NOW)
-        self.assertEqual(markup, {"inline_keyboard": [[T.IMPORT_BUTTON]]})
+        self.assertEqual(markup["inline_keyboard"][0], [T.PICK_BUTTON])
         bot.handle_update(private("/watchlist"))
         self.assertEqual(tg.markups[-1]["inline_keyboard"][-1], [T.IMPORT_BUTTON])
-        bot.handle_update(callback("imp"))
-        self.assertIn("📥 <b>Your top memecoins</b>", tg.texts[-1])
+        bot.handle_update(callback("pick"))
+        self.assertIn(f"<b>Pick tokens</b> from <code>{W1}</code>: your top memecoins by value", tg.texts[-1])
         self.assertIn("1. $AAA · Pons · $1.2K", tg.texts[-1])
         self.assertIn("🏛 too established for CrawlScan, can't be watched", tg.texts[-1])
         self.assertIn("🔔 already watching", tg.texts[-1])
@@ -468,8 +468,9 @@ class TestBotExtras(unittest.TestCase):
     def test_import_off_as_before(self):
         bot, tg, api = self.make(premium_users=[U1])
         text, markup = bot.premium_text(U1, U1, "premium", "", now=NOW)
-        self.assertIsNone(markup)
+        self.assertEqual(markup, {"inline_keyboard": [[{"text": "Unlink", "callback_data": "unlink"}]]})
         self.assertNotIn("digest", text.lower())
+        self.assertNotIn("/picktokens", text)
         bot.handle_update(private("/watchlist"))
         self.assertNotIn([T.IMPORT_BUTTON], tg.markups[-1]["inline_keyboard"])
         bot.handle_update(callback("imp"))
@@ -479,7 +480,7 @@ class TestBotExtras(unittest.TestCase):
         bot, tg, api = self.make(["premium_import"], premium_users=[U1])
         api.import_reply = {"status": 429, "error": "too soon", "retry_in": 61}
         bot.handle_update(callback("imp"))
-        self.assertEqual(tg.texts[-1], "📥 You can import once every 10 minutes. Try again in 2 min.")
+        self.assertEqual(tg.texts[-1], "You can pick tokens once every 10 minutes. Try again in 2 min.")
 
     def test_digest_command(self):
         bot, tg, api = self.make(["premium_digest"], premium_users=[U1])
@@ -492,8 +493,9 @@ class TestBotExtras(unittest.TestCase):
         bot.handle_update(private("/digest on", user=U2))
         self.assertIn("It's for Premium holders", tg.texts[-1])
         self.assertEqual(api.digest_calls, [False, True, True])
-        text, _ = bot.premium_text(U1, U1, "premium", "", now=NOW)
-        self.assertIn("Morning digest: on, daily at 08:00 UTC (/digest off)", text)
+        text, markup = bot.premium_text(U1, U1, "premium", "", now=NOW)
+        self.assertIn("/digest — a daily morning summary of your Watchlist (on/off)", text)
+        self.assertEqual(markup["inline_keyboard"][0], [{"text": "Daily digest: on", "callback_data": "digest:off"}])
 
     def test_digest_off_as_before(self):
         bot, tg, api = self.make(premium_users=[U1])
