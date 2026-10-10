@@ -379,8 +379,15 @@ def scan_priority(headers, body, user=_NO_USER):
 
 TRENDING = premium_trending.Counter()
 FRESH = premium.FreshLimits()
-TOO_FAST = "You're scanning too fast, try again in a minute."
-TOO_FAST_HINT = " Premium holders get a higher limit."
+def too_fast(is_prem):
+    """Лимит новых сканов бота превышен → (текст, показать ли [⭐ Premium features]). Числа — из настроек
+    (BOT_SCAN_RATE_PER_MIN, BOT_SCAN_RATE_PREMIUM_PER_MIN); без PREMIUM_ENABLED — только первая строка."""
+    if is_prem:
+        return f"You've reached the limit of {premium.bot_rate(True)} scans per minute, try again in a moment.", False
+    text = f"You've reached the limit of {premium.bot_rate(False)} scans per minute."
+    if not premium.enabled():
+        return text, False
+    return text + f"\n\nPremium holders can scan up to {premium.bot_rate(True)} tokens per minute.", True
 
 
 def api_scan(headers, addr, body):
@@ -411,8 +418,9 @@ def api_scan(headers, addr, body):
                          **({"fresh": True} if fresh else {}))
     except RateLimited as e:
         if client and client[0].startswith("tg:"):
-            return 429, {"error": "user_rate_limited", "message": TOO_FAST + ("" if is_prem else TOO_FAST_HINT),
-                         "premium": is_prem, "retry_in": e.args[0]}, {"retry-after": str(e.args[0])}
+            text, upsell = too_fast(is_prem)
+            return 429, {"error": "user_rate_limited", "message": text, "premium": is_prem, "upsell": upsell,
+                         "retry_in": e.args[0]}, {"retry-after": str(e.args[0])}
         raise
     if fresh:
         FRESH.take(user[0], tok, now)

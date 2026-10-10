@@ -17,7 +17,11 @@ class Busy(ApiError):
 
 class TooFast(Busy):
     """Лимит новых сканов на пользователя бота (429 user_rate_limited) или Fresh scan (429 fresh_limited):
-    args[0] — текст сайта для пользователя."""
+    args[0] — текст сайта для пользователя, upsell — показать ли под ним [⭐ Premium features]."""
+
+    def __init__(self, message, upsell=False):
+        super().__init__(message)
+        self.upsell = upsell
 
 
 class Rejected(Exception):
@@ -56,7 +60,7 @@ class CrawlScan:
             if e.code == 400 and err:
                 raise Rejected(err) from None
             if e.code == 429 and err in ("user_rate_limited", "fresh_limited"):
-                raise TooFast(payload.get("message") or err) from None
+                raise TooFast(payload.get("message") or err, bool(payload.get("upsell"))) from None
             if (e.code == 503 and err == "busy") or e.code == 429:
                 raise Busy(payload.get("message") or err) from None
             if e.code in ok and isinstance(payload, dict):

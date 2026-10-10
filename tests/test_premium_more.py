@@ -315,13 +315,29 @@ class TestBotRateAPI(Server):
         for _ in range(5):
             self.assertEqual(self.scan(A, user=U2)[0], 200)                                 # из кэша — не тратит
         code, r = self.scan(B, user=U2)
-        self.assertEqual((code, r["error"]), (429, "user_rate_limited"))
-        self.assertEqual(r["message"], "You're scanning too fast, try again in a minute. "
-                                       "Premium holders get a higher limit.")
+        self.assertEqual((code, r["error"], r["upsell"]), (429, "user_rate_limited", True))
+        self.assertEqual(r["message"], "You've reached the limit of 3 scans per minute.\n\n"
+                                       "Premium holders can scan up to 15 tokens per minute.")
         for i in range(15):
             self.assertEqual(self.scan("0x" + f"{0x30 + i:02x}" * 20, user=U1)[0], 200)     # премиум — 15
         code, r = self.scan(B, user=U1)
-        self.assertEqual((code, r["message"]), (429, "You're scanning too fast, try again in a minute."))
+        self.assertEqual((code, r["upsell"]), (429, False))
+        self.assertEqual(r["message"], "You've reached the limit of 15 scans per minute, try again in a moment.")
+        from bot.api import CrawlScan
+        api = CrawlScan(self.base, alerts_secret=SECRET)                                    # клиент бота против сервера
+        with self.assertRaises(TooFast) as cm:
+            api.scan(C, user_id=U2)
+        self.assertEqual((str(cm.exception).split("\n")[0], cm.exception.upsell),
+                         ("You've reached the limit of 3 scans per minute.", True))
+
+    def test_limit_texts(self):
+        with mock.patch.dict(os.environ, {"BOT_SCAN_RATE_PER_MIN": "4", "BOT_SCAN_RATE_PREMIUM_PER_MIN": "25"}):
+            self.assertEqual(server.too_fast(False), ("You've reached the limit of 4 scans per minute.\n\n"
+                                                      "Premium holders can scan up to 25 tokens per minute.", True))
+            self.assertEqual(server.too_fast(True),
+                             ("You've reached the limit of 25 scans per minute, try again in a moment.", False))
+            with mock.patch.dict(os.environ, {"PREMIUM_ENABLED": "false"}):              # без премиума — одна строка
+                self.assertEqual(server.too_fast(False), ("You've reached the limit of 4 scans per minute.", False))
 
     def test_env_limits_and_ip_limit_unchanged(self):
         with mock.patch.dict(os.environ, {"BOT_SCAN_RATE_PER_MIN": "1", "BOT_SCAN_RATE_PREMIUM_PER_MIN": "2"}):
@@ -465,12 +481,21 @@ class TestBot(unittest.TestCase):
             bot.request_scan(U2, U2, "0x" + f"{0x50 + i:02x}" * 20, None, private=True)
         self.assertEqual(bot.jobs.qsize(), 3)
 
+        msg = "You've reached the limit of 3 scans per minute.\n\nPremium holders can scan up to 15 tokens per minute."
+
         def limited(token, **kw):
-            raise TooFast("You're scanning too fast, try again in a minute. Premium holders get a higher limit.")
+            raise TooFast(msg, upsell=True)
         api.scan = limited
         bot.run_scan(U2, 5, A, False, True, U2)
-        self.assertEqual(tg.texts[-1], "🕷 You're scanning too fast, try again in a minute. Premium holders get a "
-                                       "higher limit.")
+        self.assertEqual(tg.texts[-1], msg)
+        self.assertEqual(tg.markups[-1], {"inline_keyboard": [[{"text": "⭐ Premium features", "callback_data": "premium"}]]})
+        bot.handle_update(callback("premium", user=U2))                                     # кнопка открывает меню
+        self.assertTrue(tg.texts[-1].startswith("⭐ <b>Premium features for $CrawlScan holders</b>"))
+        api.scan = lambda token, **kw: (_ for _ in ()).throw(
+            TooFast("You've reached the limit of 15 scans per minute, try again in a moment."))
+        bot.run_scan(U1, 5, A, False, True, U1)
+        self.assertEqual(tg.texts[-1], "You've reached the limit of 15 scans per minute, try again in a moment.")
+        self.assertIsNone(tg.markups[-1])                                                    # премиум — без кнопки и значка
         bot, tg, api = self.make()
         bot.request_scan(U2, U2, A, None, private=True)
         bot.request_scan(U2, U2, B, None, private=True)

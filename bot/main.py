@@ -667,7 +667,8 @@ class Bot:
         if was_queued:
             self.edit(chat_id, mid, T.crawling(addr))
         html, markup, token = self._scan(addr, watch=private, user_id=user_id, fresh=fresh)
-        premium_user = markup is not None and self.is_premium(user_id)   # вердикт (не ошибка) премиум-пользователю
+        verdict = markup is not None and markup is not T.PREMIUM_UPSELL   # вердикт, а не ошибка / лимит
+        premium_user = verdict and self.is_premium(user_id)               # ... премиум-пользователю
         if premium_user:
             html += "\n\n" + T.PREMIUM_BADGE
             row = T.premium_row(token, dev=private and self.feature("premium_devcheck"),
@@ -705,7 +706,7 @@ class Bot:
             return T.rejected(addr, str(e)), None, addr
         except TooFast as e:                    # лимит сканов на пользователя / Fresh scan (текст сайта)
             self.log(f"api {addr}: user limit")
-            return T.too_fast(str(e)), None, addr
+            return T.too_fast(str(e)), (T.PREMIUM_UPSELL if e.upsell else None), addr
         except Busy:
             self.log(f"api {addr}: site busy")
             return T.SITE_BUSY, None, addr

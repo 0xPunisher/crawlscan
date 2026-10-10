@@ -751,7 +751,11 @@ def premium_row(addr, dev=False, fresh=False):
 
 
 def too_fast(message):
-    return f"🕷 {e(message)}"
+    """Текст сайта о лимите сканов / Fresh scan (как есть, экранированный)."""
+    return e(message)
+
+
+PREMIUM_UPSELL = {"inline_keyboard": [[{"text": "⭐ Premium features", "callback_data": "premium"}]]}
 
 
 def _date(ts):
