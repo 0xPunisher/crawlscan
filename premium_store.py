@@ -2,7 +2,7 @@
 блокировки с розыгрышем, наградами и alerts. Храним только Telegram ID, адрес кошелька, время, хеш транзакции
 верификации и баланс.
 
-  premium_reservations — брони: один кошелёк — одна бронь, у пользователя одна бронь; живёт RESERVE_MIN минут.
+  premium_reservations — брони: один кошелёк — одна бронь, у пользователя одна бронь; живёт premium.verify_min() минут (PREMIUM_VERIFY_MIN).
   premium_links        — привязки: один кошелёк — один Telegram ID, один Telegram ID — один кошелёк.
   premium_prefs        — /digest on|off (нет строки — сводка включена).
   premium_digest_base  — снимок alerts каждого токена на момент прошлой утренней сводки (с чем сравнивать «за сутки»).
@@ -48,7 +48,7 @@ class PremiumStore:
 
     # --- брони --------------------------------------------------------------------------------------
 
-    def reserve(self, user_id, wallet, now, minutes=premium.RESERVE_MIN):
+    def reserve(self, user_id, wallet, now, minutes=None):
         """Забронировать кошелёк за пользователем. → (состояние, бронь | привязка | None):
         "reserved" — новая бронь (прежняя бронь пользователя на другой кошелёк снимается);
         "pending" — этот кошелёк уже забронирован им же (прежняя бронь); "yours" — уже привязан к нему;
@@ -61,6 +61,7 @@ class PremiumStore:
             if res:
                 return ("pending", res) if res["user_id"] == user_id else ("taken", None)
             self.db.execute("DELETE FROM premium_reservations WHERE user_id = ?", (user_id,))
+            minutes = premium.verify_min() if minutes is None else minutes
             self.db.execute("INSERT INTO premium_reservations(wallet, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
                             (wallet, user_id, now, now + minutes * 60))
             return "reserved", self._one("SELECT * FROM premium_reservations WHERE wallet = ?", (wallet,))

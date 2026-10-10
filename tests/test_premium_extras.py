@@ -657,6 +657,9 @@ class TestDigest(Site):
         self.assertIn("⚪️ <b>$AAA</b> · not scanned yet · 24h price +12.3%", self.queued[-1][1])   # снимка нет — без скана
         code, st = self.req(f"/api/premium/status?user_id={U1}")
         self.assertEqual((st["digest"], st["digest_hour"], st["premium_digest"]), (True, 8, True))
+        self.assertEqual(st["verify_min"], 5)                                               # окно /verify для меню бота
+        code, r = self.req("/api/premium/reserve", {"user_id": 444444, "wallet": "0x" + "b7" * 20})
+        self.assertEqual((code, r["minutes"], r["expires_at"] - int(time.time()) <= 300), (200, 5, True))
 
     def test_through_notify_queue(self):
         """start_premium поднимает поток сводки с server.notify_message (очередь отправщика alerts) и ds_batch."""

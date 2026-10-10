@@ -538,7 +538,7 @@ def reserved(r):
         return (f"⭐ You're already verifying {w}.\n\nBuy any amount of $CrawlScan to this wallet by "
                 f"{_hm(r['expires_at'])} to verify it.")
     return (f"⭐ <b>Verify your wallet</b>\n{w}\n\n"
-            f"Buy any amount of $CrawlScan to this wallet within {r.get('minutes', 15)} minutes to verify it.\n\n"
+            f"Buy any amount of $CrawlScan to this wallet within {r.get('minutes', 5)} minutes to verify it.\n\n"
             "Only buys count: tokens sent from another wallet don't. "
             f"I'll message you as soon as I see the buy (until {_hm(r['expires_at'])}).")
 
@@ -555,7 +555,7 @@ def premium_lines(st):
         perks.append("Fresh scan — rescan any token instantly, skipping the cache")
     if st.get("premium_memory"):
         perks.append("Memory insights — see when top holders are known sniper bots or repeat wallets")
-    cmds = ["/verify — link your wallet: buy any amount of $CrawlScan within 15 minutes"]
+    cmds = [f"/verify — link your wallet: buy any amount of $CrawlScan within {st.get('verify_min') or 5} minutes"]
     if st.get("premium_import"):
         cmds.append("/picktokens — choose tokens from your linked wallet to watch (we only read public balances, "
                     "no keys or wallet connection)")

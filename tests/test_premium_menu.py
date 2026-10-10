@@ -17,7 +17,7 @@ FEATURES = ("Priority scanning — your scans are always first in line\n"
             "Bigger Watchlist — up to 10 tokens with no time limit\n"
             "\n"
             "Commands:\n"
-            "/verify — link your wallet: buy any amount of $CrawlScan within 15 minutes\n"
+            "/verify — link your wallet: buy any amount of $CrawlScan within 5 minutes\n"
             "/picktokens — choose tokens from your linked wallet to watch (we only read public balances, "
             "no keys or wallet connection)\n"
             "/digest — a daily morning summary of your Watchlist (on/off)\n"
@@ -135,6 +135,11 @@ class TestPremiumMenu(unittest.TestCase):
             [{"text": "Unlink", "callback_data": "unlink"}]]})
         api.digest_on = False
         self.assertEqual(buttons(self.view(bot, U1)[1])[0], ["Pick tokens", "Daily digest: off"])
+
+    def test_verify_minutes_from_site(self):
+        st = {"linked": False, "min_tokens": 500_000, "verify_min": 10}
+        self.assertIn("/verify — link your wallet: buy any amount of $CrawlScan within 10 minutes",
+                      T.premium_view(st, NOW)[0])
 
     def test_minimum_from_site(self):
         st = {"linked": False, "min_tokens": 1_000_000}

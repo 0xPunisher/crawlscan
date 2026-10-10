@@ -176,7 +176,7 @@ class TestStore(unittest.TestCase):
 
     def test_reserve(self):
         state, r = self.st.reserve(U1, W1, NOW)
-        self.assertEqual((state, r["user_id"], r["expires_at"]), ("reserved", U1, NOW + 900))
+        self.assertEqual((state, r["user_id"], r["expires_at"]), ("reserved", U1, NOW + 300))   # 5 минут
         self.assertEqual(self.st.reserve(U1, W1, NOW + 5)[0], "pending")                # своя бронь
         self.assertEqual(self.st.reserve(U2, W1, NOW + 5), ("taken", None))              # кто первый, того и кошелёк
         self.assertEqual(self.st.reserve(U1, W2, NOW + 10)[0], "reserved")               # новая бронь заменяет прежнюю
@@ -334,18 +334,28 @@ class TestService(unittest.TestCase):
 
     def test_expired(self):
         self.st.reserve(U1, W1, NOW)
-        self.clock.t = NOW + 900 + premium_service.FINAL_S - 1
+        self.clock.t = NOW + 300 + premium_service.FINAL_S - 1
         self.svc.verify_tick()
         self.assertIsNotNone(self.st.reservation_of(U1))                                 # ждём, пока нода отдаст блоки
-        self.ch.buy(W1, ts=NOW + 899)                                                    # поздняя покупка внутри брони
-        self.clock.t = NOW + 900 + premium_service.FINAL_S
+        self.ch.buy(W1, ts=NOW + 299)                                                    # поздняя покупка внутри брони
+        self.clock.t = NOW + 300 + premium_service.FINAL_S
         self.assertEqual(self.svc.verify_tick(), 1)
         self.st.reserve(U2, W2, NOW + 1000)
-        self.clock.t = NOW + 1000 + 900 + premium_service.FINAL_S
+        self.clock.t = NOW + 1000 + 300 + premium_service.FINAL_S
         self.svc.verify_tick()
         self.assertIsNone(self.st.reservation_of(U2))
         self.assertEqual(self.notes[-1], (U2, f"⌛ Verification expired: no $CrawlScan buy to <code>{W2}</code> in "
-                                              "15 minutes. Send /verify to try again."))
+                                              "5 minutes. Send /verify to try again."))
+
+    def test_verify_window_env(self):
+        with mock.patch.dict(os.environ, {"PREMIUM_VERIFY_MIN": ""}):
+            self.assertEqual(premium.verify_min(), 5)
+        for v, want in (("10", 10), ("0", 5), ("x", 5)):
+            with mock.patch.dict(os.environ, {"PREMIUM_VERIFY_MIN": v}):
+                self.assertEqual(premium.verify_min(), want)
+        with mock.patch.dict(os.environ, {"PREMIUM_VERIFY_MIN": "10"}):
+            self.assertEqual(self.st.reserve(333333, W3, NOW)[1]["expires_at"], NOW + 600)
+            self.assertIn("in 10 minutes.", premium.expired_message(W3))
 
     def test_balance_daily_paused_grace_trim(self):
         self.st.reserve(U1, W1, NOW)
@@ -507,7 +517,7 @@ class TestPremiumAPI(Site):
 
     def test_reserve(self):
         code, r = self.req("/api/premium/reserve", {"user_id": U1, "wallet": W1.upper().replace("0X", "0x")})
-        self.assertEqual((code, r["state"], r["wallet"], r["minutes"]), (200, "reserved", W1, 15))
+        self.assertEqual((code, r["state"], r["wallet"], r["minutes"]), (200, "reserved", W1, 5))
         self.assertEqual(self.req("/api/premium/reserve", {"user_id": U1, "wallet": W1})[1]["state"], "pending")
         code, r = self.req("/api/premium/reserve", {"user_id": U2, "wallet": W1})
         self.assertEqual((code, r["message"]), (409, "This wallet is already linked to another account."))
@@ -645,7 +655,7 @@ class PremiumAPI:
         self.reserves.append((user_id, wallet))
         if wallet.lower() == W2:
             return {"status": 409, "error": "taken"}
-        return {"ok": True, "state": "reserved", "wallet": wallet.lower(), "minutes": 15, "expires_at": NOW + 900}
+        return {"ok": True, "state": "reserved", "wallet": wallet.lower(), "minutes": 5, "expires_at": NOW + 300}
 
     def premium_status(self, user_id):
         self.calls.append(("status", user_id))
@@ -695,9 +705,9 @@ class TestBot(unittest.TestCase):
         bot.handle_update(private(W1))                                                    # адрес — кошелёк, не скан
         self.assertEqual(api.reserves, [(U1, W1)])
         self.assertEqual(tg.texts[-1], f"⭐ <b>Verify your wallet</b>\n<code>{W1}</code>\n\n"
-                                       "Buy any amount of $CrawlScan to this wallet within 15 minutes to verify it.\n\n"
+                                       "Buy any amount of $CrawlScan to this wallet within 5 minutes to verify it.\n\n"
                                        "Only buys count: tokens sent from another wallet don't. I'll message you as "
-                                       "soon as I see the buy (until " + T._hm(NOW + 900) + ").")
+                                       "soon as I see the buy (until " + T._hm(NOW + 300) + ").")
         self.assertEqual(tg.markups[-1]["inline_keyboard"][0][0]["text"], "Buy $CrawlScan")
         bot.handle_update(private(f"/verify {W2}"))
         self.assertEqual(tg.texts[-1], "This wallet is already linked to another account.")

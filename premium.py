@@ -1,7 +1,7 @@
 """Premium для холдеров $CrawlScan: правила и тексты. Чистые функции без сети и базы.
 
 Всё за выключателем PREMIUM_ENABLED (по умолчанию выключено). Верификация — только покупкой: пользователь бронирует
-кошелёк в боте (/verify) на RESERVE_MIN минут за свой Telegram ID, и если за это время на кошелёк пришёл $CrawlScan
+кошелёк в боте (/verify) на PREMIUM_VERIFY_MIN минут (по умолчанию 5) за свой Telegram ID, и если за это время на кошелёк пришёл $CrawlScan
 от пула или известного роутера — или от любого приложения / агрегатора, если в той же транзакции токен вышел из пула
 (Transfer токена от пула) и в ней есть своп в пуле (V4 Swap или CurveBuy), — кошелёк привязан. Кто первый, того и кошелёк: один
 кошелёк — один Telegram-аккаунт, один аккаунт — один кошелёк.
@@ -16,7 +16,7 @@ from draw_store import DEFAULT_PATH as DRAW_DEFAULT_PATH
 
 DEFAULT_TOKEN = "0x19dcb63c4d2f29a6f077f094a4f858fc790145e1"   # $CrawlScan (как REWARDS_TOKEN)
 MIN_TOKENS = 500_000         # по умолчанию PREMIUM_MIN_TOKENS
-RESERVE_MIN = 15             # минут брони кошелька
+RESERVE_MIN = 5              # минут брони кошелька по умолчанию (env PREMIUM_VERIFY_MIN)
 WATCH_LIMIT = 10             # токенов в Watchlist у премиума (обычные — alerts.WATCH_LIMIT)
 GRACE_DAYS = 7               # дней после падения баланса ниже порога, пока Watchlist остаётся премиальным
 CHECK_EVERY = 86400          # секунд между проверками баланса
@@ -28,6 +28,15 @@ TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523
 
 def enabled():
     return os.environ.get("PREMIUM_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+
+def verify_min():
+    """PREMIUM_VERIFY_MIN — минут на покупку после /verify (бронь кошелька); пусто или неверно — RESERVE_MIN."""
+    try:
+        v = int(os.environ.get("PREMIUM_VERIFY_MIN", "").strip())
+        return v if v > 0 else RESERVE_MIN
+    except ValueError:
+        return RESERVE_MIN
 
 
 def _flag(name):
@@ -286,7 +295,7 @@ def verified_message(wallet, balance, decimals, threshold, old_wallet=None):
 
 
 def expired_message(wallet):
-    return (f"⌛ Verification expired: no $CrawlScan buy to {_code(wallet)} in {RESERVE_MIN} minutes. "
+    return (f"⌛ Verification expired: no $CrawlScan buy to {_code(wallet)} in {verify_min()} minutes. "
             "Send /verify to try again.")
 
 

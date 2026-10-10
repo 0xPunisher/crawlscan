@@ -820,7 +820,7 @@ def premium_status(user_id, now):
     limit, days = premium.watch_terms(link, now)
     out = {"user_id": user_id, "linked": bool(link), "premium": bool(link and link["premium"]),
            "min_tokens": premium.min_tokens(), "watch_limit": limit, "watch_days": days,
-           "reservation": {"wallet": res["wallet"], "expires_at": res["expires_at"]} if res else None}
+           "verify_min": premium.verify_min(), "reservation": {"wallet": res["wallet"], "expires_at": res["expires_at"]} if res else None}
     out |= premium.features()   # включённые функции (priority / import / digest); выключенных полей нет
     if premium.digest_enabled():
         out |= {"digest": st.digest_on(user_id), "digest_hour": premium.digest_hour()}
@@ -1004,7 +1004,7 @@ def premium_api(method, path, body, q):
         return 409, {"error": "taken", "message": PREMIUM_TAKEN, "wallet": wallet}
     if state == "reserved":
         print(f"premium: reserved {premium.short(wallet)} {premium.log_user(user_id)}", flush=True)
-    out = {"ok": True, "state": state, "wallet": wallet, "minutes": premium.RESERVE_MIN,
+    out = {"ok": True, "state": state, "wallet": wallet, "minutes": premium.verify_min(),
            "min_tokens": premium.min_tokens()}
     return 200, out | ({"expires_at": row["expires_at"]} if state in ("reserved", "pending") else {})
 
