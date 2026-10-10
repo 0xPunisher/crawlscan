@@ -551,12 +551,20 @@ def premium_lines(st):
     показываются."""
     perks = (["Priority scanning — your scans are always first in line"] if st.get("premium_priority") else []) + [
         "Bigger Watchlist — up to 10 tokens with no time limit"]
+    if st.get("premium_fresh"):
+        perks.append("Fresh scan — rescan any token instantly, skipping the cache")
+    if st.get("premium_memory"):
+        perks.append("Memory insights — see when top holders are known sniper bots or repeat wallets")
     cmds = ["/verify — link your wallet: buy any amount of $CrawlScan within 15 minutes"]
     if st.get("premium_import"):
         cmds.append("/picktokens — choose tokens from your linked wallet to watch (we only read public balances, "
                     "no keys or wallet connection)")
     if st.get("premium_digest"):
         cmds.append("/digest — a daily morning summary of your Watchlist (on/off)")
+    if st.get("premium_devcheck"):
+        cmds.append("/dev — see what else this token's dev launched, and which of those ended up in Rug Replay")
+    if st.get("premium_trending"):
+        cmds.append("/trending — the most scanned tokens on CrawlScan right now")
     cmds.append("/unlink — unlink your wallet")
     return perks + ["", "Commands:"] + cmds
 
@@ -595,7 +603,8 @@ def premium_buttons(st, buy_url=None):
     if st.get("premium_digest"):
         on = st.get("digest", True)
         row.append({"text": f"Daily digest: {'on' if on else 'off'}", "callback_data": f"digest:{'off' if on else 'on'}"})
-    return {"inline_keyboard": ([row] if row else []) + [[unlink]]}
+    extra = [TRENDING_BUTTON] if st.get("premium_trending") else []
+    return {"inline_keyboard": ([row] if row else []) + [extra + [unlink]]}
 
 
 def premium_view(st, now, buy_url=None):
@@ -722,3 +731,108 @@ def digest_state(r):
             text += "\n\nIt's for Premium holders: it starts when your Premium is active. /premium shows your status."
         return text
     return "Morning digest is off. /digest on turns it back on."
+
+
+# ---------- Premium: Dev history, Memory, Trending, Fresh scan, лимит сканов ----------
+TRENDING_BUTTON = {"text": "Trending", "callback_data": "trending"}
+DEV_USAGE = "Usage: /dev &lt;token address&gt;"
+DEV_UNKNOWN = ("We haven't recorded a scan of this token yet, so we don't know its dev. Scan it first, "
+               "then check again.")
+DEV_NONE = "No other tokens from this dev in our records yet."
+PREMIUM_ONLY = "This is a Premium feature. /premium shows how to get it."
+TRENDING_EMPTY = "No scans in the last hour yet."
+
+
+def premium_row(addr, dev=False, fresh=False):
+    """Ряд под вердиктом для премиума: [Dev history] [Fresh scan] (только включённые функции) или None."""
+    row = ([{"text": "Dev history", "callback_data": f"dev:{addr}"}] if dev else []) + (
+        [{"text": "Fresh scan", "callback_data": f"fresh:{addr}"}] if fresh else [])
+    return row or None
+
+
+def too_fast(message):
+    return f"🕷 {e(message)}"
+
+
+def _date(ts):
+    d = datetime.fromtimestamp(ts, timezone.utc)
+    return f"{d:%b} {d.day}"
+
+
+def _verdict_short(band, score):
+    if not band:
+        return "no verdict"
+    icon = BAND_ICON.get(band, "⚪️")
+    return f"{icon} {e(band.replace('_', ' '))}" + (f" {score}" if score is not None else "")
+
+
+def replay_mark(rep):
+    drop, hours = rep.get("drop"), rep.get("hours")
+    tail = []
+    if drop is not None:
+        tail.append(f"fell {drop * 100:.0f}%")
+    if hours is not None:
+        tail.append(f"within {max(1, round(hours))} hours")
+    return "🔴 in Rug Replay" + (f" ({' '.join(tail)})" if tail else "")
+
+
+def dev_view(r):
+    """Ответ /api/premium/dev → HTML."""
+    if not r.get("known"):
+        return DEV_UNKNOWN
+    name = f"${e(r['ticker'])}" if r.get("ticker") else e(short(r["token"]))
+    lines = [f"👤 <b>Dev history</b> · {name}", f"Dev: <code>{e(r['dev'])}</code>", ""]
+    if not r.get("total"):
+        lines.append(DEV_NONE)
+        return "\n".join(lines)
+    n, m = r["total"], r.get("in_replay", 0)
+    lines += [f"This dev launched {n} other token{'' if n == 1 else 's'} we've seen, {m} of them "
+              f"{'is' if m == 1 else 'are'} in Rug Replay.", ""]
+    for i, t in enumerate(r.get("tokens") or [], 1):
+        tick = f"${e(t['ticker'])}" if t.get("ticker") else e(short(t["token"]))
+        mcap = f" · mcap {_usd(t['mcap_usd'])} at scan" if t.get("mcap_usd") else ""
+        lines.append(f"{i}. {tick} · {_date(t['ts'])} · {_verdict_short(t.get('band'), t.get('score'))}{mcap}")
+        if t.get("replay"):
+            lines.append(f"   {replay_mark(t['replay'])}")
+    more = n - len(r.get("tokens") or [])
+    if more > 0:
+        lines.append(f"…and {more} more.")
+    return "\n".join(lines)
+
+
+def memory_block(r):
+    """Ответ /api/premium/memory → HTML-блок «Memory» под вердиктом или None (ничего примечательного)."""
+    if not r or not r.get("notable"):
+        return None
+    lines = ["🧠 <b>Memory</b>"]
+    if r.get("repeat"):
+        lines.append(f"• {r['repeat']} of the top {r.get('holders', 20)} holders were in other tokens we scanned")
+    for sn in r.get("snipers") or []:
+        lines.append(f"• <code>{e(short(sn['wallet']))}</code> — sniper bot, seen in {sn['tokens']} tokens today")
+    for c in r.get("clusters") or []:
+        toks = c.get("tokens") or []
+        names = ", ".join(f"${e(t['ticker'])}" if t.get("ticker") else e(short(t["token"])) for t in toks[:5])
+        if len(toks) > 5:
+            names += f" +{len(toks) - 5}"
+        share = f" ({c['share_supply'] * 100:.1f}% of supply)" if c.get("share_supply") else ""
+        rugs = sum(1 for t in toks if t.get("replay"))
+        tail = f" — 🔴 {rugs} in Rug Replay" if rugs else ""
+        lines.append(f"• {c['wallets']} linked wallets{share} were together in {len(toks)} other "
+                     f"token{'' if len(toks) == 1 else 's'}: {names}{tail}")
+    return "\n".join(lines)
+
+
+def trending_view(r):
+    """Ответ /api/premium/trending → (html, кнопки [Scan $TICKER] по две в ряд)."""
+    items = r.get("items") or []
+    if not items:
+        return f"🔥 <b>Trending on CrawlScan</b>\n\n{TRENDING_EMPTY}", None
+    lines, buttons = [f"🔥 <b>Trending on CrawlScan</b> · last {r.get('window_min', 60)} min", ""], []
+    for i, it in enumerate(items, 1):
+        tick = f"${e(it['ticker'])}" if it.get("ticker") else e(short(it["token"]))
+        verdict = _verdict_short(it.get("band"), it.get("score")) + ("/100" if it.get("score") is not None else "")
+        lines.append(f"{i}. {tick} · {verdict} · {it['scans']} scan{'' if it['scans'] == 1 else 's'}")
+        label = f"${it['ticker']}" if it.get("ticker") else short(it["token"])
+        buttons.append({"text": f"Scan {label}", "callback_data": f"sc:{it['token']}"})
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    return "\n".join(lines), {"inline_keyboard": rows}

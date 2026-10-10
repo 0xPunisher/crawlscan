@@ -64,6 +64,12 @@ Premium для бота (только при PREMIUM_ENABLED=true, иначе 40
                                                    410 — просмотра нет или устарел
   POST /api/premium/digest {"user_id"[, "on"]}    -> {"digest", "hour", "premium"} (PREMIUM_DIGEST, иначе 404)
   PREMIUM_PRIORITY: POST /api/scan с X-Alerts-Secret и {"user_id"} премиум-холдера — первым в очереди слотов (scan_gate).
+  POST /api/premium/dev {"user_id", "token"}      -> другие токены дева из memory.db (PREMIUM_DEVCHECK, иначе 404)
+  POST /api/premium/memory {"user_id", "token"}   -> блок Memory: холдеры из других токенов, снайпер-боты, кластеры
+                                                   (PREMIUM_MEMORY_INSIGHTS; только memory.db, после вердикта)
+  POST /api/premium/trending {"user_id"}          -> топ-10 по сканам за час (PREMIUM_TRENDING, кэш 60 с)
+  PREMIUM_FRESH: POST /api/scan {"fresh": true} премиума — мимо кэша результата (2 мин на токен, 20 в час);
+  PREMIUM_BOT_RATE: новые сканы бота на Telegram ID — BOT_SCAN_RATE_PER_MIN / BOT_SCAN_RATE_PREMIUM_PER_MIN, 429.
 
 Результат токена кэшируется 10 минут: повторный скан отдаёт сохранённые события сразу.
 Чарт кэшируется 10 минут (без свечей — 1 минуту); сбой GeckoTerminal — пустые candles, не ошибка.
@@ -105,6 +111,8 @@ import opmem
 import premium
 import premium_digest
 import premium_import
+import premium_memory
+import premium_trending
 import premium_service
 import replay
 import scan_gate
@@ -253,11 +261,13 @@ def _run_job(job_id, token, prio=False):
         record_snapshot(res)
 
 
-def _reuse(token, now):
-    """job_id свежего кэша или идущего скана токена, иначе None (под _lock)."""
+def _reuse(token, now, fresh=False):
+    """job_id свежего кэша или идущего скана токена, иначе None (под _lock). fresh (Fresh scan премиума) — кэш
+    готового результата не берётся, только подключение к идущему скану."""
     jid = BY_TOKEN.get(token)
     job = JOBS.get(jid)
-    if job and (not job["done"] or (job["result"] and now - job["ts"] < CACHE_TTL and not _index_ready(job["result"]))):
+    if job and (not job["done"] or (not fresh and job["result"] and now - job["ts"] < CACHE_TTL
+                                    and not _index_ready(job["result"]))):
         return jid
     return None
 
@@ -282,12 +292,13 @@ def scan_stats():
     return active, f", last min: {started} started, {busy} busy"
 
 
-def start_scan(token, client=None, prio=False):
+def start_scan(token, client=None, prio=False, fresh=False):
     """job_id: свежий кэш по токену или уже идущий скан того же токена, иначе новый.
     Новый — только если в очереди есть место и память ниже порога, иначе Busy; и если client (ключ, лимит в минуту)
     не исчерпал лимит новых сканов, иначе RateLimited. Кэш и подключение к идущему скану лимит не тратят.
     prio — скан премиум-холдера (scan_priority: баланс $CrawlScan, 0 — обычный): при PREMIUM_PRIORITY первым берёт
-    освободившийся слот, среди премиумов — больший баланс раньше."""
+    освободившийся слот, среди премиумов — больший баланс раньше. fresh — Fresh scan (PREMIUM_FRESH): мимо кэша
+    готового результата (идущий скан того же токена — подключение к нему)."""
     chain, token = engine.chain_of(token)
     now = time.time()
     with _lock:
@@ -295,7 +306,7 @@ def start_scan(token, client=None, prio=False):
             if BY_TOKEN.get(JOBS[jid]["token"]) == jid:
                 del BY_TOKEN[JOBS[jid]["token"]]
             del JOBS[jid]
-        jid = _reuse(token, now)
+        jid = _reuse(token, now, fresh)
         if jid:
             return jid
         active = _ACTIVE[0]
@@ -304,7 +315,7 @@ def start_scan(token, client=None, prio=False):
     if memguard.over(live=active, cap=MAX_CONCURRENT):   # вне _lock: сброс кэшей и gc не держат остальные запросы
         _busy("memory")
     with _lock:
-        jid = _reuse(token, now)
+        jid = _reuse(token, now, fresh)
         if jid:
             return jid
         if _ACTIVE[0] >= MAX_CONCURRENT + SCAN_QUEUE_MAX:
@@ -329,22 +340,89 @@ def start_scan(token, client=None, prio=False):
     return jid
 
 
-def scan_priority(headers, body):
-    """Приоритет скана (только PREMIUM_PRIORITY): запрос от нашего бота (верный X-Alerts-Secret) с user_id, у которого
-    премиум активен (premium.db) → баланс $CrawlScan привязанного кошелька из уже сохранённой привязки (сырой, > 0;
-    в очереди больший — раньше), без новых запросов. Иначе 0 — обычный скан (выключено, сайт, нет секрета, сбой базы)."""
-    if not premium.priority_enabled() or not isinstance(body, dict) or body.get("user_id") is None:
-        return 0
+def bot_user(headers, body):
+    """Пользователь нашего бота на /api/scan для функций премиума (PREMIUM_PRIORITY, PREMIUM_BOT_RATE, PREMIUM_FRESH):
+    (user_id, привязка | None) — верный X-Alerts-Secret и user_id в теле; одно чтение premium.db (сбой — без
+    привязки). Ни одна такая функция не включена, сайт, нет секрета — None (база не открывается)."""
+    if not (premium.priority_enabled() or premium.bot_rate_enabled() or premium.fresh_enabled()):
+        return None
+    if not isinstance(body, dict) or body.get("user_id") is None:
+        return None
     if not alerts_secret_ok(headers.get("X-Alerts-Secret")):
-        return 0
+        return None
     try:
-        link = premium_store().link_of(_chat_id(body["user_id"]))
+        uid = _chat_id(body["user_id"])
     except (ValueError, TypeError):
-        return 0
+        return None
+    try:
+        return uid, premium_store().link_of(uid)
     except Exception as e:
         print(f"premium: priority not read: {type(e).__name__}: {e}", flush=True)
+        return uid, None
+
+
+_NO_USER = object()
+
+
+def scan_priority(headers, body, user=_NO_USER):
+    """Приоритет скана (только PREMIUM_PRIORITY): запрос от нашего бота (верный X-Alerts-Secret) с user_id, у которого
+    премиум активен (premium.db) → баланс $CrawlScan привязанного кошелька из уже сохранённой привязки (сырой, > 0;
+    в очереди больший — раньше), без новых запросов. Иначе 0 — обычный скан (выключено, сайт, нет секрета, сбой базы).
+    user — уже прочитанный bot_user (один раз на запрос)."""
+    if not premium.priority_enabled():
         return 0
+    if user is _NO_USER:
+        user = bot_user(headers, body)
+    link = user[1] if user else None
     return max(1, int(link["balance"])) if link and link["premium"] else 0
+
+
+TRENDING = premium_trending.Counter()
+FRESH = premium.FreshLimits()
+TOO_FAST = "You're scanning too fast, try again in a minute."
+TOO_FAST_HINT = " Premium holders get a higher limit."
+
+
+def api_scan(headers, addr, body):
+    """POST /api/scan → (код, тело, заголовки | None). Все функции премиума выключены — ровно прежний путь:
+    start_scan(token, лимит по IP, prio 0). Иначе (только запросы нашего бота с user_id): лимит новых сканов на
+    Telegram ID (PREMIUM_BOT_RATE, ответы из кэша не тратят), Fresh scan (PREMIUM_FRESH, только премиум, свои
+    лимиты), приоритет (PREMIUM_PRIORITY); счётчик Trending (PREMIUM_TRENDING) — после принятого запроса, O(1)."""
+    user = bot_user(headers, body)
+    link = user[1] if user else None
+    is_prem = bool(link and link["premium"])
+    client = scan_client(headers, addr)
+    if user and premium.bot_rate_enabled():
+        client = (f"tg:{user[0]}", premium.bot_rate(is_prem))
+    fresh = premium.fresh_enabled() and isinstance(body, dict) and body.get("fresh") is True
+    now = time.time()
+    if fresh:
+        if not is_prem:
+            return 403, NOT_PREMIUM, None
+        chain, tok = engine.chain_of(body.get("token"))
+        wait, why = FRESH.wait(user[0], tok, now)
+        if wait:
+            msg = (f"You can fresh-scan the same token once every {premium.FRESH_SAME_TOKEN_S // 60} minutes."
+                   if why == "token" else f"You've used {premium.FRESH_PER_HOUR} fresh scans this hour.")
+            return 429, {"error": "fresh_limited", "message": msg + " Try again later.", "retry_in": wait}, \
+                {"retry-after": str(wait)}
+    try:
+        jid = start_scan(body.get("token"), client, prio=scan_priority(headers, body, user),
+                         **({"fresh": True} if fresh else {}))
+    except RateLimited as e:
+        if client and client[0].startswith("tg:"):
+            return 429, {"error": "user_rate_limited", "message": TOO_FAST + ("" if is_prem else TOO_FAST_HINT),
+                         "premium": is_prem, "retry_in": e.args[0]}, {"retry-after": str(e.args[0])}
+        raise
+    if fresh:
+        FRESH.take(user[0], tok, now)
+    if premium.trending_enabled():
+        with _lock:
+            job = JOBS.get(jid)
+            key = (job["chain"], job["token"]) if job else None
+        if key:
+            TRENDING.hit(*key)
+    return 200, {"job": jid}, None
 
 
 def scan_flags(token):
@@ -818,6 +896,59 @@ def premium_import_api(path, user_id, body, now):
     return 200, premium_import.view(hit, watching, limit, now) | {"cached": cached}
 
 
+TRENDING_TTL = 60          # секунд: кэш ответа /api/premium/trending (общий для всех)
+EXTRA_PATHS = {"/api/premium/dev": premium.devcheck_enabled, "/api/premium/memory": premium.memory_enabled,
+               "/api/premium/trending": premium.trending_enabled}
+
+
+def _last_result(token):
+    """Готовый результат последнего скана токена из памяти сервера (кэш задач, JOB_TTL) или None."""
+    with _lock:
+        job = JOBS.get(BY_TOKEN.get(token))
+        return job["result"] if job and job["done"] and job["result"] else None
+
+
+def trending_body():
+    """Топ-10 токенов по сканам за час (счётчик TRENDING) с последним вердиктом из памяти сервера; без базы и сети."""
+    items = []
+    for chain, token, n in TRENDING.top(10):
+        res = _last_result(token) or {}
+        items.append({"token": token, "chain": chain, "scans": n, "band": res.get("band"), "score": res.get("score"),
+                      "ticker": (res.get("header") or {}).get("ticker")})
+    return {"items": items, "window_min": premium_trending.WINDOW // 60}
+
+
+def premium_extra_api(path, user_id, body, now):
+    """/api/premium/dev {user_id, token}, /api/premium/memory {user_id, token}, /api/premium/trending {user_id}:
+    только премиум; выключатель функции выключен — 404. Только чтение memory.db (premium_memory) / память сервера."""
+    if not EXTRA_PATHS[path]():
+        return 404, {"error": "not found"}
+    link = premium_store().link_of(user_id)
+    if not link or not link["premium"]:
+        return 403, NOT_PREMIUM
+    if path == "/api/premium/trending":
+        return 200, cached_response(("trending",), TRENDING_TTL, trending_body)
+    try:
+        chain, token = engine.chain_of(body.get("token"))
+    except engine.ScanError as e:
+        return 400, {"error": str(e)}
+    con = premium_memory.connect(opmem.db_path())
+    try:
+        if path == "/api/premium/dev":
+            return 200, {"token": token, "chain": chain} | premium_memory.dev_history(con, token)
+        res = _last_result(token)
+        if res:
+            holders, snipers, ops = premium_memory.from_result(res)
+        elif con is not None:
+            holders, snipers, ops = premium_memory.holders_from_db(con, token)
+        else:
+            holders, snipers, ops = [], set(), []
+        return 200, {"token": token, "chain": chain} | premium_memory.insights(con, token, holders, snipers, ops, now)
+    finally:
+        if con is not None:
+            con.close()
+
+
 def premium_api(method, path, body, q):
     """/api/premium/* → (код, тело). Выключатель и секрет проверяет вызывающий."""
     now = int(time.time())
@@ -839,6 +970,8 @@ def premium_api(method, path, body, q):
         return 200, premium_status(user_id, now)
     if method == "POST" and path in ("/api/premium/import", "/api/premium/import_add"):
         return premium_import_api(path, user_id, body, now)
+    if method == "POST" and path in EXTRA_PATHS:
+        return premium_extra_api(path, user_id, body, now)
     if method == "POST" and path == "/api/premium/digest":
         if not premium.digest_enabled():
             return 404, {"error": "not found"}
@@ -1132,9 +1265,8 @@ class H(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("content-length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
-            return self._send(200, {"job": start_scan(body.get("token"),
-                                                      scan_client(self.headers, self.client_address[0]),
-                                                      prio=scan_priority(self.headers, body))})
+            code, out, hdr = api_scan(self.headers, self.client_address[0], body)
+            return self._send(code, out, headers=hdr)
         except Busy:
             return self._send(503, BUSY, headers={"retry-after": str(RETRY_AFTER)})
         except RateLimited as e:

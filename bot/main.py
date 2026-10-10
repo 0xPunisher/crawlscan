@@ -27,7 +27,7 @@ if ROOT not in sys.path:
 import env                                          # noqa: E402
 import trade                                        # noqa: E402
 from bot import text as T                           # noqa: E402
-from bot.api import AlertsOff, ApiError, Busy, CrawlScan, PremiumOff, Rejected   # noqa: E402
+from bot.api import AlertsOff, ApiError, Busy, CrawlScan, PremiumOff, Rejected, TooFast   # noqa: E402
 from bot.tg import Telegram, TelegramError          # noqa: E402
 
 WORKERS = 3            # сканов одновременно на весь бот
@@ -49,9 +49,13 @@ PREMIUM_COMMANDS = [{"command": "verify", "description": "Link your $CrawlScan w
                     {"command": "unlink", "description": "Unlink your wallet"}]
 DIGEST_COMMAND = {"command": "digest", "description": "Morning digest of your watchlist: /digest on|off"}
 PICK_COMMAND = {"command": "picktokens", "description": "Pick tokens from your wallet to watch"}
+DEV_COMMAND = {"command": "dev", "description": "What else this token's dev launched: /dev <address>"}
+TRENDING_COMMAND = {"command": "trending", "description": "Most scanned tokens right now"}
 PREMIUM_CMDS = ("verify", "premium", "unlink", "admin_unlink", "digest")
 PICK_CMDS = ("picktokens", "import")   # /import — прежнее название (Import from wallet)
-PREMIUM_FEATURES = ("premium_priority", "premium_import", "premium_digest")   # поля /api/config (только включённые)
+PREMIUM_FEATURES = ("premium_priority", "premium_import", "premium_digest", "premium_devcheck", "premium_memory",
+                    "premium_trending", "premium_fresh", "premium_bot_rate")   # поля /api/config (только включённые)
+SCAN_USER_FEATURES = ("premium_priority", "premium_bot_rate", "premium_fresh")   # с ними /api/scan получает user_id
 WATCHLIST_BUTTON = {"inline_keyboard": [[{"text": "🔔 Watchlist", "callback_data": "watchlist"}]]}
 ALERTS_CHECK_TTL = 60  # секунд: сколько помнить, включены ли алерты на сайте
 PREMIUM_TTL = 300      # секунд: сколько помнить, премиум ли пользователь (значок под вердиктом)
@@ -172,6 +176,8 @@ class Bot:
                 return self.premium_command(chat_id, user.get("id"), cmd, arg)
             if cmd in PICK_CMDS:   # выключено (или Premium выключен) — подсказка, как у неизвестной команды
                 return self.import_command(chat_id, user.get("id"))
+            if cmd in ("dev", "trending"):
+                return self.extra_command(chat_id, user.get("id"), cmd, arg)
             if cmd is None and self.awaiting_watch(chat_id):       # после [➕ New]: адрес — подписка, не скан
                 found = T.find_address(txt)
                 if not found:
@@ -213,6 +219,16 @@ class Bot:
                 self.alerts_command(chat_id, "remove" if cmd == "rm" else cmd, found[1], edit=mid)
         elif data == "watchlist" and private:
             self.alerts_command(chat_id, "watchlist", "")
+        elif cmd in ("dev", "fresh", "sc") and addr and private:
+            # [Dev history] и [Fresh scan] под вердиктом премиума, [Scan $X] в Trending
+            uid = (cq.get("from") or {}).get("id", chat_id)
+            found = T.find_address(addr)
+            if found and cmd == "dev":
+                self.extra_command(chat_id, uid, "dev", found[1])
+            elif found:
+                self.request_scan(chat_id, uid, found[1], None, private=True, fresh=cmd == "fresh")
+        elif data == "trending" and private:
+            self.extra_command(chat_id, (cq.get("from") or {}).get("id", chat_id), "trending", "")
         elif data in ("pick", "imp") and private:     # imp — кнопка прежних сообщений (Import from wallet)
             self.import_command(chat_id, (cq.get("from") or {}).get("id", chat_id))
         elif cmd in ("premium", "verify", "unlink", "digest") and private:
@@ -548,6 +564,54 @@ class Bot:
             self.log("import text:\n" + self.tg.redact(traceback.format_exc()))
             return T.UNREACHABLE, None
 
+    # --- Premium: Dev history, Trending (сайт читает memory.db / свой счётчик; бот только просит) ----------
+
+    def extra_command(self, chat_id, user_id, cmd, arg):
+        """/dev <адрес>, [Dev history], /trending, [Trending] — запрос к сайту в отдельном потоке."""
+        def run():
+            html, markup = self.extra_text(user_id, cmd, arg)
+            self.send(chat_id, html, markup)
+        self.spawn(run)
+
+    def extra_text(self, user_id, cmd, arg):
+        """→ (html, кнопки). Функция выключена (или Premium) — подсказка, как у неизвестной команды."""
+        if not self.feature("premium_devcheck" if cmd == "dev" else "premium_trending"):
+            return T.HINT, None
+        try:
+            if cmd == "dev":
+                found = T.find_address(arg) if arg else None
+                if not found:
+                    return T.DEV_USAGE, None
+                r = self.api.premium_dev(user_id, found[1])
+                if r.get("status") == 403:
+                    return T.PREMIUM_ONLY, None
+                return T.dev_view(r), None
+            r = self.api.premium_trending(user_id)
+            if r.get("status") == 403:
+                return T.PREMIUM_ONLY, None
+            return T.trending_view(r)
+        except PremiumOff:
+            self.alerts_seen = self.premium_seen = None
+            return T.HINT, None
+        except Rejected as e:
+            return T.rejected(arg, str(e)), None
+        except ApiError as e:
+            self.log(f"api {cmd}: {e}")
+            return T.UNREACHABLE, None
+        except Exception:
+            self.log(f"{cmd} text:\n" + self.tg.redact(traceback.format_exc()))
+            return T.UNREACHABLE, None
+
+    def memory_text(self, user_id, token):
+        """Блок Memory под вердиктом премиума (PREMIUM_MEMORY_INSIGHTS) — отдельный запрос после вердикта;
+        ничего примечательного, сбой, выключено — None."""
+        try:
+            r = self.api.premium_memory(user_id, token)
+        except (ApiError, Rejected, PremiumOff) as e:
+            self.log(f"api memory: {e}")
+            return None
+        return None if r.get("status") else T.memory_block(r)
+
     def with_import(self, chat_id, view):
         """Watchlist премиум-холдера при PREMIUM_IMPORT — ещё ряд [Pick tokens]; иначе как был."""
         html, markup = view
@@ -557,12 +621,16 @@ class Bot:
 
     # --- сканы ------------------------------------------------------------------------------------
 
-    def request_scan(self, chat_id, user_id, addr, reply_to, private=False):
-        """Лимиты и очередь: сразу ответ crawling/queued, скан — в рабочем потоке."""
+    def request_scan(self, chat_id, user_id, addr, reply_to, private=False, fresh=False):
+        """Лимиты и очередь: сразу ответ crawling/queued, скан — в рабочем потоке. При PREMIUM_BOT_RATE
+        (по последнему /api/config, без запроса в цикле опроса) свой лимит бота 1 скан в USER_COOLDOWN не
+        действует: новые сканы считает сайт по Telegram ID, ответы из кэша лимит не тратят.
+        fresh — [Fresh scan] премиума (мимо кэша результата сайта)."""
         now = self.clock()
+        site_limit = "premium_bot_rate" in self.premium_feats
         with self.lock:
             last = self.last_scan.get(user_id)
-            if last is not None and now - last < self.cooldown:
+            if not site_limit and last is not None and now - last < self.cooldown:
                 left = math.ceil(self.cooldown - (now - last))
                 busy = None
             elif self.jobs.qsize() >= MAX_QUEUE:
@@ -579,7 +647,7 @@ class Bot:
         mid = self.send(chat_id, T.queued(addr) if waiting else T.crawling(addr), reply_to=reply_to)
         if mid is None:
             return
-        self.jobs.put((chat_id, mid, addr, waiting, private, user_id))
+        self.jobs.put((chat_id, mid, addr, waiting, private, user_id) + ((True,) if fresh else ()))
 
     def worker(self):
         while True:
@@ -595,21 +663,35 @@ class Bot:
                     self.busy -= 1
                 self.jobs.task_done()
 
-    def run_scan(self, chat_id, mid, addr, was_queued, private=False, user_id=None):
+    def run_scan(self, chat_id, mid, addr, was_queued, private=False, user_id=None, fresh=False):
         if was_queued:
             self.edit(chat_id, mid, T.crawling(addr))
-        html, markup = self.scan_text(addr, watch=private, user_id=user_id)
-        if markup is not None and self.is_premium(user_id):     # вердикт (не ошибка) премиум-пользователю
+        html, markup, token = self._scan(addr, watch=private, user_id=user_id, fresh=fresh)
+        premium_user = markup is not None and self.is_premium(user_id)   # вердикт (не ошибка) премиум-пользователю
+        if premium_user:
             html += "\n\n" + T.PREMIUM_BADGE
+            row = T.premium_row(token, dev=private and self.feature("premium_devcheck"),
+                                fresh=private and self.feature("premium_fresh"))
+            if row:
+                markup = {"inline_keyboard": markup["inline_keyboard"] + [row]}
         self.edit(chat_id, mid, html, markup)
+        if premium_user and private and self.feature("premium_memory"):   # после вердикта, отдельным запросом
+            block = self.memory_text(user_id, token)
+            if block:
+                self.edit(chat_id, mid, html + "\n\n" + block, markup)
 
     def scan_text(self, addr, watch=False, user_id=None):
         """Скан через API сайта → (html, кнопки). watch — личка: кнопка [Watch], если алерты включены
-        и токен не too established. user_id — при PREMIUM_PRIORITY уходит на сайт (премиум проверяет сайт)."""
+        и токен не too established. user_id — при PREMIUM_PRIORITY / PREMIUM_BOT_RATE / PREMIUM_FRESH уходит
+        на сайт (премиум и лимиты проверяет сайт)."""
+        return self._scan(addr, watch, user_id)[:2]
+
+    def _scan(self, addr, watch=False, user_id=None, fresh=False):
+        """→ (html, кнопки, адрес токена)."""
         deadline = self.clock() + self.scan_timeout
         try:
-            if user_id is not None and self.feature("premium_priority"):
-                job = self.api.scan(addr, user_id=user_id)
+            if user_id is not None and any(self.feature(f) for f in SCAN_USER_FEATURES):
+                job = self.api.scan(addr, user_id=user_id, **({"fresh": True} if fresh else {}))
             else:
                 job = self.api.scan(addr)
             while True:
@@ -617,19 +699,22 @@ class Bot:
                 if r.get("done"):
                     break
                 if self.clock() >= deadline:
-                    return T.TIMEOUT, None
+                    return T.TIMEOUT, None, addr
                 self.sleep(self.poll_every)
         except Rejected as e:
-            return T.rejected(addr, str(e)), None
+            return T.rejected(addr, str(e)), None, addr
+        except TooFast as e:                    # лимит сканов на пользователя / Fresh scan (текст сайта)
+            self.log(f"api {addr}: user limit")
+            return T.too_fast(str(e)), None, addr
         except Busy:
             self.log(f"api {addr}: site busy")
-            return T.SITE_BUSY, None
+            return T.SITE_BUSY, None, addr
         except ApiError as e:
             self.log(f"api {addr}: {e}")
-            return T.UNREACHABLE, None
+            return T.UNREACHABLE, None, addr
         if r.get("error") or not isinstance(r.get("result"), dict):
             self.log(f"scan {addr}: {r.get('error')}")
-            return T.scan_error(addr, r.get("error")), None
+            return T.scan_error(addr, r.get("error")), None, addr
         res = r["result"]
         token = res.get("token") or addr
         ticker = (res.get("header") or {}).get("ticker")
@@ -639,7 +724,7 @@ class Bot:
             self.tickers[token] = ticker
         chain = res.get("chain") or T.chain_of(token)
         watch = watch and res.get("band") not in (T.TOO_ESTABLISHED, T.TOO_ACTIVE) and self.alerts_on()
-        return T.verdict(res), T.report_button(token, trade.url(chain, token, self.trade_urls), watch)
+        return T.verdict(res), T.report_button(token, trade.url(chain, token, self.trade_urls), watch), token
 
     # --- цикл опроса ------------------------------------------------------------------------------
 
@@ -669,6 +754,8 @@ class Bot:
         self.call("setMyCommands", commands=COMMANDS + (WATCH_COMMANDS if self.alerts_on() else [])
                   + (PREMIUM_COMMANDS if self.premium_on() else [])
                   + ([PICK_COMMAND] if self.feature("premium_import") else [])
+                  + ([DEV_COMMAND] if self.feature("premium_devcheck") else [])
+                  + ([TRENDING_COMMAND] if self.feature("premium_trending") else [])
                   + ([DIGEST_COMMAND] if self.feature("premium_digest") else []))
         self.start_workers()
         self.log(f"@{self.username} polling, site {self.api.base}")

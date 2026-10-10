@@ -50,6 +50,52 @@ def digest_enabled():
     return _flag("PREMIUM_DIGEST")
 
 
+def devcheck_enabled():
+    """PREMIUM_DEVCHECK: /dev и [Dev history] — другие токены дева из памяти операторов (premium_memory.py)."""
+    return _flag("PREMIUM_DEVCHECK")
+
+
+def memory_enabled():
+    """PREMIUM_MEMORY_INSIGHTS: блок Memory под вердиктом — холдеры из других токенов, снайпер-боты, кластеры."""
+    return _flag("PREMIUM_MEMORY_INSIGHTS")
+
+
+def trending_enabled():
+    """PREMIUM_TRENDING: /trending — самые сканируемые токены за час (premium_trending.py)."""
+    return _flag("PREMIUM_TRENDING")
+
+
+def fresh_enabled():
+    """PREMIUM_FRESH: [Fresh scan] — скан мимо 10-минутного кэша результата."""
+    return _flag("PREMIUM_FRESH")
+
+
+def bot_rate_enabled():
+    """PREMIUM_BOT_RATE: лимит новых сканов из бота на Telegram ID (BOT_SCAN_RATE_PER_MIN / ..._PREMIUM_PER_MIN)."""
+    return _flag("PREMIUM_BOT_RATE")
+
+
+def _env_pos(name, default):
+    try:
+        v = int(os.environ.get(name, "").strip())
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+BOT_RATE = 3                 # новых сканов в минуту на Telegram ID (env BOT_SCAN_RATE_PER_MIN)
+BOT_RATE_PREMIUM = 15        # ... у премиума (env BOT_SCAN_RATE_PREMIUM_PER_MIN)
+FRESH_SAME_TOKEN_S = 120     # Fresh scan одного токена — не чаще раза в 2 минуты на пользователя
+FRESH_PER_HOUR = 20          # Fresh scan — не больше 20 в час на пользователя
+
+
+def bot_rate(premium_user):
+    """Лимит новых сканов в минуту для пользователя бота."""
+    if premium_user:
+        return _env_pos("BOT_SCAN_RATE_PREMIUM_PER_MIN", BOT_RATE_PREMIUM)
+    return _env_pos("BOT_SCAN_RATE_PER_MIN", BOT_RATE)
+
+
 DIGEST_HOUR = 8              # по умолчанию PREMIUM_DIGEST_HOUR_UTC
 
 
@@ -66,7 +112,9 @@ def features():
     """Включённые функции премиума для /api/config и /api/premium/status: {"premium_priority": True, ...};
     выключенных полей нет (ответ при выключенных — прежний)."""
     return {k: True for k, on in (("premium_priority", priority_enabled()), ("premium_import", import_enabled()),
-                                  ("premium_digest", digest_enabled())) if on}
+                                  ("premium_digest", digest_enabled()), ("premium_devcheck", devcheck_enabled()),
+                                  ("premium_memory", memory_enabled()), ("premium_trending", trending_enabled()),
+                                  ("premium_fresh", fresh_enabled()), ("premium_bot_rate", bot_rate_enabled())) if on}
 
 
 def min_tokens():
@@ -171,6 +219,34 @@ class Attempts:
             if len(self.seen) > 10000:
                 self.seen = {k: v for k, v in self.seen.items() if v and now - v[-1] < self.window}
             return True
+
+
+class FreshLimits:
+    """Fresh scan: один токен — не чаще раза в FRESH_SAME_TOKEN_S, всего — не больше FRESH_PER_HOUR в час на
+    пользователя (в памяти процесса)."""
+
+    def __init__(self, same=FRESH_SAME_TOKEN_S, per_hour=FRESH_PER_HOUR):
+        self.same, self.per_hour, self.lock = same, per_hour, threading.Lock()
+        self.by_user, self.by_token = {}, {}
+
+    def wait(self, user_id, token, now):
+        """Секунд до следующего Fresh scan (0 — можно сейчас) и почему: (секунд, "token" | "hour" | None)."""
+        with self.lock:
+            last = self.by_token.get((user_id, token))
+            if last is not None and now - last < self.same:
+                return max(1, int(self.same - (now - last))), "token"
+            q = [t for t in self.by_user.get(user_id, ()) if now - t < 3600]
+            self.by_user[user_id] = q
+            if len(q) >= self.per_hour:
+                return max(1, int(3600 - (now - q[0]))), "hour"
+            return 0, None
+
+    def take(self, user_id, token, now):
+        with self.lock:
+            self.by_token[(user_id, token)] = now
+            self.by_user.setdefault(user_id, []).append(now)
+            if len(self.by_token) > 20_000:
+                self.by_token = {k: t for k, t in self.by_token.items() if now - t < self.same}
 
 
 # ---------- тексты сообщений, которые шлёт сайт (HTML) ----------

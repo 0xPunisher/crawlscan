@@ -15,6 +15,11 @@ class Busy(ApiError):
     """Сайт перегружен (503 busy) или лимит частоты (429): новый скан не принят, повторить позже."""
 
 
+class TooFast(Busy):
+    """Лимит новых сканов на пользователя бота (429 user_rate_limited) или Fresh scan (429 fresh_limited):
+    args[0] — текст сайта для пользователя."""
+
+
 class Rejected(Exception):
     """Сайт отклонил адрес (400): текст для пользователя — "not a token address" и т.п."""
 
@@ -50,6 +55,8 @@ class CrawlScan:
                 payload, err = None, None
             if e.code == 400 and err:
                 raise Rejected(err) from None
+            if e.code == 429 and err in ("user_rate_limited", "fresh_limited"):
+                raise TooFast(payload.get("message") or err) from None
             if (e.code == 503 and err == "busy") or e.code == 429:
                 raise Busy(payload.get("message") or err) from None
             if e.code in ok and isinstance(payload, dict):
@@ -62,12 +69,14 @@ class CrawlScan:
         except (OSError, ValueError) as e:
             raise ApiError(f"{path}: {e}") from None
 
-    def scan(self, token, user_id=None):
+    def scan(self, token, user_id=None, fresh=False):
         """Запустить скан (или получить кэш сайта) → job id. С секретом алертов сайт не ограничивает частоту сканов
         бота (лимит новых сканов по IP — для остальных). user_id (Telegram ID, только с секретом) — сайт сам
-        проверяет премиум и при PREMIUM_PRIORITY ставит скан первым в очередь ожидания."""
+        проверяет премиум и при PREMIUM_PRIORITY ставит скан первым в очередь ожидания, считает лимит новых сканов
+        на пользователя (PREMIUM_BOT_RATE). fresh — Fresh scan премиума (мимо кэша результата сайта)."""
         headers = {"X-Alerts-Secret": self.alerts_secret} if self.alerts_secret else None
-        body = {"token": token} | ({"user_id": user_id} if user_id is not None and self.alerts_secret else {})
+        body = ({"token": token} | ({"user_id": user_id} if user_id is not None and self.alerts_secret else {})
+                | ({"fresh": True} if fresh else {}))
         job = self._req("/api/scan", body, headers=headers).get("job")
         if not job:
             raise ApiError("no job in /api/scan response")
@@ -132,3 +141,18 @@ class CrawlScan:
     def premium_digest(self, user_id, on=None):
         """/digest: {"digest": bool, "hour", "premium"}; on=None — только узнать."""
         return self._premium("/api/premium/digest", {"user_id": user_id} | ({} if on is None else {"on": on}))
+
+    def _extra(self, path, body):
+        return self._req(path, body, headers={"X-Alerts-Secret": self.alerts_secret}, ok=(403,))
+
+    def premium_dev(self, user_id, token):
+        """История дева: {"known", "dev", "total", "in_replay", "tokens"} | {"status": 403}."""
+        return self._extra("/api/premium/dev", {"user_id": user_id, "token": token})
+
+    def premium_memory(self, user_id, token):
+        """Блок Memory: {"notable", "holders", "repeat", "snipers", "clusters"} | {"status": 403}."""
+        return self._extra("/api/premium/memory", {"user_id": user_id, "token": token})
+
+    def premium_trending(self, user_id):
+        """Trending: {"items": [{"token", "chain", "scans", "band", "score", "ticker"}]} | {"status": 403}."""
+        return self._extra("/api/premium/trending", {"user_id": user_id})
