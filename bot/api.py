@@ -2,7 +2,7 @@
 GET /api/rewards/status → награды и сжигания (/rewards), GET /api/config → включены ли алерты,
 /api/alerts/* → подписки, /api/premium/* → Premium (заголовок X-Alerts-Secret).
 Бот сам в блокчейн не ходит. Кэш (10 минут) и очередь сканов — на стороне сайта."""
-import json, urllib.error, urllib.parse, urllib.request
+import json, time, urllib.error, urllib.parse, urllib.request
 
 DEFAULT = "https://crawlscan.fun"
 
@@ -37,21 +37,38 @@ class PremiumOff(Exception):
 
 
 class CrawlScan:
-    def __init__(self, base=DEFAULT, timeout=15, alerts_secret=""):
+    def __init__(self, base=DEFAULT, timeout=15, alerts_secret="", clock=time.monotonic):
         self.base = base.rstrip("/")
         self.timeout = timeout
         self.alerts_secret = alerts_secret   # ALERTS_API_SECRET: только в заголовке, нигде не логируется
+        self.clock = clock
+        self.on_request = None               # (метод, путь без query, HTTP-код | "error", секунд) — лог времени (бот)
 
     def _req(self, path, body=None, headers=None, ok=()):
-        """JSON-ответ сайта. ok — коды ошибок, тело которых вернуть как ответ (409, 422 у подписок)."""
+        """JSON-ответ сайта. ok — коды ошибок, тело которых вернуть как ответ (409, 422 у подписок).
+        Время каждого запроса — в on_request (если задан)."""
+        method = "POST" if body is not None else "GET"
+        info, t0 = {"code": "error"}, self.clock()
+        try:
+            return self._send(path, body, headers, ok, info)
+        finally:
+            if self.on_request:
+                try:
+                    self.on_request(method, path.split("?", 1)[0], info["code"], self.clock() - t0)
+                except Exception:
+                    pass
+
+    def _send(self, path, body, headers, ok, info):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method="POST" if data is not None else "GET",
                                      headers={"content-type": "application/json", "user-agent": "crawlscan-bot"}
                                      | (headers or {}))
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                info["code"] = r.status
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            info["code"] = e.code
             try:
                 payload = json.loads(e.read())
                 err = payload.get("error")

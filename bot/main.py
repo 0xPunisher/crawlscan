@@ -37,6 +37,8 @@ SCAN_TIMEOUT = 60      # секунд на скан (от начала, без �
 BANNER = os.path.join(ROOT, "bot", "assets", "banner.png")   # картинка /start
 POLL_EVERY = 1.5       # секунд между запросами /api/result
 LONG_POLL = 30         # getUpdates timeout
+SLOW_S = 3.0           # секунд: строки времени с пометкой SLOW (апдейт до ответа, запрос к сайту, вызов Telegram)
+REPLY_METHODS = ("sendMessage", "editMessageText", "sendPhoto")   # первый из них по апдейту — «ответ»
 COMMANDS = [{"command": "start", "description": "What this bot does"},
             {"command": "scan", "description": "Scan a token: /scan <address>"},
             {"command": "help", "description": "How to read a verdict"},
@@ -94,7 +96,10 @@ class Bot:
         self.banner_id = None        # file_id баннера после первой загрузки: дальше шлём без файла
         # запросы к сайту вне цикла опроса (/rewards): по умолчанию — свой поток
         self.trade_urls = trade_urls or trade.templates()   # {сеть: шаблон} для [Trade on Axiom]
-        self.spawn = spawn or (lambda f: threading.Thread(target=f, daemon=True).start())
+        self._spawn = spawn or (lambda f: threading.Thread(target=f, daemon=True).start())
+        self._ctx = threading.local()  # .cur — апдейт, который сейчас обрабатывается (время до ответа)
+        if hasattr(api, "on_request"):  # время каждого запроса к сайту — в лог (CrawlScan; подставные API — нет)
+            api.on_request = self.api_timing
         self.alerts_seen = None      # (clock(), включены ли алерты на сайте)
         self.flap_seen = None        # (clock(), (Flap, Bankr) включены на сайте: строка о площадках в /help)
         self.awaiting = {}           # chat_id -> clock() до которого ждём адрес для подписки ([➕ New])
@@ -107,9 +112,51 @@ class Bot:
 
     # --- Telegram ---------------------------------------------------------------------------------
 
+    # --- время: апдейт → ответ, запросы к сайту, медленные вызовы Telegram -----------------------------
+
+    def spawn(self, f):
+        """Запустить f отдельно (поток; в тестах — сразу), с тем же апдейтом для замера «до ответа»."""
+        cur = getattr(self._ctx, "cur", None)
+
+        def run():
+            self._ctx.cur = cur
+            try:
+                f()
+            finally:
+                self._ctx.cur = None
+        return self._spawn(run)
+
+    @staticmethod
+    def update_kind(u):
+        """Что за апдейт — для строки времени, без текста пользователя: /команда, address, text, callback:<кнопка>."""
+        if "callback_query" in u:
+            return "callback:" + ((u["callback_query"].get("data") or "").split(":", 1)[0] or "-")
+        txt = ((u.get("message") or {}).get("text") or "").strip()
+        if txt.startswith("/"):
+            return txt.split()[0].split("@")[0][:32]
+        return "address" if T.find_address(txt) else "text"
+
+    def replied(self):
+        """Первый ответ по текущему апдейту: строка «update N kind reply X.XXs» (SLOW, если ≥ SLOW_S)."""
+        cur = getattr(self._ctx, "cur", None)
+        if not cur or cur["done"]:
+            return
+        cur["done"] = True
+        dt = self.clock() - cur["t0"]
+        self.log(f"{'SLOW ' if dt >= SLOW_S else ''}update {cur['id']} {cur['kind']} reply {dt:.2f}s")
+
+    def api_timing(self, method, path, code, dt):
+        """Запрос бота к сайту: «api METHOD /path код X.XXs». Опрос /api/result во время скана — одной строкой на
+        скан (scan … done), отдельно — только медленный."""
+        if path == "/api/result" and dt < SLOW_S:
+            return
+        self.log(f"{'SLOW ' if dt >= SLOW_S else ''}api {method} {path} {code} {dt:.2f}s")
+
     def call(self, method, upload=None, **params):
         """Вызов Bot API; ошибка логируется, бот живёт. → result или None.
-        upload=(поле, путь) — с файлом (multipart)."""
+        upload=(поле, путь) — с файлом (multipart). Вызов дольше SLOW_S — строка SLOW telegram; первый ответ по
+        апдейту — строка времени апдейта."""
+        t0 = self.clock()
         try:
             if upload:
                 return self.tg.upload(method, *upload, **params)
@@ -119,6 +166,12 @@ class Bot:
                 self.log(f"telegram {method}: {e}")
         except Exception as e:
             self.log(f"telegram {method}: {type(e).__name__}: {self.tg.redact(e)}")
+        finally:
+            dt = self.clock() - t0
+            if dt >= SLOW_S:
+                self.log(f"SLOW telegram {method} {dt:.2f}s")
+            if method in REPLY_METHODS:
+                self.replied()
         return None
 
     def send(self, chat_id, html, markup=None, reply_to=None):
@@ -154,11 +207,17 @@ class Bot:
 
     # --- обновления -------------------------------------------------------------------------------
 
-    def handle_update(self, u):
-        if "message" in u:
-            self.handle_message(u["message"])
-        elif "callback_query" in u:
-            self.handle_callback(u["callback_query"])
+    def handle_update(self, u, received=None):
+        """received — clock() получения пачки getUpdates (по умолчанию — сейчас): от него считается время до ответа."""
+        self._ctx.cur = {"id": u.get("update_id"), "kind": self.update_kind(u), "done": False,
+                         "t0": self.clock() if received is None else received}
+        try:
+            if "message" in u:
+                self.handle_message(u["message"])
+            elif "callback_query" in u:
+                self.handle_callback(u["callback_query"])
+        finally:
+            self._ctx.cur = None
 
     def handle_message(self, m):
         chat, user = m.get("chat") or {}, m.get("from") or {}
@@ -695,11 +754,15 @@ class Bot:
                 job = self.api.scan(addr, user_id=user_id, **({"fresh": True} if fresh else {}))
             else:
                 job = self.api.scan(addr)
+            t0, polls = self.clock(), 0
             while True:
                 r = self.api.result(job)
+                polls += 1
                 if r.get("done"):
+                    self.log(f"scan {addr} done in {self.clock() - t0:.1f}s, {polls} polls")
                     break
                 if self.clock() >= deadline:
+                    self.log(f"scan {addr} timed out after {polls} polls")
                     return T.TIMEOUT, None, addr
                 self.sleep(self.poll_every)
         except Rejected as e:
@@ -737,10 +800,11 @@ class Bot:
         """Один getUpdates → новый offset. Ошибки обработки одного апдейта не мешают остальным."""
         updates = self.tg.call("getUpdates", http_timeout=LONG_POLL + 10, offset=offset, timeout=LONG_POLL,
                                allowed_updates=["message", "callback_query"]) or []
+        received = self.clock()
         for u in updates:
             offset = max(offset or 0, u.get("update_id", 0) + 1)
             try:
-                self.handle_update(u)
+                self.handle_update(u, received)
             except Exception:
                 self.log("update failed:\n" + self.tg.redact(traceback.format_exc()))
         return offset
