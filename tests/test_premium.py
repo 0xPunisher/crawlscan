@@ -717,10 +717,10 @@ class TestBot(unittest.TestCase):
         text, _ = bot.premium_text(U1, U1, "premium", "", now=NOW)
         self.assertIn("⭐ <b>Premium features for $CrawlScan holders</b>", text)
         self.assertIn(f"Wallet: <code>{W1}</code>\nBalance: 1,234,567 $CrawlScan\nPremium: ✅ active", text)
-        self.assertIn("Next balance check: " + T._hm(NOW + 3600) + " (in 1h 0m)", text)
+        self.assertNotIn("check", text.lower())                                             # когда проверяется баланс — нет
         text, _ = bot.premium_text(U2, U2, "premium", "", now=NOW)
-        self.assertIn("Hold 500,000+ $CrawlScan in a linked wallet to unlock everything below.", text)
-        self.assertIn("Your status: no wallet linked.", text)
+        self.assertIn("Hold 500,000 $CrawlScan in a linked wallet to unlock:", text)
+        self.assertIn("Wallet: not linked", text)
         text, _ = bot.premium_text(U1, U1, "unlink", "")
         self.assertIn(f"🔓 Wallet <code>{W1}</code> unlinked, Premium is off.", text)
 

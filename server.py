@@ -286,7 +286,8 @@ def start_scan(token, client=None, prio=False):
     """job_id: свежий кэш по токену или уже идущий скан того же токена, иначе новый.
     Новый — только если в очереди есть место и память ниже порога, иначе Busy; и если client (ключ, лимит в минуту)
     не исчерпал лимит новых сканов, иначе RateLimited. Кэш и подключение к идущему скану лимит не тратят.
-    prio — скан премиум-холдера (scan_priority): при PREMIUM_PRIORITY первым берёт освободившийся слот."""
+    prio — скан премиум-холдера (scan_priority: баланс $CrawlScan, 0 — обычный): при PREMIUM_PRIORITY первым берёт
+    освободившийся слот, среди премиумов — больший баланс раньше."""
     chain, token = engine.chain_of(token)
     now = time.time()
     with _lock:
@@ -317,7 +318,7 @@ def start_scan(token, client=None, prio=False):
                      "ts": now}
         BY_TOKEN[token] = jid
     try:
-        threading.Thread(target=_run, args=(jid, token) + ((True,) if prio else ()), daemon=True).start()
+        threading.Thread(target=_run, args=(jid, token) + ((prio,) if prio else ()), daemon=True).start()
     except RuntimeError:   # can't start new thread: как полная очередь
         with _lock:
             _ACTIVE[0] -= 1
@@ -329,20 +330,21 @@ def start_scan(token, client=None, prio=False):
 
 
 def scan_priority(headers, body):
-    """Скан премиум-холдера (только PREMIUM_PRIORITY): запрос от нашего бота (верный X-Alerts-Secret) с user_id,
-    у которого премиум активен (premium.db). Выключено, сайт, нет секрета или сбой базы — обычный скан."""
+    """Приоритет скана (только PREMIUM_PRIORITY): запрос от нашего бота (верный X-Alerts-Secret) с user_id, у которого
+    премиум активен (premium.db) → баланс $CrawlScan привязанного кошелька из уже сохранённой привязки (сырой, > 0;
+    в очереди больший — раньше), без новых запросов. Иначе 0 — обычный скан (выключено, сайт, нет секрета, сбой базы)."""
     if not premium.priority_enabled() or not isinstance(body, dict) or body.get("user_id") is None:
-        return False
+        return 0
     if not alerts_secret_ok(headers.get("X-Alerts-Secret")):
-        return False
+        return 0
     try:
         link = premium_store().link_of(_chat_id(body["user_id"]))
     except (ValueError, TypeError):
-        return False
+        return 0
     except Exception as e:
         print(f"premium: priority not read: {type(e).__name__}: {e}", flush=True)
-        return False
-    return bool(link and link["premium"])
+        return 0
+    return max(1, int(link["balance"])) if link and link["premium"] else 0
 
 
 def scan_flags(token):
@@ -802,7 +804,7 @@ def premium_import_api(path, user_id, body, now):
         result = None
         try:
             result = premium_import.lookup(robinhood, link["wallet"], lambda toks: market.ds_batch(toks, "robinhood"),
-                                           import_established, bankr.recently_active, skip=[premium.token()])
+                                           import_established, bankr.recently_active)
         except Exception as e:
             print(f"premium: import {premium.short(link['wallet'])} failed: {type(e).__name__}: {e}", flush=True)
             return 502, {"error": "wallet not read"}

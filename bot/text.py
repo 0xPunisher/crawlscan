@@ -547,25 +547,25 @@ PREMIUM_START_BUTTON = {"text": "⭐ Premium features", "callback_data": "premiu
 
 
 def premium_lines(st):
-    """Список функций Premium: команда — пояснение. Pick tokens, digest и Priority — только если включены на сайте."""
-    lines = ["/verify — link your wallet: buy any amount of $CrawlScan within 15 minutes"]
+    """Что даёт Premium и команды. Строки функций, выключенных на сайте (Priority, /picktokens, /digest), не
+    показываются."""
+    perks = (["Priority scanning — your scans are always first in line"] if st.get("premium_priority") else []) + [
+        "Bigger Watchlist — up to 10 tokens with no time limit"]
+    cmds = ["/verify — link your wallet: buy any amount of $CrawlScan within 15 minutes"]
     if st.get("premium_import"):
-        lines.append("/picktokens — choose tokens from your linked wallet to watch (we only read public balances, "
-                     "no keys or wallet connection)")
-    lines.append("<b>Watchlist</b> — up to 10 tokens with no time limit (3 without Premium)")
+        cmds.append("/picktokens — choose tokens from your linked wallet to watch (we only read public balances, "
+                    "no keys or wallet connection)")
     if st.get("premium_digest"):
-        lines.append("/digest — a daily morning summary of your Watchlist (on/off)")
-    if st.get("premium_priority"):
-        lines.append("<b>Priority</b> — your scans skip the queue when the scanner is busy")
-    lines.append("/unlink — unlink your wallet")
-    return lines
+        cmds.append("/digest — a daily morning summary of your Watchlist (on/off)")
+    cmds.append("/unlink — unlink your wallet")
+    return perks + ["", "Commands:"] + cmds
 
 
 def premium_status_lines(st, now):
-    """Статус пользователя: не привязан (и идущая верификация) / кошелёк, баланс, премиум, следующая проверка."""
+    """Статус: Wallet, Balance, Premium. Когда и как часто проверяется баланс — не показываем."""
     res = st.get("reservation")
     if not st.get("linked"):
-        out = ["Your status: no wallet linked."]
+        out = ["Wallet: not linked", "Premium: ❌ not active"]
         if res:
             out.append(f"Verifying <code>{e(res['wallet'])}</code> until {_hm(res['expires_at'])}: "
                        "buy any amount of $CrawlScan to it.")
@@ -577,11 +577,8 @@ def premium_status_lines(st, now):
         prem = f"⏸ paused: your watchlist stays as it is until {_day(grace)}"
     else:
         prem = "❌ not active"
-    out = [f"Wallet: <code>{e(st['wallet'])}</code>", f"Balance: {st.get('balance_tokens', 0):,} $CrawlScan",
-           f"Premium: {prem}"]
-    if st.get("next_check_at"):
-        out.append(f"Next balance check: {_hm(st['next_check_at'])} ({until(st['next_check_at'], now)})")
-    return out
+    return [f"Wallet: <code>{e(st['wallet'])}</code>", f"Balance: {st.get('balance_tokens', 0):,} $CrawlScan",
+            f"Premium: {prem}"]
 
 
 def premium_buttons(st, buy_url=None):
@@ -606,7 +603,7 @@ def premium_view(st, now, buy_url=None):
     need = f"{st.get('min_tokens', 0):,}"
     text = "\n".join([
         "⭐ <b>Premium features for $CrawlScan holders</b>", "",
-        f"Hold {need}+ $CrawlScan in a linked wallet to unlock everything below.", "",
+        f"Hold {need} $CrawlScan in a linked wallet to unlock:",
         *premium_lines(st), "", *premium_status_lines(st, now)])
     return text, premium_buttons(st, buy_url)
 

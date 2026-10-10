@@ -4,6 +4,7 @@
 import unittest
 
 import fakes  # noqa: F401  (фиктивный CRAWLER_RPC до импорта бота и сервера)
+import premium
 import trade
 from bot import main as bm, text as T
 from test_premium import NOW, U1, U2, W1, TGStub, private
@@ -12,15 +13,17 @@ from test_premium_extras import FeatAPI, callback
 U3 = 333333
 ALL = ("premium_priority", "premium_import", "premium_digest")
 CRAWL_TRADE = trade.url("robinhood", T.OFFICIAL_CA.lower(), trade.templates())
-FEATURES = ("/verify — link your wallet: buy any amount of $CrawlScan within 15 minutes\n"
+FEATURES = ("Priority scanning — your scans are always first in line\n"
+            "Bigger Watchlist — up to 10 tokens with no time limit\n"
+            "\n"
+            "Commands:\n"
+            "/verify — link your wallet: buy any amount of $CrawlScan within 15 minutes\n"
             "/picktokens — choose tokens from your linked wallet to watch (we only read public balances, "
             "no keys or wallet connection)\n"
-            "<b>Watchlist</b> — up to 10 tokens with no time limit (3 without Premium)\n"
             "/digest — a daily morning summary of your Watchlist (on/off)\n"
-            "<b>Priority</b> — your scans skip the queue when the scanner is busy\n"
             "/unlink — unlink your wallet")
 HEAD = ("⭐ <b>Premium features for $CrawlScan holders</b>\n\n"
-        "Hold 500,000+ $CrawlScan in a linked wallet to unlock everything below.\n\n")
+        "Hold 500,000 $CrawlScan in a linked wallet to unlock:\n")
 
 
 class MenuAPI(FeatAPI):
@@ -99,7 +102,7 @@ class TestPremiumMenu(unittest.TestCase):
     def test_not_linked(self):
         bot, tg, api = self.make()
         text, markup = self.view(bot, 999)
-        self.assertEqual(text, HEAD + FEATURES + "\n\nYour status: no wallet linked.")
+        self.assertEqual(text, HEAD + FEATURES + "\n\nWallet: not linked\nPremium: ❌ not active")
         self.assertEqual(markup, {"inline_keyboard": [[{"text": "Verify wallet", "callback_data": "verify"}]]})
         bot.handle_update(callback("verify", user=999))
         self.assertEqual(tg.texts[-1], T.ASK_WALLET)
@@ -110,7 +113,7 @@ class TestPremiumMenu(unittest.TestCase):
         bot, tg, api = self.make()
         text, markup = self.view(bot, U2)
         self.assertEqual(text, HEAD + FEATURES + f"\n\nWallet: <code>{W1}</code>\nBalance: 120,000 $CrawlScan\n"
-                         "Premium: ❌ not active\nNext balance check: " + T._hm(NOW + 7200) + " (in 2h 0m)")
+                         "Premium: ❌ not active")
         self.assertEqual(markup, {"inline_keyboard": [[{"text": "Buy $CrawlScan", "url": CRAWL_TRADE},
                                                        {"text": "Unlink", "callback_data": "unlink"}]]})
         self.assertIn("axiom.trade", CRAWL_TRADE)
@@ -126,7 +129,7 @@ class TestPremiumMenu(unittest.TestCase):
         bot, tg, api = self.make()
         text, markup = self.view(bot, U1)
         self.assertEqual(text, HEAD + FEATURES + f"\n\nWallet: <code>{W1}</code>\nBalance: 1,234,567 $CrawlScan\n"
-                         "Premium: ✅ active\nNext balance check: " + T._hm(NOW + 3600) + " (in 1h 0m)")
+                         "Premium: ✅ active")
         self.assertEqual(markup, {"inline_keyboard": [
             [{"text": "Pick tokens", "callback_data": "pick"}, {"text": "Daily digest: on", "callback_data": "digest:off"}],
             [{"text": "Unlink", "callback_data": "unlink"}]]})
@@ -135,12 +138,26 @@ class TestPremiumMenu(unittest.TestCase):
 
     def test_minimum_from_site(self):
         st = {"linked": False, "min_tokens": 1_000_000}
-        self.assertIn("Hold 1,000,000+ $CrawlScan in a linked wallet", T.premium_view(st, NOW)[0])
+        self.assertIn("Hold 1,000,000 $CrawlScan in a linked wallet to unlock:", T.premium_view(st, NOW)[0])
+
+    def test_balance_check_timing_never_shown(self):
+        """Ни в меню, ни в сообщениях сайта: когда и как часто проверяется баланс."""
+        bot, tg, api = self.make()
+        for user in (U1, U2, U3, 999):
+            text = self.view(bot, user)[0]
+            for word in ("check", "daily", "once a day", "Next balance"):
+                self.assertNotIn(word.lower(), text.lower().replace("a daily morning summary", ""))
+        msgs = [premium.verified_message(W1, 600_000 * 10 ** 18, 18, 500_000),
+                premium.verified_message(W1, 1, 18, 500_000), premium.paused_message(W1, 1, 18, 500_000),
+                premium.on_message(W1, 600_000 * 10 ** 18, 18)]
+        for m in msgs:
+            for word in ("check", "daily", "once a day"):
+                self.assertNotIn(word, m.lower())
 
     def test_features_off_are_not_listed(self):
         bot, tg, api = self.make(feats=())
         text, markup = self.view(bot, U1)
-        for line in ("/picktokens", "/digest", "Priority"):
+        for line in ("/picktokens", "/digest", "Priority scanning"):
             self.assertNotIn(line, text)
         self.assertIn("/verify — link your wallet", text)
         self.assertIn("/unlink — unlink your wallet", text)

@@ -12,7 +12,7 @@
      когда нашли TOP поддерживаемых или проверили CHECK_MAX;
   4. TOO ESTABLISHED (последний снимок, кэш вердикта или данные DexScreener — detect.too_established) и TOO ACTIVE
      (bankr.recently_active, память) — в списке с пометкой, без кнопки.
-Ни одного скана. Сам токен $CrawlScan в список не идёт (он и даёт Premium).
+Ни одного скана. $CrawlScan — обычный токен Pons: показывается, как остальные.
 """
 import threading
 

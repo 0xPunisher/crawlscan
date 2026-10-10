@@ -199,12 +199,11 @@ def removed_lines(tokens):
 def verified_message(wallet, balance, decimals, threshold, old_wallet=None):
     if balance >= threshold * 10 ** decimals:
         text = (f"✅ Wallet verified: {_code(wallet)}\n\n⭐ <b>Premium is on.</b> This wallet holds "
-                f"{amount(balance, decimals)} $CrawlScan (minimum {threshold:,}).\n\n{PERKS}\n\n"
-                "I check the balance once a day.")
+                f"{amount(balance, decimals)} $CrawlScan (minimum {threshold:,}).\n\n{PERKS}")
     else:
         text = (f"✅ Wallet verified: {_code(wallet)}\n\nPremium needs at least {threshold:,} $CrawlScan in this "
-                f"wallet; it holds {amount(balance, decimals)} now. I check the balance once a day, and Premium "
-                "turns on when it's enough.")
+                f"wallet; it holds {amount(balance, decimals)} now. Premium turns on when the wallet holds "
+                "enough.")
     if old_wallet and old_wallet != wallet:
         text += f"\n\nYour previous wallet {_code(old_wallet)} is no longer linked."
     return text
@@ -219,7 +218,7 @@ def paused_message(wallet, balance, decimals, threshold):
     return (f"⭐ Premium is paused: {_code(wallet)} holds {amount(balance, decimals)} $CrawlScan, "
             f"below {threshold:,}.\n\nYour watchlist stays as it is for {GRACE_DAYS} days. If the balance is still "
             f"below by then, it goes back to {alerts.WATCH_LIMIT} tokens, {alerts.WATCH_DAYS} days each. "
-            "Top up the wallet and Premium comes back at the next daily check.")
+            "Top up the wallet and Premium comes back.")
 
 
 def on_message(wallet, balance, decimals):

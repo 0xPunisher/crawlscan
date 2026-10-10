@@ -65,6 +65,12 @@ class TestFairGate(unittest.TestCase):
         self.assertEqual(self.run_queue([("p1", True), ("p2", True), ("p3", True), ("p4", True)]),
                          ["p1", "p2", "p3", "p4"])
 
+    def test_premium_by_balance(self):
+        """Среди премиумов первым — больший баланс $CrawlScan (равный — кто раньше), справедливость остаётся."""
+        order = self.run_queue([("n1", False), ("p100", 100), ("p900", 900), ("p500", 500), ("p900b", 900),
+                                ("n2", False)])
+        self.assertEqual(order, ["p900", "p900b", "n1", "p500", "p100", "n2"])
+
     def test_only_regular_is_fifo(self):
         self.assertEqual(self.run_queue([(f"n{i}", False) for i in range(5)]), [f"n{i}" for i in range(5)])
 
@@ -106,6 +112,7 @@ class TestPriorityServer(Site):
         ok = {"X-Alerts-Secret": SECRET}
         self.assertTrue(server.scan_priority(ok, {"token": TOK[0], "user_id": U1}))
         self.assertTrue(server.scan_priority(ok, {"token": TOK[0], "user_id": str(U1)}))
+        self.assertEqual(server.scan_priority(ok, {"token": TOK[0], "user_id": U1}), 600_000 * E18)   # сохранённый баланс
         self.assertFalse(server.scan_priority(ok, {"token": TOK[0], "user_id": U2}))
         self.assertFalse(server.scan_priority(ok, {"token": TOK[0], "user_id": U3}))
         self.assertFalse(server.scan_priority(ok, {"token": TOK[0]}))
@@ -146,6 +153,33 @@ class TestPriorityServer(Site):
             gates[TOK[1]].set()
             self.wait(lambda: gate.free == 1)
         self.assertEqual(started, [TOK[0], TOK[2], TOK[1]])
+
+    def test_bigger_holder_first(self):
+        """Через /api/scan: слот занят, ждут премиумы с 600K и 5M $CrawlScan → первым 5M (баланс из привязки,
+        без запросов в сеть)."""
+        self.link(U1, W1, 600_000 * E18)
+        self.link(U2, W2, 5_000_000 * E18)
+        started, gates = [], {t: threading.Event() for t in TOK[:3]}
+
+        def scan(token, emit=None):
+            started.append(token)
+            gates[token].wait(10)
+            raise engine.ScanError("test stop")
+        gate = scan_gate.FairGate(1)
+        calls = len(self.ch.calls)
+        with mock.patch.object(server, "_gate", gate), mock.patch.object(server.engine, "scan", side_effect=scan), \
+                mock.patch.object(memguard, "over", return_value=False):
+            self.req("/api/scan", {"token": TOK[0]}, secret=None)
+            self.wait(lambda: started == [TOK[0]])
+            self.req("/api/scan", {"token": TOK[1], "user_id": U1})                         # 600K — встал первым
+            self.wait(lambda: gate.waiting_count() == (1, 0))
+            self.req("/api/scan", {"token": TOK[2], "user_id": U2})                         # 5M — встал вторым
+            self.wait(lambda: gate.waiting_count() == (2, 0))
+            for t in TOK[:3]:
+                gates[t].set()
+            self.wait(lambda: gate.free == 1)
+        self.assertEqual(started, [TOK[0], TOK[2], TOK[1]])
+        self.assertEqual(len(self.ch.calls), calls)                                         # ни одного запроса в сеть
 
     def wait(self, cond, timeout=5):
         deadline = time.time() + timeout
@@ -249,6 +283,13 @@ class TestImportLookup(unittest.TestCase):
         ch.calls.clear()
         premium_import.lookup(ch, W1, ds, lambda t, m: False, lambda t: False, skip=[CRAWL])
         self.assertEqual(ch.calls, [("balances", W1)])                                     # лаунчпад — из кэша
+
+    def test_crawlscan_itself_is_shown(self):
+        """$CrawlScan на привязанном кошельке — обычный токен Pons: в списке, как остальные (раньше отсеивался skip)."""
+        ch = WalletChain(self.bal, PONS + [CRAWL])
+        r = premium_import.lookup(ch, W1, prices(self.mkt), lambda t, m: False, lambda t: False)
+        self.assertEqual([it["token"] for it in r["items"]][0], CRAWL)                     # 600K × $1 — самый дорогой
+        self.assertEqual(r["items"][0]["ticker"], "CRAWL")
 
     def test_empty_wallet(self):
         ch = WalletChain({}, [])
