@@ -1,0 +1,12 @@
+.env
+.env*
+!.env.example
+__pycache__/
+.DS_Store
+*_out.txt
+DEV_NOTES.md
+CLAUDE.md
+scripts/probe_*.py
+.claude/
+data/*
+!data/timeline.json

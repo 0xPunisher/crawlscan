@@ -1,0 +1,551 @@
+"""Tests for Token Burn & Holder Rewards: rules (rewards.py), storage, orchestration with a fake chain, API."""
+import json, math, os, sqlite3, tempfile, threading, time, unittest, urllib.error, urllib.request
+from contextlib import ExitStack
+from datetime import datetime
+from http.server import ThreadingHTTPServer
+from unittest import mock
+
+import fakes  # noqa: F401  (blocks real Robinhood adapter RPC, sets up paths)
+import rewards as rw
+import rewards_service as rs
+from chains import robinhood as ch
+import rewards_store as rws
+from rewards_store import RewardsStore
+import server
+
+TOKEN = "0x" + "ab" * 20
+CURVE = "0x" + "c0" * 20
+DEV, DEV2 = "0x" + "de" * 20, "0x" + "df" * 20
+CONTRACT = "0x" + "cc" * 20
+A, B, C, OUTSIDER = ("0x" + f"{i:02x}" * 20 for i in (0xa1, 0xb1, 0xc1, 0xe1))
+DAY = "2026-10-04"
+DAY_START, DAY_END = rw.day_bounds(DAY)
+BLOCK_SECONDS = 10
+DAY0 = 1000                                       # first block of the day
+T0 = DAY_START - DAY0 * BLOCK_SECONDS             # timestamp of block 0
+LAUNCH = 10
+
+
+def blk(ts):
+    return math.ceil((ts - T0) / BLOCK_SECONDS)
+
+
+def at(h, m=0, day_start=DAY_START):
+    """Block h hours m minutes after the start of the weighting day (22:00 UTC the previous day)."""
+    return blk(day_start + h * 3600 + m * 60)
+
+
+class FakeChain:
+    """Fake Robinhood Chain: a block every 10 s, token transfers from a list, contract code, chain head."""
+
+    def __init__(self, head_ts=None):
+        self.transfers = []
+        self.eth = []                                   # native ETH transfers (external)
+        self.head_ts = head_ts or DAY_END + 2 * 86400
+        self.contracts = {CONTRACT}
+        self.calls = {"seed": 0, "launch": 0}
+        self.add(ZERO_, CURVE, 10 ** 9, LAUNCH)        # mint into the curve
+        self.add(CURVE, A, 1000, 20)                    # A holds from the start of the day
+        self.add(CURVE, DEV, 5000, 20)                  # developer
+        self.add(CURVE, CONTRACT, 300, 20)              # contract
+        self.add(A, C, 400, at(6))                      # +6 h (04:00 UTC): A -> C
+        self.add(CURVE, B, 1000, at(12))                # +12 h (10:00 UTC): B bought
+        self.add(DEV, rw.DEAD, 100, at(15))             # +15 h (13:00 UTC): developer burn
+
+    def add(self, frm, to, amount, block, tx=None):
+        t = {"frm": frm, "to": to, "amount": amount, "block": block, "tx": tx or f"0xtx{len(self.transfers):04d}",
+             "log_index": len(self.transfers)}
+        self.transfers.append(t)
+        self.transfers.sort(key=lambda t: (t["block"], t["log_index"]))
+        return t
+
+    def add_eth(self, frm, to, wei, block, tx=None):
+        t = {"frm": frm, "to": to, "amount": wei, "block": block, "tx": tx or f"0xeth{len(self.eth):04d}", "log_index": -1}
+        self.eth.append(t)
+        return t
+
+    def eth_sent(self, frm, from_block, to_block, to=None, max_count=1000):
+        fs, ts = set(frm), None if to is None else set(to)
+        return sorted((dict(t) for t in self.eth if from_block <= t["block"] <= to_block and t["frm"] in fs
+                       and (ts is None or t["to"] in ts)), key=lambda t: t["block"])
+
+    def head(self):
+        return blk(self.head_ts)
+
+    def block_at_time(self, ts):
+        if ts > self.head_ts:
+            raise LookupError("future")
+        if ts == rw.seed_time(DAY) or ts > DAY_END:
+            self.calls["seed"] += 1
+        n = blk(ts)
+        return {"number": n, "hash": f"0x{n:064x}", "timestamp": T0 + n * BLOCK_SECONDS}
+
+    def get_token_transfers(self, token, from_block, to_block=None, frm=None, to=None):
+        hi = self.head() if to_block is None else to_block
+        fs = None if frm is None else ({frm} if isinstance(frm, str) else set(frm))
+        ts = None if to is None else ({to} if isinstance(to, str) else set(to))
+        return [dict(t) for t in self.transfers if from_block <= t["block"] <= hi
+                and (fs is None or t["frm"] in fs) and (ts is None or t["to"] in ts)]
+
+    def get_launch(self, token):
+        self.calls["launch"] += 1
+        return {"block": LAUNCH, "curve": CURVE, "deployer": DEV, "tx": "0xlaunch"} if token == TOKEN else None
+
+    def patch(self):
+        st = ExitStack()
+        p = lambda name, fn: st.enter_context(mock.patch.object(ch, name, side_effect=fn))
+        p("block_at_time", self.block_at_time)
+        p("block_number", self.head)
+        p("block_timestamps", lambda blocks: {b: T0 + b * BLOCK_SECONDS for b in blocks})
+        p("get_token_transfers", self.get_token_transfers)
+        p("eth_sent", self.eth_sent)
+        p("get_launch", self.get_launch)
+        p("excluded_addresses", lambda curve: {CURVE, ZERO_, rw.DEAD})
+        p("is_contract_at", lambda addrs, block: {a: a in self.contracts for a in addrs})
+        p("token_decimals", lambda t: 18)
+        p("token_supply", lambda t: 10 ** 9 - 50)                     # 50 burned via burn()
+        p("token_balance", lambda t, a: 100 if a == rw.DEAD else 0)
+        return st
+
+
+ZERO_ = rw.ZERO
+
+
+class TestRules(unittest.TestCase):
+
+    def test_time_weighted_half_day(self):
+        # bought 12 h after the start of the day and held to the end — half the weight; A gave away 400 after 6 h
+        trs = FakeChain().transfers
+        ts_of = {t["block"]: T0 + t["block"] * BLOCK_SECONDS for t in trs}
+        w = rw.time_weights(trs, DAY0, blk(DAY_END), ts_of, DAY_START, DAY_END)
+        self.assertEqual(w[B], 500)                                   # 1000 * 12 h / 24 h
+        self.assertEqual(w[A], 1000 * 6 // 24 + 600 * 18 // 24)       # 250 + 450 = 700
+        self.assertEqual(w[C], 300)                                   # 400 * 18 / 24
+        self.assertEqual(w[DEV], (5000 * 15 + 4900 * 9) // 24)       # burned 100 after 15 h
+
+    def test_balance_before_day_and_sold_before(self):
+        trs = [{"frm": ZERO_, "to": A, "amount": 10, "block": 5, "log_index": 0},
+               {"frm": A, "to": B, "amount": 10, "block": 6, "log_index": 1}]   # A sold everything before the day started
+        w = rw.time_weights(trs, DAY0, blk(DAY_END), {}, DAY_START, DAY_END)
+        self.assertNotIn(A, w)
+        self.assertEqual(w[B], 10)
+
+    def test_exclusions(self):
+        weights = {A: 7, DEV: 50, CURVE: 99, rw.DEAD: 5, ZERO_: 3, CONTRACT: 9, B: 0}
+        self.assertEqual(rw.eligible(weights, {DEV, CURVE}, {CONTRACT}), {A: 7})
+
+    def test_pick_deterministic_and_verify(self):
+        parts = {A: 700, B: 500, C: 300}
+        h = "0x" + "11" * 32
+        a, b = rw.pick(parts, h), rw.pick(dict(reversed(list(parts.items()))), h)
+        self.assertEqual(a, b)
+        rec = {"list_hash": a["list_hash"], "blockhash": h, "winner": a["winner"], "total_weight": a["total"], "r": a["r"]}
+        self.assertTrue(rw.verify(rec, parts)["ok"])
+        self.assertFalse(rw.verify(rec, dict(parts, **{A: 701}))["ok"])
+
+    def test_find_burns(self):
+        trs = [{"frm": DEV, "to": rw.DEAD, "amount": 5}, {"frm": DEV, "to": ZERO_, "amount": 7},
+               {"frm": A, "to": rw.DEAD, "amount": 9}, {"frm": DEV, "to": B, "amount": 1},
+               {"frm": DEV, "to": ZERO_, "amount": 0}]
+        self.assertEqual([t["amount"] for t in rw.find_burns(trs, [DEV.upper().replace("0X", "0x")])], [5, 7])
+
+    def test_match_payouts(self):
+        after = rw.draw_time(DAY)
+        draws = [{"day": DAY, "winner": A, "payout_tx": None}, {"day": "2026-10-05", "winner": A, "payout_tx": None}]
+        trs = [{"frm": DEV, "to": A, "amount": 1, "block": 1, "tx": "0xearly", "log_index": 0},     # before the draw
+               {"frm": B, "to": A, "amount": 2, "block": 2, "tx": "0xnotdev", "log_index": 0},     # not the developer
+               {"frm": DEV, "to": A, "amount": 3, "block": 3, "tx": "0xpay1", "log_index": 0},
+               {"frm": DEV, "to": A, "amount": 4, "block": 4, "tx": "0xpay2", "log_index": 0}]
+        ts_of = {1: after - 1, 2: after + 1, 3: after + 2, 4: rw.draw_time("2026-10-05") + 5}
+        m = rw.match_payouts(draws, trs, [DEV], ts_of)
+        self.assertEqual({d: t["tx"] for d, t in m.items()}, {DAY: "0xpay1", "2026-10-05": "0xpay2"})
+        self.assertEqual(rw.match_payouts(draws, trs, [DEV], ts_of, {("0xpay1", 0), ("0xpay2", 0)}), {})
+
+    def test_total_burned(self):
+        self.assertEqual(rw.total_burned(1000, 950, 30), 80)
+        self.assertEqual(rw.BURN_ADDRESS.lower(), rw.DEAD)
+        self.assertEqual(rw.BURN_SINKS, {rw.DEAD, ZERO_})
+
+
+def utc(s):
+    return int(datetime.fromisoformat(s + "+00:00").timestamp())
+
+
+class TestSchedule(unittest.TestCase):
+    """UTC schedule: burns at 10:00 and 22:00, draw at 22:00 (computed at 22:05), day [22:00 previous day, 22:00), seed 22:01."""
+
+    def test_draw_window_seed_and_run(self):
+        self.assertEqual(rw.day_bounds("2026-10-06"), (utc("2026-10-05T22:00:00"), utc("2026-10-06T22:00:00")))
+        self.assertEqual(rw.draw_at("2026-10-06"), utc("2026-10-06T22:00:00"))
+        self.assertEqual(rw.seed_time("2026-10-06"), utc("2026-10-06T22:01:00"))
+        self.assertEqual(rw.draw_time("2026-10-06"), utc("2026-10-06T22:05:00"))
+
+    def test_which_draw(self):
+        self.assertEqual(rw.next_draw(utc("2026-10-06T00:20:00")), ("2026-10-06", utc("2026-10-06T22:00:00")))
+        self.assertEqual(rw.day_key(utc("2026-10-05T22:00:00")), "2026-10-06")     # from 22:00 — the next draw's day
+        self.assertEqual(rw.day_key(utc("2026-10-06T21:59:59")), "2026-10-06")
+        self.assertEqual(rw.next_draw(utc("2026-10-06T22:00:00")), ("2026-10-07", utc("2026-10-07T22:00:00")))
+        self.assertEqual(rw.prev_day(utc("2026-10-06T22:03:00")), "2026-10-06")
+
+    def test_next_burns(self):
+        self.assertEqual(rw.next_burns(utc("2026-10-06T00:20:00"), 2), [utc("2026-10-06T10:00:00"), utc("2026-10-06T22:00:00")])
+        self.assertEqual(rw.next_burn(utc("2026-10-06T10:00:00")), utc("2026-10-06T22:00:00"))      # exactly 10:00 — already the next one
+        self.assertEqual(rw.next_burns(utc("2026-10-06T22:30:00"), 2), [utc("2026-10-07T10:00:00"), utc("2026-10-07T22:00:00")])
+
+    def test_first_draw_by_default(self):
+        with mock.patch.dict(os.environ, {"REWARDS_START_DAY": ""}):
+            self.assertEqual(rs.config()["start_day"], "2026-10-06")
+        tmp = tempfile.TemporaryDirectory()
+        store = RewardsStore(os.path.join(tmp.name, "d.db"))
+        cfg = {"start_day": rs.FIRST_DAY}
+        try:
+            self.assertEqual(rs.pending_days(store, cfg, utc("2026-10-06T15:00:00")), [])           # release during the day: wait
+            self.assertEqual(rs.pending_days(store, cfg, utc("2026-10-06T22:04:59")), [])           # computed at 22:05
+            self.assertEqual(rs.pending_days(store, cfg, utc("2026-10-06T22:05:00")), ["2026-10-06"])
+            self.assertEqual(rs.pending_days(store, cfg, utc("2026-10-08T22:10:00")),                 # downtime: catches up
+                             ["2026-10-06", "2026-10-07", "2026-10-08"])
+        finally:
+            store.close(); tmp.cleanup()
+
+
+class TestService(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = RewardsStore(os.path.join(self.tmp.name, "draw.db"))
+        self.cfg = {"enabled": True, "token": TOKEN, "dev_wallets": [DEV], "invalid_dev_wallets": [],
+                    "start_day": DAY}
+        self.chain = FakeChain()
+        self.st = self.chain.patch()
+        self.st.__enter__()
+
+    def tearDown(self):
+        self.st.__exit__(None, None, None)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_draw_weights_exclusions_and_idempotency(self):
+        row = rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY))
+        self.assertEqual(self.store.participants(DAY), {A: 700, B: 500, C: 300})   # without DEV, curve, contract, dead
+        self.assertEqual((row["status"], row["participants"], row["total_weight"]), ("done", 3, 1500))
+        self.assertEqual((row["start_block"], row["end_block"]), (DAY0, blk(DAY_END)))
+        self.assertEqual(row["seed_block"], blk(rw.seed_time(DAY)))
+        self.assertTrue(rs.verify_json(self.store, DAY)["ok"])
+        # repeat: nothing is recomputed or duplicated
+        self.assertEqual(rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY)), row)
+        self.assertEqual(self.chain.calls["seed"], 1)
+        self.assertEqual(len(self.store.draws()), 1)
+
+    def test_recompute_without_db_is_deterministic(self):
+        launch = rs.launch_info(None, TOKEN)
+        a, pa, _ = rs.compute_day(TOKEN, DAY, [DEV], launch, 18)
+        b, pb, _ = rs.compute_day(TOKEN, DAY, [DEV], launch, 18)
+        a.pop("created_at"); b.pop("created_at")
+        self.assertEqual((a, pa), (b, pb))
+
+    def test_timestamps_from_logs(self):
+        # RPC returned blockTimestamp in the logs — no separate block time requests, same result
+        launch = rs.launch_info(None, TOKEN)
+        a, pa, _ = rs.compute_day(TOKEN, DAY, [DEV], launch, 18)
+        plain = self.chain.get_token_transfers
+        with_ts = lambda *a, **k: [dict(t, ts=T0 + t["block"] * BLOCK_SECONDS) for t in plain(*a, **k)]
+        with mock.patch.object(ch, "get_token_transfers", side_effect=with_ts), \
+             mock.patch.object(ch, "block_timestamps", side_effect=AssertionError("extra RPC")):
+            b, pb, _ = rs.compute_day(TOKEN, DAY, [DEV], launch, 18)
+        a.pop("created_at"); b.pop("created_at")
+        self.assertEqual((a, pa), (b, pb))
+
+    def test_not_ready(self):
+        with self.assertRaises(rs.NotReady):
+            rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY) - 1)
+        self.chain.head_ts = rw.seed_time(DAY) - 1                     # seed block doesn't exist yet
+        with self.assertRaises(rs.NotReady):
+            rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY))
+        self.assertIsNone(self.store.get_draw(DAY))
+
+    def test_zero_participants(self):
+        self.cfg["dev_wallets"] = [DEV, A, B, C]                       # all holders are developers
+        row = rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY))
+        self.assertEqual((row["status"], row["participants"], row["winner"], row["seed_block"]), ("no_eligible", 0, None, None))
+        self.assertEqual(self.chain.calls["seed"], 0)                  # seed is not requested
+        self.assertTrue(rs.verify_json(self.store, DAY)["ok"])
+        self.assertEqual(rs.draw_json(row)["payout_status"], "no_winner")
+
+    def test_burns_detected_once(self):
+        self.assertEqual(rs.check_burns(self.store, self.cfg), 1)
+        self.assertEqual(rs.check_burns(self.store, self.cfg), 0)      # cursor: repeat doesn't duplicate
+        self.chain.head_ts += 1000                                     # chain moved ahead by 100 blocks
+        self.chain.add(DEV, ZERO_, 50, self.chain.head() - 50)         # burn() -> Transfer to 0x0
+        self.chain.add(A, rw.DEAD, 7, self.chain.head() - 50)          # not the developer — doesn't count
+        self.assertEqual(rs.check_burns(self.store, self.cfg), 1)
+        self.assertEqual(self.store.burned_total(TOKEN), (150, 2))
+        self.store.set_meta("burn_cursor:" + TOKEN, LAUNCH - 1)         # cursor failure: everything re-read — no duplicates
+        self.assertEqual(rs.check_burns(self.store, self.cfg), 0)
+        self.assertEqual(self.store.burned_total(TOKEN), (150, 2))
+        last = self.store.burns(TOKEN, 1)[0]
+        self.assertEqual((last["amount"], last["to_addr"]), (50, ZERO_))
+
+    def test_dev_wallets_change_rescans(self):
+        rs.check_burns(self.store, self.cfg)
+        self.chain.add(DEV2, rw.DEAD, 9, 30)
+        self.assertEqual(rs.check_burns(self.store, self.cfg), 0)      # DEV2 is not a developer yet
+        self.cfg["dev_wallets"] = [DEV, DEV2]
+        self.assertEqual(rs.check_burns(self.store, self.cfg), 2)      # the set changed — rebuilt from launch
+        self.assertEqual(self.store.burned_total(TOKEN), (109, 2))
+
+    def test_payout_detected_once(self):
+        row = rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY))
+        win = row["winner"]
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 0)    # no payout
+        self.chain.add(DEV, win, 11, blk(DAY_END) + 10)                # 22:01:40 — before the 22:05 computation, not a payout
+        self.chain.add(OUTSIDER, win, 12, blk(rw.draw_time(DAY)) + 5)  # not from DEV_WALLETS
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 0)
+        pay = self.chain.add(DEV, win, 25, blk(rw.draw_time(DAY)) + 30)
+        self.chain.add(DEV, win, 26, blk(rw.draw_time(DAY)) + 40)
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 1)
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 0)
+        row = self.store.get_draw(DAY)
+        self.assertEqual((row["payout_tx"], row["payout_amount"], row["payout_from"]), (pay["tx"], 25, DEV))
+        self.assertEqual(rs.draw_json(row)["payout_status"], "paid")
+
+    def test_eth_payout_detected(self):
+        row = rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY))
+        win, after = row["winner"], blk(rw.draw_time(DAY))
+        self.chain.add_eth(DEV, win, 10 ** 17, blk(DAY_END) + 10)            # before the 22:05 computation — not a payout
+        self.chain.add_eth(OUTSIDER, win, 2 * 10 ** 17, after + 5)          # not from DEV_WALLETS
+        self.chain.add_eth(DEV, OUTSIDER, 3 * 10 ** 17, after + 6)          # not to the winner
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 0)
+        pay = self.chain.add_eth(DEV, win, 52_300_000_000_000_000, after + 20)   # 0.0523 ETH
+        self.chain.add(DEV, win, 25, after + 30)                             # token later — no longer a payout
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 1)
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 0)
+        row = self.store.get_draw(DAY)
+        self.assertEqual((row["payout_tx"], row["payout_amount"], row["payout_currency"], row["payout_log_index"]),
+                         (pay["tx"], 52_300_000_000_000_000, "ETH", -1))
+        j = rs.draw_json(row)
+        self.assertEqual((j["payout_status"], j["payout_currency"], j["payout_eth"], j["payout_tokens"]),
+                         ("paid", "ETH", 0.0523, None))
+        st = rs.status_json(self.store, self.cfg, now=DAY_END + 3600)["last_draw"]
+        self.assertEqual((st["payout_currency"], st["payout_eth"], st["payout_tokens"]), ("ETH", 0.0523, None))
+        h = rs.history_json(self.store, self.cfg)["draws"][0]
+        self.assertEqual((h["payout_currency"], h["payout_eth"]), ("ETH", 0.0523))
+
+    def test_token_payout_still_counts_first(self):
+        row = rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY))
+        win, after = row["winner"], blk(rw.draw_time(DAY))
+        tok = self.chain.add(DEV, win, 25, after + 10)
+        self.chain.add_eth(DEV, win, 10 ** 17, after + 20)
+        self.assertEqual(rs.check_payouts(self.store, self.cfg), 1)
+        row = self.store.get_draw(DAY)
+        self.assertEqual((row["payout_tx"], row["payout_currency"]), (tok["tx"], "CRAWLSCAN"))
+        j = rs.draw_json(row)
+        self.assertEqual((j["payout_currency"], j["payout_tokens"], j["payout_eth"]), ("CRAWLSCAN", 25 / 10 ** 18, None))
+
+    def test_old_token_payout_and_migration(self):
+        """Database from before ETH payouts: no payout_currency column; a token payout is shown as before."""
+        path = os.path.join(self.tmp.name, "old.db")
+        db = sqlite3.connect(path)
+        old = rws.SCHEMA.replace(",\n  payout_currency TEXT", "")
+        self.assertNotIn("payout_currency", old)
+        db.executescript(old)
+        db.execute("INSERT INTO rw_draws(day, token, status, list_hash, seed_time, winner, winner_weight, total_weight, "
+                   "participants, decimals, dev_wallets, created_at, payout_amount, payout_tx, payout_log_index, "
+                   "payout_block, payout_from, paid_at) VALUES (?, ?, 'done', 'h', 1, ?, '5', '10', 2, 18, ?, 1, ?, "
+                   "'0xold', 3, 100, ?, 2)", (DAY, TOKEN, A, DEV, str(7 * 10 ** 18), DEV))
+        db.commit(); db.close()
+        st = rws.RewardsStore(path)
+        try:
+            row = st.get_draw(DAY)
+            self.assertIsNone(row["payout_currency"])
+            j = rs.draw_json(row)
+            self.assertEqual((j["payout_status"], j["payout_currency"], j["payout_tokens"], j["payout_eth"]),
+                             ("paid", "CRAWLSCAN", 7.0, None))
+            rws.RewardsStore(path).close()                                  # reopening — no errors
+        finally:
+            st.close()
+
+    def test_status_decimals_before_first_draw(self):
+        rs.check_burns(self.store, self.cfg)
+        rs.refresh_supply(self.store, self.cfg)   # caches decimals: the frontend needs *_tokens amounts before the first draw
+        st = rs.status_json(self.store, self.cfg, now=DAY_END - 3600)
+        self.assertIsNone(st["last_draw"])
+        self.assertEqual(st["decimals"], 18)
+        self.assertEqual(st["last_burn"]["amount_tokens"], 100 / 10 ** 18)
+
+    def test_supply_and_status(self):
+        rs.check_burns(self.store, self.cfg)
+        rs.refresh_supply(self.store, self.cfg)
+        rs.decimals(self.store, TOKEN)
+        rs.run_draw(self.store, self.cfg, DAY, now=rw.draw_time(DAY))
+        st = rs.status_json(self.store, self.cfg, now=DAY_END + 3600)
+        self.assertEqual(st["total_burned"]["amount"], 50 + 100)       # minted - totalSupply + dead
+        self.assertEqual((st["burned_by_dev"]["amount"], st["burned_by_dev"]["count"]), (100, 1))
+        self.assertEqual(st["last_burn"]["amount"], 100)
+        # now = 2026-10-04 23:00 UTC: the weighting day of the 2026-10-05 draw is already running
+        self.assertEqual(st["next_burns"], ["2026-10-05T10:00:00+00:00", "2026-10-05T22:00:00+00:00"])
+        self.assertEqual(st["next_burn"], "2026-10-05T10:00:00+00:00")
+        self.assertEqual((st["next_draw"], st["next_draw_day"]), ("2026-10-05T22:00:00+00:00", "2026-10-05"))
+        self.assertEqual(st["next_draw_runs_at"], "2026-10-05T22:05:00+00:00")
+        self.assertEqual((st["period_start"], st["period_end"]), ("2026-10-04T22:00:00+00:00", "2026-10-05T22:00:00+00:00"))
+        self.assertEqual(st["burn_address"], "0x000000000000000000000000000000000000dEaD")
+        self.assertEqual(st["last_burn"]["amount_tokens"], 100 / 10 ** 18)
+        self.assertEqual((st["last_draw"]["day"], st["participants_last"], st["last_draw"]["payout_status"]), (DAY, 3, "pending"))
+        self.assertAlmostEqual(st["last_draw"]["chance"], st["last_draw"]["weight"] / 1500)
+
+    def test_scheduler_draws_pending_and_survives_errors(self):
+        sch = rs.Scheduler(self.store, self.cfg)
+        with mock.patch.object(rs, "refresh_supply", side_effect=RuntimeError("rpc down")):
+            sch.tick(now=rw.draw_time(DAY) + 60)                       # supply dropped — draw and burns went through
+        self.assertIsNotNone(self.store.get_draw(DAY))
+        self.assertEqual(self.store.burned_total(TOKEN)[1], 1)
+        with mock.patch.object(rs, "run_draw", side_effect=RuntimeError("boom")):
+            sch.tick(now=rw.draw_time("2026-10-05") + 60)               # a draw error doesn't crash the thread
+        self.assertIsNone(self.store.get_draw("2026-10-05"))
+
+
+
+class TestRewardsAPI(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.H)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown(); cls.httpd.server_close()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"REWARDS_ENABLED": "true", "REWARDS_TOKEN": TOKEN, "DEV_WALLETS": DEV,
+                                                "DRAW_DB_PATH": os.path.join(self.tmp.name, "d.db")})
+        self.env.start()
+        self.chain = FakeChain()
+        self.st = self.chain.patch()
+        self.st.__enter__()
+        store = server.rewards_store()
+        cfg = rs.config()
+        rs.run_draw(store, cfg, DAY, now=rw.draw_time(DAY))
+        rs.check_burns(store, cfg)
+
+    def tearDown(self):
+        self.st.__exit__(None, None, None)
+        with server._stores_lock:
+            for st in server._rw_stores.values():
+                st.close()
+            server._rw_stores.clear()
+        self.env.stop(); self.tmp.cleanup()
+
+    def req(self, path):
+        try:
+            with urllib.request.urlopen(self.base + path, timeout=10) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_read_endpoints(self):
+        code, st = self.req("/api/rewards/status")
+        self.assertEqual((code, st["enabled"], st["token"], st["dev_wallets"]), (200, True, TOKEN, [DEV]))
+        self.assertEqual((st["last_draw"]["day"], st["participants_last"]), (DAY, 3))
+        code, hist = self.req("/api/rewards/history?limit=5")
+        self.assertEqual((code, [d["day"] for d in hist["draws"]], len(hist["burns"])), (200, [DAY], 1))
+        code, parts = self.req(f"/api/rewards/{DAY}/participants")
+        self.assertEqual((code, [p["address"] for p in parts["participants"]]), (200, sorted([A, B, C])))
+        self.assertEqual(sum(p["weight"] for p in parts["participants"]), parts["total_weight"])
+        code, v = self.req(f"/api/rewards/{DAY}/verify")
+        self.assertEqual((code, v["ok"], v["inputs"]["seed_block"]), (200, True, blk(rw.seed_time(DAY))))
+        self.assertEqual(self.req("/api/rewards/2026-01-01/verify")[0], 404)
+        self.assertEqual(self.req("/api/rewards/nope")[0], 404)
+
+    def req_full(self, path):
+        try:
+            with urllib.request.urlopen(self.base + path, timeout=10) as resp:
+                return resp.status, json.loads(resp.read()), resp.headers.get("cache-control")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read()), e.headers.get("cache-control")
+
+    def walk(self, kind, limit, first_before=None):
+        """All pages via the next_before cursor: (items in order, page sizes, total)."""
+        items, sizes, before = [], [], first_before
+        for _ in range(100):
+            q = f"/api/rewards/history?kind={kind}&limit={limit}" + (f"&before={before}" if before is not None else "")
+            code, page, _ = self.req_full(q)
+            self.assertEqual((code, page["kind"]), (200, kind))
+            items += page["items"]; sizes.append(len(page["items"]))
+            before = page["next_before"]
+            if before is None:
+                return items, sizes, page["total"]
+        self.fail("pagination does not end")
+
+    def test_history_burns_pages(self):
+        store = server.rewards_store()
+        base = DAY_END + 3600
+        burns = [{"tx": f"0x{i:064x}", "log_index": 0, "frm": DEV, "to": rw.BURN_ADDRESS, "amount": 10 ** 18 * (i + 1),
+                  "block": 5000 + i} for i in range(23)]
+        ts_of = {b["block"]: base + b["block"] * 100 for b in burns}
+        ts_of[5012] = ts_of[5013]          # two burns in the same second — exactly on the page boundary
+        ts_of[5001] = ts_of[5002]
+        self.assertEqual(store.save_burns(TOKEN, burns, ts_of), 23)
+        items, sizes, total = self.walk("burns", 10)
+        self.assertEqual(total, 24)                                    # + the burn from setUp
+        self.assertEqual(len(items), 24)
+        self.assertEqual(len({(b["tx"], b["log_index"]) for b in items}), 24)       # no repeats or gaps
+        times = [b["time"] for b in items]
+        self.assertEqual(times, sorted(times, reverse=True))
+        self.assertEqual(sizes, [11, 11, 2])                           # pair with the same time not split
+        self.assertEqual(items[0]["tx"], f"0x{22:064x}")
+        self.assertEqual(items[0]["amount_tokens"], 23.0)
+        # cursor is strictly "earlier": a page with before = the burn's time doesn't include it
+        code, page, cache = self.req_full(f"/api/rewards/history?kind=burns&limit=3&before={ts_of[5010]}")
+        self.assertEqual([b["block"] for b in page["items"]], [5009, 5008, 5007])
+        self.assertEqual((page["next_before"], cache), (ts_of[5007], "no-store"))
+
+    def test_history_draws_pages(self):
+        store = server.rewards_store()
+        row = store.get_draw(DAY)
+        days = [f"2026-09-{d:02d}" for d in range(1, 13)]
+        for d in days:
+            rec = {k: row[k] for k in row if k in ("token", "status", "start_block", "end_block", "list_hash", "seed_time",
+                   "seed_block", "blockhash", "r", "winner", "winner_weight", "total_weight", "participants",
+                   "decimals", "dev_wallets", "created_at")}
+            self.assertTrue(store.save_draw(dict(rec, day=d), {A: 1}))
+        items, sizes, total = self.walk("draws", 5)
+        self.assertEqual(total, 13)
+        self.assertEqual([d["day"] for d in items], [DAY] + days[::-1])
+        self.assertEqual(sizes, [5, 5, 3])
+        self.assertEqual(items[0]["time"], rw.draw_at(DAY))
+        self.assertIn("payout_status", items[0])
+        # before = exactly the time of the 2026-09-10 draw — it is not included; ISO is accepted too
+        for b in (rw.draw_at("2026-09-10"), "2026-09-10T22:00:00Z", "2026-09-10T22:00:00"):
+            code, page, _ = self.req_full(f"/api/rewards/history?kind=draws&limit=2&before={b}")
+            self.assertEqual((code, [d["day"] for d in page["items"]]), (200, ["2026-09-09", "2026-09-08"]))
+        code, page, _ = self.req_full(f"/api/rewards/history?kind=draws&before={rw.draw_at('2026-09-01')}")
+        self.assertEqual((page["items"], page["next_before"]), ([], None))
+        self.assertEqual(self.req("/api/rewards/status")[1]["draws_count"], 13)
+
+    def test_history_page_params(self):
+        code, page, _ = self.req_full("/api/rewards/history?kind=draws")
+        self.assertEqual((code, page["limit"], page["before"]), (200, 10, None))
+        self.assertEqual(self.req_full("/api/rewards/history?kind=burns&limit=500")[1]["limit"], 50)
+        self.assertEqual(self.req_full("/api/rewards/history?kind=burns&limit=0")[1]["limit"], 1)
+        for bad in ("kind=all", "kind=burns&limit=x", "kind=burns&before=yesterday"):
+            self.assertEqual(self.req(f"/api/rewards/history?{bad}")[0], 400, bad)
+        code, legacy = self.req("/api/rewards/history?limit=5")                 # without kind — the old response
+        self.assertEqual((code, sorted(legacy)), (200, ["burns", "draws"]))
+        with mock.patch.object(ch, "rpc", side_effect=AssertionError("no network")):
+            self.assertEqual(self.req("/api/rewards/history?kind=burns")[0], 200)
+            self.assertEqual(self.req("/api/rewards/history?kind=draws")[0], 200)
+
+    def test_disabled(self):
+        with mock.patch.dict(os.environ, {"REWARDS_ENABLED": "false"}):
+            self.assertEqual(self.req("/api/rewards/history?kind=burns")[0], 404)
+            self.assertEqual(self.req("/api/rewards/status"), (200, {"enabled": False}))
+            self.assertEqual(self.req("/api/rewards/history")[0], 404)
+            self.assertIsNone(server.start_rewards_scheduler())
+
+
+if __name__ == "__main__":
+    unittest.main()

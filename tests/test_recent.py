@@ -1,0 +1,216 @@
+"""Tests for the "Recently scanned" feed: storage, recording after a scan, /api/recent. No network."""
+import json, os, tempfile, threading, time, unittest, urllib.error, urllib.request
+from unittest import mock
+from http.server import ThreadingHTTPServer
+
+import fakes
+import server
+from recent_store import RecentStore, entry
+
+SOL = "fjKUqPWK9m331Y5TZZNFismtqoP2MGWAMHEkB62pump"
+
+
+def res(token="0x" + "11" * 20, chain="robinhood", score=42, band="RISKY", rug=None, ticker="AAA", name="Alpha"):
+    return {"token": token, "chain": chain, "header": {"ticker": ticker, "name": name},
+            "score": score, "band": band, "rug": rug}
+
+
+class TestStore(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = RecentStore(os.path.join(self.tmp.name, "r.db"))
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_record_and_order(self):
+        self.store.record(res("0x" + "11" * 20), ts=100)
+        self.store.record(res(SOL, chain="solana", score=80, band="CLEAN", ticker="SOLX"), ts=200)
+        self.store.record(res("0x" + "33" * 20, band="DANGER", score=10, rug={"drop": 0.6}), ts=150)
+        items = self.store.recent(12)
+        self.assertEqual([x["token"] for x in items], [SOL, "0x" + "33" * 20, "0x" + "11" * 20])
+        self.assertEqual(items[0], {"token": SOL, "chain": "solana", "launchpad": None, "ticker": "SOLX", "name": "Alpha",
+                                    "score": 80, "band": "CLEAN", "rug": False, "ts": 200})
+        self.assertTrue(items[1]["rug"])
+        self.assertEqual(len(self.store.recent(2)), 2)
+
+    def test_one_row_per_token(self):
+        self.store.record(res(score=42, band="RISKY"), ts=100)
+        self.store.record(res("0x" + "22" * 20), ts=150)
+        self.store.record(res(score=12, band="DANGER", rug={"drop": 0.5}), ts=200)   # same token — update
+        items = self.store.recent(12)
+        self.assertEqual(len(items), 2)
+        self.assertEqual((items[0]["token"], items[0]["score"], items[0]["band"], items[0]["rug"], items[0]["ts"]),
+                         ("0x" + "11" * 20, 12, "DANGER", True, 200))
+
+    def test_too_early_and_missing_header(self):
+        e = entry({"token": "0x" + "44" * 20, "chain": "robinhood", "header": None, "score": None,
+                   "band": "TOO_EARLY_OR_LATE", "rug": None}, ts=5)
+        self.assertEqual((e["score"], e["ticker"], e["name"], e["rug"]), (None, None, None, False))
+
+    def test_flap_launchpad(self):
+        self.store.record(res("0x" + "66" * 20) | {"launchpad": "flap"}, ts=300)
+        self.assertEqual(self.store.recent(1)[0]["launchpad"], "flap")
+
+    def test_old_db_gets_launchpad_column(self):
+        import sqlite3
+        path = os.path.join(self.tmp.name, "old.db")
+        db = sqlite3.connect(path)
+        db.executescript("CREATE TABLE recent_scans (token TEXT PRIMARY KEY, chain TEXT NOT NULL, ticker TEXT, "
+                         "name TEXT, score INTEGER, band TEXT NOT NULL, rug INTEGER NOT NULL, ts INTEGER NOT NULL);"
+                         "INSERT INTO recent_scans VALUES ('0xold', 'robinhood', 'OLD', 'Old', 50, 'OK', 0, 1);")
+        db.commit()
+        db.close()
+        st = RecentStore(path)
+        try:
+            self.assertIsNone(st.recent()[0]["launchpad"])
+            st.record(res("0x" + "77" * 20) | {"launchpad": "flap"}, ts=2)
+            self.assertEqual(st.recent()[0]["launchpad"], "flap")
+        finally:
+            st.close()
+
+    def test_no_verdict_not_saved(self):
+        for bad in (None, {}, {"token": "0x" + "55" * 20}, {"band": "OK"}, "error"):
+            self.assertIsNone(self.store.record(bad))
+        self.assertEqual(self.store.recent(), [])
+
+
+class TestServerFeed(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.H)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        with server._lock:
+            server.JOBS.clear(); server.BY_TOKEN.clear(); server.RECENT.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"DRAW_DB_PATH": os.path.join(self.tmp.name, "f.db")})
+        self.env.__enter__()
+        self.fakes = fakes.patched()
+        self.fakes.__enter__()
+
+    def tearDown(self):
+        self.fakes.__exit__(None, None, None)
+        with server._stores_lock:
+            for st in server._recent_stores.values():
+                st.close()
+            server._recent_stores.clear()
+        self.env.__exit__(None, None, None)
+        self.tmp.cleanup()
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=10) as r:
+            return r.status, json.loads(r.read()), dict(r.headers)
+
+    def scan(self, token):
+        req = urllib.request.Request(self.base + "/api/scan", data=json.dumps({"token": token}).encode(),
+                                     method="POST", headers={"content-type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                job = json.loads(r.read())["job"]
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code
+        t0 = time.time()
+        while time.time() - t0 < 10:
+            _, d, _ = self.get(f"/api/result?job={job}")
+            if d["done"]:
+                time.sleep(0.05)       # feed entry is written right after done
+                return d
+            time.sleep(0.05)
+        self.fail("scan did not finish")
+
+    def test_scan_is_recorded(self):
+        d = self.scan(fakes.TOKEN)
+        self.assertIn("result", d)
+        code, feed, headers = self.get("/api/recent?limit=12")
+        self.assertEqual(code, 200)
+        self.assertEqual([x["token"] for x in feed["items"]], [fakes.TOKEN])
+        x = feed["items"][0]
+        self.assertEqual((x["chain"], x["score"], x["band"], x["rug"]),
+                         ("robinhood", d["result"]["score"], d["result"]["band"], bool(d["result"]["rug"])))
+        self.assertIn("max-age=15", headers["cache-control"])
+
+    def test_errors_not_recorded(self):
+        self.assertEqual(self.scan("not an address"), 400)
+        d = self.scan(fakes.OTHER)                       # not a Pons V2 token — scan error
+        self.assertIn("error", d)
+        _, feed, _ = self.get("/api/recent")
+        self.assertEqual(feed, {"items": []})
+
+    def test_db_failure_does_not_break_scan(self):
+        with mock.patch.object(server, "recent_store", side_effect=OSError("disk full")):
+            d = self.scan(fakes.TOKEN)
+            self.assertIn("result", d)
+            self.assertNotIn("error", d)
+            _, feed, _ = self.get("/api/recent")
+        self.assertEqual(feed, {"items": []})            # reading does not crash either
+
+    def test_cache_and_limit(self):
+        st = server.recent_store()
+        for i in range(5):
+            st.record(res("0x" + f"{i:02d}" * 20), ts=100 + i)
+        _, feed, _ = self.get("/api/recent?limit=3")
+        self.assertEqual([x["ts"] for x in feed["items"]], [104, 103, 102])
+        st.record(res("0x" + "99" * 20), ts=200)         # bypassing record_recent: cache not reset
+        _, again, _ = self.get("/api/recent?limit=3")
+        self.assertEqual(again, feed)
+        with mock.patch.object(server.time, "time", return_value=time.time() + server.RECENT_TTL + 1):
+            _, fresh, _ = self.get("/api/recent?limit=3")
+        self.assertEqual(fresh["items"][0]["ts"], 200)
+        for bad in ("abc", "0", "1000"):
+            code, d, _ = self.get(f"/api/recent?limit={bad}")
+            self.assertEqual(code, 200)
+            self.assertLessEqual(len(d["items"]), 50)
+
+    def test_new_scan_shows_at_once(self):
+        """Scan recorded — feed without waiting for RECENT_TTL (cache reset), new token on top."""
+        st = server.recent_store()
+        st.record(res("0x" + "11" * 20), ts=int(time.time()) - 3600)
+        _, old, _ = self.get("/api/recent?limit=12")
+        self.assertEqual(len(old["items"]), 1)
+        self.scan(fakes.TOKEN)
+        _, feed, _ = self.get("/api/recent?limit=12")
+        self.assertEqual(feed["items"][0]["token"], fakes.TOKEN)
+        self.assertLess(time.time() - feed["items"][0]["ts"], 60)
+
+    def test_read_racing_write_is_not_cached(self):
+        """DB read started before the scan was recorded and finished after: the stale response does not get cached."""
+        st = server.recent_store()
+        st.record(res("0x" + "11" * 20), ts=100)
+        real = st.recent
+
+        def slow(limit):
+            out = real(limit)
+            server.record_recent(res("0x" + "22" * 20))      # scan recorded while reading
+            return out
+        with mock.patch.object(st, "recent", side_effect=slow):
+            stale = server.get_recent(12)
+        self.assertEqual([x["ts"] for x in stale["items"]], [100])
+        fresh = server.get_recent(12)
+        self.assertEqual(fresh["items"][0]["token"], "0x" + "22" * 20)
+
+    def test_frontend_polls_bypass_browser_cache(self):
+        """Cloudflare rewrites Cache-Control to max-age=14400: page polls use cache: 'no-store'."""
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "scripts", "build_frontend.py")) as f:
+            src = f.read()
+        for url in ("'/api/recent?limit=12'", "'/api/rewards/status'", "`/api/rewards/history?kind="):
+            i = src.index("fetch(" + url)
+            self.assertIn(",NO_STORE)", src[i:i + 120], url)
+        self.assertIn("const j=u=>fetch(u,NO_STORE)", src)                # /api/draw/*
+        self.assertIn("const NO_STORE={cache:'no-store'}", src)
+
+
+if __name__ == "__main__":
+    unittest.main()

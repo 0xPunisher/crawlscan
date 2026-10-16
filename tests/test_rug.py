@@ -1,0 +1,242 @@
+"""Tests for the "probably rug" projection (detect.rug_projection, launch_bundle signal) and its place in engine.scan.
+No network: detect — synthetic data from test_detect, engine — fake adapters from fakes / test_solana."""
+import unittest
+from unittest import mock
+
+import fakes
+from fakes import ch, engine, market
+from chains import solana as sol
+import detect as d
+from test_detect import Scenario, BUNDLER, CURVE, LAUNCH_BLOCK, LAUNCH_TS, DEPLOYER
+import test_solana as ts
+
+
+def signals(s, window=0):
+    """Scenario signals with the launch block (Scenario.run computes them without it)."""
+    hs = [a for a, _, _ in s.holders]
+    return d.wallet_signals({w: s.data[w] for w in hs}, LAUNCH_TS, DEPLOYER, LAUNCH_BLOCK, window)
+
+
+class TestRugProjection(unittest.TestCase):
+
+    def build(self):
+        s = Scenario()
+        self.linked = [s.wallet(500, kind="transfer", via=BUNDLER, tx="0xbundle", block=101, dt=2, distinct=0)
+                       for _ in range(3)]                                         # linked and also transfer/virgin/snipers
+        self.transfer = s.wallet(400, kind="transfer", via="0xsolo")             # transfer from a single distributor
+        self.virgin = s.wallet(300, distinct=0)
+        self.sniper = s.wallet(250, dt=10)                                        # sniper, did not sell
+        self.sold = s.wallet(240, dt=10)
+        s.data[self.sold]["sold"] = True                                          # sniper, but sold
+        self.launch = s.wallet(230, block=LAUNCH_BLOCK, dt=0)                     # entry in the launch block
+        self.unread = s.wallet(220, distinct=None)                                # history not read
+        self.short = s.wallet(210, distinct=2)                                    # short history does not count
+        s.normal(12)
+        return s.run()
+
+    def test_union_without_double_count(self):
+        s = self.build()
+        self.assertEqual(s.score["band"], "DANGER")
+        sig = signals(s)
+        rug = d.rug_projection(s.holders, sig, s.ops, s.base, s.reserve, s.score["band"])
+        kinds = {p["kind"]: p["wallets"] for p in rug["parts"]}
+        self.assertEqual([p["kind"] for p in rug["parts"]], ["linked", "transfer", "virgin", "bundle"])
+        self.assertEqual(sorted(kinds["linked"]), sorted(self.linked))           # priority: linked first
+        self.assertEqual(kinds["transfer"], [self.transfer])
+        self.assertEqual(kinds["virgin"], [self.virgin])
+        self.assertEqual(sorted(kinds["bundle"]), sorted([self.sniper, self.launch]))
+        flat = [w for p in rug["parts"] for w in p["wallets"]]
+        self.assertEqual(len(flat), len(set(flat)))                               # each wallet once
+        self.assertEqual(sorted(flat), sorted(rug["wallets"]))
+        for w in (self.sold, self.unread, self.short):
+            self.assertNotIn(w, flat)
+        share = {a: sh for a, _, sh in s.holders}
+        self.assertAlmostEqual(rug["share"], sum(share[w] for w in flat))
+        self.assertAlmostEqual(rug["share"], sum(p["share"] for p in rug["parts"]))  # shares add up to the total
+        ratio = s.base["circulating"] / s.supply
+        self.assertAlmostEqual(rug["share_supply"], rug["share"] * ratio)
+        q = sum(v for a, v, _ in s.holders if a in flat)
+        self.assertAlmostEqual(rug["drop"], d.dump_impact(q, s.reserve))
+        self.assertAlmostEqual(rug["level_factor"], 1 - rug["drop"])
+        self.assertGreaterEqual(rug["drop"], d.RUG_MIN_DROP)
+
+    def test_snipers_off_keeps_launch_bundle_only(self):
+        s = self.build()
+        rug = d.rug_projection(s.holders, signals(s), s.ops, s.base, s.reserve, "DANGER", snipers=False)
+        bundle = next(p for p in rug["parts"] if p["kind"] == "bundle")
+        self.assertEqual(bundle["wallets"], [self.launch])
+
+    def test_only_danger(self):
+        s = self.build()
+        sig = signals(s)
+        for band in ("CLEAN", "OK", "RISKY", d.TOO_EARLY, None):
+            self.assertIsNone(d.rug_projection(s.holders, sig, s.ops, s.base, s.reserve, band), band)
+
+    def test_threshold(self):
+        s = self.build()
+        sig = signals(s)
+        rug = d.rug_projection(s.holders, sig, s.ops, s.base, s.reserve, "DANGER")
+        q = sum(v for a, v, _ in s.holders if a in rug["wallets"])
+        # 1 − (R/(R+q))² = 0.40 at R ≈ 3.4365·q
+        above = d.rug_projection(s.holders, sig, s.ops, s.base, 3.4 * q, "DANGER")
+        self.assertGreaterEqual(above["drop"], 0.40)
+        self.assertIsNone(d.rug_projection(s.holders, sig, s.ops, s.base, 3.5 * q, "DANGER"))
+        self.assertEqual(d.RUG_MIN_DROP, 0.40)
+
+    def test_reserve_zero(self):
+        s = self.build()
+        rug = d.rug_projection(s.holders, signals(s), s.ops, s.base, 0, "DANGER")
+        self.assertEqual(rug["drop"], 1.0)                                        # nowhere to sell
+        self.assertEqual(rug["level_factor"], 0.0)
+
+    def test_no_suspicious_supply(self):
+        s = Scenario()
+        s.normal(20)
+        s.run()
+        self.assertIsNone(d.rug_projection(s.holders, signals(s), s.ops, s.base, 1, "DANGER"))
+
+    def test_requires_behavioral_danger(self):
+        # DANGER not from a behavioral hard rule (low score, single whale) — no projection
+        s = self.build()
+        sig = signals(s)
+        self.assertIsNone(d.rug_projection(s.holders, sig, s.ops, s.base, s.reserve, "DANGER", behavioral=False))
+        self.assertIsNotNone(d.rug_projection(s.holders, sig, s.ops, s.base, s.reserve, "DANGER", behavioral=True))
+
+    def whale_in_thin_pool(self, linked):
+        """Like $CrawlScan: the largest is a whale (one wallet or two linked) in a thin pool, plus 3 virgins."""
+        s = Scenario()
+        if linked:
+            whale = [s.wallet(500, via=BUNDLER, tx="0xsame", block=101) for _ in range(2)]
+        else:
+            whale = [s.wallet(1000)]
+        virgins = [s.wallet(300, distinct=0) for _ in range(3)]
+        s.normal(14)
+        return s, whale, virgins
+
+    def test_single_whale_thin_pool_not_danger_no_rug(self):
+        s, whale, virgins = self.whale_in_thin_pool(linked=False)
+        s.run()
+        sc = d.score(s.holders, signals(s), s.ops, s.base, 1500)
+        self.assertEqual(s.ops[0]["wallets"], whale)
+        self.assertGreaterEqual(sc["metrics"]["impact"], d.GATE_IMPACT)
+        self.assertNotEqual(sc["band"], "DANGER")                                 # would have been DANGER under the old rule
+        self.assertTrue(any(g.startswith("soft: one holder could move price") for g in sc["gates"]))
+        behavioral = any(not g.startswith("soft:") for g in sc["gates"])
+        self.assertFalse(behavioral)
+        self.assertIsNone(d.rug_projection(s.holders, signals(s), s.ops, s.base, 1500, sc["band"],
+                                           behavioral=behavioral))
+        reason = engine._reason(sc, s.base)
+        self.assertTrue(reason.startswith("one holder could move price −") and reason.endswith("(thin liquidity)"), reason)
+
+    def test_linked_whale_thin_pool_keeps_danger_and_rug(self):
+        s, whale, virgins = self.whale_in_thin_pool(linked=True)
+        s.run()
+        sc = d.score(s.holders, signals(s), s.ops, s.base, 1500)
+        self.assertEqual(sorted(s.ops[0]["wallets"]), sorted(whale))
+        self.assertEqual(sc["band"], "DANGER")
+        behavioral = any(not g.startswith("soft:") for g in sc["gates"])
+        rug = d.rug_projection(s.holders, signals(s), s.ops, s.base, 1500, sc["band"], behavioral=behavioral)
+        self.assertEqual(rug["parts"][0]["kind"], "linked")
+        self.assertEqual(sorted(rug["parts"][0]["wallets"]), sorted(whale))
+
+    def test_launch_bundle_signal(self):
+        def entry(block):
+            return {"kind": "buy" if block is not None else None, "tx": "t", "block": block, "via": CURVE,
+                    "eth_in": None, "entry_ts": None, "distinct_tokens": 4, "inflows": [], "sold": False}
+        blocks = {"a": 1000, "b": 1002, "c": 1003, "e": 999, "n": None}
+        data = {w: entry(b) for w, b in blocks.items()}
+        sig = d.wallet_signals(data, LAUNCH_TS, DEPLOYER, 1000, 2)
+        self.assertEqual({w for w, s in sig.items() if s["launch_bundle"]}, {"a", "b"})
+        sig = d.wallet_signals(data, LAUNCH_TS, DEPLOYER, 1000, 0)
+        self.assertEqual({w for w, s in sig.items() if s["launch_bundle"]}, {"a"})
+        sig = d.wallet_signals(data, LAUNCH_TS, DEPLOYER)                          # launch block not passed
+        self.assertFalse(any(s["launch_bundle"] for s in sig.values()))
+
+
+ADAPTER_CALLS = ("get_launch", "get_token_transfers", "token_supply", "excluded_addresses", "market_addresses",
+                 "classify_entries", "block_timestamps", "wallet_distinct_tokens", "is_contract", "token_meta")
+
+
+class TestRugInScan(unittest.TestCase):
+
+    def scan(self, history=lambda w, b, t, window=None, cap=4: 0, header=None, rug=True):
+        # in the synthetic token 80% of supply is in the curve: the whole top drops the price by ~35%, threshold lowered
+        # to test the wiring in engine (the threshold itself — TestRugProjection.test_threshold)
+        with fakes.patched(history_fn=history), mock.patch.object(d, "RUG_MIN_DROP", 0.2), \
+                mock.patch.object(market, "fetch_market", return_value=header or {}), \
+                mock.patch.object(engine.d, "rug_projection",
+                                  side_effect=None if rug else (lambda *a, **k: None),
+                                  wraps=d.rug_projection if rug else None):
+            events = []
+            res = engine.scan(fakes.TOKEN, events.append)
+            calls = {n: getattr(ch, n).call_count for n in ADAPTER_CALLS}
+        return res, events, calls
+
+    def test_danger_scan_has_rug(self):
+        res, events, _ = self.scan(header={"price_usd": 2.0})                    # all virgin → DANGER
+        self.assertEqual(res["band"], "DANGER")
+        rug = res["rug"]
+        self.assertIsNotNone(rug)
+        self.assertEqual(rug["parts"][0]["kind"], "linked")
+        self.assertEqual(sorted(rug["parts"][0]["wallets"]), sorted(fakes.WALLETS[:fakes.BUNDLE]))
+        self.assertAlmostEqual(rug["level_usd"], 2.0 * rug["level_factor"])
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["rug"], rug)
+
+    def test_no_price_no_level(self):
+        res, _, _ = self.scan()
+        self.assertIsNotNone(res["rug"])
+        self.assertIsNone(res["rug"]["level_usd"])
+
+    def test_danger_without_behavioral_gate_no_rug(self):
+        # DANGER only from a low score / soft rules (single whale in a thin pool) — engine gives no rug
+        real = d.score
+        def soft_danger(*a, **k):
+            sc = real(*a, **k)
+            return dict(sc, band="DANGER", gates=["soft: one holder could move price −70% (thin liquidity)"])
+        with mock.patch.object(engine.d, "score", side_effect=soft_danger):
+            res, _, _ = self.scan(header={"price_usd": 2.0})
+        self.assertEqual(res["band"], "DANGER")
+        self.assertIsNone(res["rug"])
+        self.assertEqual(res["reason"], "one holder could move price −70% (thin liquidity)")
+
+    def test_not_danger_no_rug(self):
+        res, events, _ = self.scan(history=fakes.history)
+        self.assertNotEqual(res["band"], "DANGER")
+        self.assertIsNone(res["rug"])
+        self.assertIsNone(events[-1]["rug"])
+
+    def test_score_and_requests_unchanged(self):
+        with_rug, _, calls_with = self.scan()
+        without, _, calls_without = self.scan(rug=False)
+        self.assertIsNotNone(with_rug["rug"])
+        self.assertIsNone(without["rug"])
+        for k in ("score", "band", "parts", "gates", "metrics", "headline", "reason"):
+            self.assertEqual(with_rug[k], without[k], k)
+        self.assertEqual(calls_with, calls_without)                              # not a single new request
+
+
+class TestRugSolana(unittest.TestCase):
+
+    def test_launch_bundle_not_30s_snipers(self):
+        w = ts.SOL_WALLETS
+        offsets = {0: 0, 1: 2, 2: 3, 3: 10}                                       # slots since launch (1 slot = 1 s in the fake)
+        entries = {x: ts.buy(ts.LAUNCH_SLOT + offsets.get(i, 300 + 10 * i), 10 ** 8, f"tx{i}") for i, x in enumerate(w)}
+        for i in (5, 6):
+            entries[w[i]] = dict(entries[w[i]], kind="transfer", eth_in=None)
+        bal = {x: ts.SUPPLY // 400 * (30 - i) for i, x in enumerate(w)}
+        history = lambda x, b, t, window=None, cap=4: cap
+        with ts.enabled(), ts.patched_chain(sol, ts.SOL_TOKEN, w, entries, history, bal=bal):
+            res = engine.scan(ts.SOL_TOKEN)
+        sig = {h["wallet"]: h["signals"] for h in res["holders"]}
+        self.assertEqual({x for x, s in sig.items() if s["launch_bundle"]}, {w[0], w[1]})
+        self.assertTrue(sig[w[3]]["sniper"])
+        self.assertEqual(res["band"], "DANGER")
+        parts = {p["kind"]: p["wallets"] for p in res["rug"]["parts"]}
+        self.assertEqual(sorted(parts["transfer"]), sorted([w[5], w[6]]))
+        self.assertEqual(sorted(parts["bundle"]), sorted([w[0], w[1]]))         # +3 slots and sniper at 10 s — no
+        self.assertNotIn("linked", parts)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,494 @@
+"""Bot texts and verdict rendering (HTML parse mode). Pure functions, no network.
+Address detection uses the same logic as the site (engine.chain_of): 0x + 40 hex → Robinhood,
+base58 of 32 bytes (32–44 chars) → Solana."""
+import html, re
+from datetime import datetime, timezone
+
+WEBSITE = "https://crawlscan.fun"
+OFFICIAL_CA = "0x19dCb63C4d2F29A6f077F094a4f858fC790145e1"
+BUY_URL = "https://www.ponsfamily.com/launchpad/" + OFFICIAL_CA
+
+ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+CHAIN_NAME = {"robinhood": "Robinhood Chain", "solana": "Solana"}
+BAND_ICON = {"CLEAN": "🟢", "OK": "🟡", "RISKY": "🟠", "DANGER": "🔴"}
+TOO_EARLY = "TOO_EARLY_OR_LATE"
+TOO_ESTABLISHED = "TOO_ESTABLISHED"
+TOO_ACTIVE = "TOO_ACTIVE"
+ACTIVE_HEADLINE = "This token has too many trades for a full scan right now."
+ESTABLISHED_HEADLINE = "This token is too established for CrawlScan."
+ESTABLISHED_TEXT = ("CrawlScan is built for fresh memecoins. On large, older tokens the top holders are mostly "
+                    "exchanges and big liquidity pools: tokens reach exchange wallets by transfer, not by buying, "
+                    "and liquidity is spread across many pools, so holder patterns don't mean what they mean "
+                    "on a fresh launch.")
+
+
+def _b58_len(s):
+    """Number of bytes in a base58 string; None if not base58."""
+    n = 0
+    for c in s:
+        k = B58.find(c)
+        if k < 0:
+            return None
+        n = n * 58 + k
+    zeros = len(s) - len(s.lstrip("1"))
+    return zeros + (n.bit_length() + 7) // 8
+
+
+def chain_of(s):
+    """String → "robinhood" | "solana" | None."""
+    if ADDR_RE.match(s):
+        return "robinhood"
+    if 32 <= len(s) <= 44 and _b58_len(s) == 32:
+        return "solana"
+    return None
+
+
+def find_address(text):
+    """First token address in the text (whole or inside a link) → (chain, address) or None."""
+    text = (text or "").strip()
+    for piece in [text] + re.split(r"[^0-9A-Za-z]+", text):
+        chain = chain_of(piece)
+        if chain:
+            return chain, piece
+    return None
+
+
+def short(addr):
+    return f"{addr[:6]}…{addr[-4:]}" if len(addr) > 12 else addr
+
+
+def e(s):
+    return html.escape(str(s), quote=False)
+
+
+START = (
+    "<b>CrawlScan</b> shows how many real people are behind a memecoin's top holders.\n\n"
+    "Send me a token address from Robinhood Chain or Solana. Crawlers go through the top 20 holders onchain "
+    "and check who actually bought and who just received tokens, fresh wallets with no history, snipers still "
+    "holding, and wallets linked by the same transaction, distributor or funder.\n\n"
+    "In about 15 seconds you get a score from 0 to 100 and a verdict.\n\n"
+    "<b>CrawlScan has its own token, and it rewards its holders.</b>\n\n"
+    "Every 24 hours one holder wins 10% of the creator fees, paid in ETH. Every token you hold is a ticket, "
+    "so the more you hold, the bigger your chance. Every 12 hours the dev burns tokens. "
+    "All verifiable live on the website.\n\n"
+    f"CA: <code>{OFFICIAL_CA}</code>"
+)
+CAPTION_MAX = 1024     # Telegram photo caption limit (visible text, UTF-16)
+START_BUTTONS = {"inline_keyboard": [
+    [{"text": "Scan a token", "callback_data": "scan"}, {"text": "Help", "callback_data": "help"}],
+    [{"text": "Website", "url": WEBSITE}, {"text": "Buy $CrawlScan", "url": BUY_URL}],
+]}
+
+
+def start_buttons(alerts=False):
+    """/start buttons; with alerts enabled, [🔔 Watchlist] goes in the first row next to Scan a token / Help."""
+    if not alerts:
+        return START_BUTTONS
+    first, *rest = START_BUTTONS["inline_keyboard"]
+    return {"inline_keyboard": [first + [{"text": "🔔 Watchlist", "callback_data": "watchlist"}], *rest]}
+
+HELP = (
+    "<b>How to read a verdict?</b>\n\n"
+    "<b>Score 0–100</b>: 100 = clean.\n\n"
+    "The lower it is, the more the top holders look like a few people.\n\n"
+    "<b>Verdicts</b>: 🟢 CLEAN · 🟡 OK · 🟠 RISKY · 🔴 DANGER.\n\n"
+    "⏳ <b>TOO EARLY OR LATE</b>: too few holders to judge.\n\n"
+    "🏛 <b>TOO ESTABLISHED</b>: a large, older token, not scanned.\n\n"
+    "<b>Operators</b>: real people behind the top holders.\n\n"
+    "Wallets linked by shared buys or transfers count as one operator.\n\n"
+    "<b>Dump impact</b>: how far the price could drop if the biggest operator sold everything.\n\n"
+    "<b>Virgin wallets</b>: top holders with no trading history before this token, a typical sign "
+    "of prepared wallets.\n\n"
+    "<b>Transfer supply</b>: share of the float received by transfer instead of bought.\n\n"
+    "<b>Snipers</b>: wallets that bought right after launch and still hold.\n\n"
+    "<b>Why</b>: rules that forced the verdict down.\n\n"
+    "Send a token address to scan it."
+)
+
+LAUNCHPADS_FLAP = "<b>Launchpads</b>: Pons V2 and Flap on Robinhood Chain, pump.fun on Solana.\n\n"
+LAUNCHPADS = "<b>Launchpads</b>: {pads} on Robinhood Chain, pump.fun on Solana.\n\n"
+
+
+def help_text(flap=False, bankr=False):
+    """/help; if Flap or Bankr is enabled on the site, a launchpads line goes before the last line."""
+    if not flap and not bankr:
+        return HELP
+    tail = "Send a token address to scan it."
+    pads = ["Pons V2"] + (["Flap"] if flap else []) + (["Bankr"] if bankr else [])
+    line = LAUNCHPADS_FLAP if pads == ["Pons V2", "Flap"] else \
+        LAUNCHPADS.format(pads=", ".join(pads[:-1]) + " and " + pads[-1])
+    return HELP[:-len(tail)] + line + tail
+
+
+ASK_ADDRESS = "Send me a token address from Robinhood Chain or Solana"
+HINT = "Send me a token address from Robinhood Chain (0x…) or Solana. /help explains the verdict."
+SCAN_USAGE = "Usage: /scan &lt;token address&gt;"
+BUSY = "🕷 Too many scans right now, try again in a minute."
+TIMEOUT = "⌛ The scan took too long. Try again in a minute."
+SITE_BUSY = "🕷 Scanner is busy, try again in a few seconds."   # site answered 503 busy (server.BUSY)
+UNREACHABLE = "⚠️ CrawlScan is not reachable right now. Try again in a minute."
+FAILED = "⚠️ The scan failed. Try again in a minute."
+
+
+def crawling(addr):
+    return f"🕷 crawling {e(short(addr))}…"
+
+
+def queued(addr):
+    return f"⏳ queued {e(short(addr))}…"
+
+
+def wait(seconds):
+    return f"⏳ please wait {seconds} s"
+
+
+def report_button(addr, trade_url=None, watch=False):
+    """[Full report] and, if there is a link, [Trade on Axiom] in one row; watch adds a second row [Watch]."""
+    row = [{"text": "Full report", "url": f"{WEBSITE}/?ca={addr}"}]
+    if trade_url:
+        row.append({"text": "Trade on Axiom", "url": trade_url})
+    return {"inline_keyboard": [row] + ([watch_button(addr)] if watch else [])}
+
+
+def rejected(addr, error):
+    """Site rejected the address (400): not a token address, Solana coming soon, etc."""
+    if error == "not a token address":
+        return f"🤔 {e(short(addr))} is not a token address."
+    return f"⚠️ {e(error)}"
+
+
+def scan_error(addr, error):
+    """Scan error from /api/result. Internal failures ("scan failed: ...") are not shown as is."""
+    if not error or error.startswith("scan failed"):
+        return FAILED
+    return f"⚠️ {e(short(addr))}: {e(error)}"
+
+
+def _pct(x, digits):
+    return f"{x * 100:.{digits}f}"
+
+
+def impact_phrase(impact):
+    """Same as the site: < 1% → "<1%", otherwise −X%."""
+    return "<1%" if impact < 0.01 else f"−{_pct(impact, 0)}%"
+
+
+def title(res):
+    h = res.get("header") or {}
+    name, ticker = h.get("name"), h.get("ticker")
+    if ticker and name and name != ticker:
+        t = f"<b>${e(ticker)}</b> · {e(name)}"
+    elif ticker or name:
+        t = f"<b>${e(ticker or name)}</b>"
+    else:
+        t = f"<b>{e(short(res.get('token', '')))}</b>"
+    return f"{t} · {CHAIN_NAME.get(res.get('chain'), e(res.get('chain', '')))}"
+
+
+RUG_KIND = {"linked": "linked wallets", "transfer": "received by transfer", "virgin": "fresh wallets",
+            "bundle": "bundle / snipers"}
+
+
+def rug_lines(rug):
+    """The "probably rug" projection (DANGER only): a line with the drop and the two biggest causes by share."""
+    lines = [f"⚠️ <b>Probably rug: −{_pct(rug['drop'], 0)}% if suspicious holders sell</b>"]
+    for p in sorted(rug.get("parts") or [], key=lambda p: -p["share"])[:2]:
+        n = len(p.get("wallets") or [])
+        lines.append(f"• {RUG_KIND.get(p['kind'], e(p['kind']))}: {n} wallet{'' if n == 1 else 's'}, "
+                     f"{_pct(p['share'], 1)}% of float")
+    return lines
+
+
+def _usd(v):
+    """$ abbreviated: $1.2M, $45.3K, $0.000123."""
+    if v >= 1e9:
+        return f"${v / 1e9:.1f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"${v / 1e3:.1f}K"
+    if v >= 1:
+        return f"${v:.2f}"
+    return f"${v:.3g}" if v else "$0"
+
+
+def _tax(x):
+    return f"{x * 100:.2f}".rstrip("0").rstrip(".") + "%"
+
+
+def flap_line(res):
+    """Flap token: "Flap · bonding curve 26% · tax 3%/3%" or "Flap · Uniswap V2"; not Flap → None."""
+    f = res.get("flap") if res.get("launchpad") == "flap" else None
+    if not isinstance(f, dict):
+        return None
+    parts = ["Flap", "Uniswap V2" if f.get("phase") == "dex" else e(f.get("phase_text") or "bonding curve")]
+    tax = f.get("tax") or {}
+    if tax.get("buy") or tax.get("sell"):
+        parts.append(f"tax {_tax(tax.get('buy') or 0)}/{_tax(tax.get('sell') or 0)}")
+    return " · ".join(parts)
+
+
+def bankr_line(res):
+    """Bankr token: "Bankr · ETH pair · dev vesting 15%" (pair is ETH or a stock token ticker; vesting is a share of supply,
+    unlocked part in parentheses, if any); not Bankr → None."""
+    b = res.get("bankr") if res.get("launchpad") == "bankr" else None
+    if not isinstance(b, dict):
+        return None
+    pair = b.get("pair") or {}
+    parts = ["Bankr", f"{e(pair.get('symbol') or ('ETH' if pair.get('kind') == 'eth' else 'token'))} pair"]
+    v = b.get("vesting") or {}
+    if v.get("total_share_supply"):
+        unl = v.get("unlocked_share_supply") or 0
+        parts.append(f"dev vesting {_tax(v['total_share_supply'])}" + (f" ({_tax(unl)} unlocked)" if unl >= 0.0005 else ""))
+    return " · ".join(parts)
+
+
+def verdict(res):
+    """Site scan result → verdict HTML text."""
+    lp = flap_line(res) or bankr_line(res)
+    lines = [title(res)] + ([lp] if lp else []) + [""]
+    holders = len(res.get("holders") or [])
+    ops = res.get("operators") or []
+    if res.get("band") == TOO_ESTABLISHED:     # full scan was not run: no score
+        lines.append(f"🏛 <b>{e(res.get('headline') or ESTABLISHED_HEADLINE)}</b>")
+        lines.append(e(res.get("reason") or ESTABLISHED_TEXT))
+        return "\n".join(lines)
+    if res.get("band") == TOO_ACTIVE:          # Bankr, history larger than the scan: no verdict, exact facts only
+        lines.append(f"🌊 <b>{e(res.get('headline') or ACTIVE_HEADLINE)}</b>")
+        h = res.get("header") or {}
+        mk = [f"{k} {_usd(h[f])}" for k, f in (("price", "price_usd"), ("mcap", "mcap_usd"),
+                                               ("liquidity", "liquidity_usd")) if h.get(f) is not None]
+        if mk:
+            lines.append(" · ".join(mk))
+        lines.append("No verdict or score: the full holder history is too long to read in one scan.")
+        return "\n".join(lines)
+    if res.get("band") == TOO_EARLY:
+        lines.append("⏳ <b>Too early or too late</b>")
+        lines.append(f"Only {res.get('holders_total', 0)} holders, too few to judge.")
+        return "\n".join(lines)
+
+    band = res.get("band", "")
+    lines.append(f"{BAND_ICON.get(band, '⚪️')} <b>Score {res.get('score')}/100 · {e(band)}</b>")
+    if (ps := res.get("partial_scan")) and ps.get("message"):   # Bankr: full holder index is still being built
+        lines.append(f"⏳ {e(ps['message'])}")
+    lines.append(f"{holders} top holders → {len(ops)} operator{'' if len(ops) == 1 else 's'}")
+    m = res.get("metrics") or {}
+    if ops and "impact" in m:
+        n = len(ops[0].get("wallets") or [])
+        who = f"Biggest operator ({n} wallets)" if n > 1 else "Biggest operator"
+        if m["impact"] is None:                   # reserve not measured reliably: drop not computed
+            lines.append(f"{who} holds {_pct(m.get('operator') or 0, 1)}% of float · liquidity not measured")
+        else:
+            lines.append(f"{who} could move price {impact_phrase(m['impact'])} if sold")
+    if res.get("rug"):
+        lines += [""] + rug_lines(res["rug"])
+
+    signals = []
+    if float(_pct(m.get("virgin") or 0, 0)):
+        signals.append(f"{_pct(m['virgin'], 0)}% virgin wallets in top")
+    if float(_pct(m.get("transfer") or 0, 1)):
+        signals.append(f"{_pct(m['transfer'], 1)}% of float received by transfer")
+    if float(_pct(m.get("sniper") or 0, 1)):
+        signals.append(f"snipers still hold {_pct(m['sniper'], 1)}% of float")
+    if signals:
+        lines.append("")
+        lines += [f"• {s}" for s in signals]
+
+    gates = res.get("gates") or []
+    if gates:
+        lines += ["", "<b>Why:</b>"]
+        lines += [f"• {e(g[len('soft:'):].strip() if g.startswith('soft:') else g)}" for g in gates]
+    return "\n".join(lines)
+
+
+# ---------- /rewards ----------
+EXPLORER = "https://robinhoodchain.blockscout.com"
+REWARDS_BUTTON = {"inline_keyboard": [[{"text": "Rewards on website", "url": WEBSITE}]]}
+REWARDS_OFF = "🎁 Holder rewards are not running right now. Check the website for news."
+
+
+def _parse_iso(s):
+    try:
+        return datetime.fromisoformat(s).timestamp() if s else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _utc(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def until(ts, now):
+    """Time until the event: "in 5h 12m", "in 7m", "in <1m"; already passed → "now"."""
+    s = int(ts - now)
+    if s <= 0:
+        return "now"
+    if s < 60:
+        return "in <1m"
+    h, m = s // 3600, s // 60 % 60
+    return f"in {h}h {m}m" if h else f"in {m}m"
+
+
+def tokens(x):
+    """Token amount for display: 1,500,001 · 12.5 · 0.0042."""
+    if x is None:
+        return "—"
+    return f"{x:,.0f}" if x >= 100 else f"{x:,.2f}".rstrip("0").rstrip(".") if x >= 1 else f"{x:.4g}"
+
+
+def eth(x):
+    """ETH amount for display: up to 4 decimals without trailing zeros (0.0523, 2.5); below 0.0001 → "<0.0001"."""
+    if 0 < x < 0.0001:
+        return "<0.0001"
+    return f"{x:.4f}".rstrip("0").rstrip(".")
+
+
+def tx_link(tx, label="tx"):
+    return f'<a href="{EXPLORER}/tx/{e(tx)}">{e(label)}</a>'
+
+
+def _when(label, iso, now):
+    ts = _parse_iso(iso)
+    if ts is None:
+        return None
+    return f"{label}: <b>{datetime.fromtimestamp(ts, timezone.utc).strftime('%H:%M')} UTC</b> · {until(ts, now)}"
+
+
+def rewards(st):
+    """/api/rewards/status → /rewards HTML text. Disabled → REWARDS_OFF."""
+    if not isinstance(st, dict) or not st.get("enabled"):
+        return REWARDS_OFF
+    now = _parse_iso(st.get("now")) or datetime.now(timezone.utc).timestamp()
+    lines = ["🎁 <b>$CrawlScan holder rewards</b>", ""]
+    lines += [x for x in (_when("🎲 Next draw", st.get("next_draw"), now),
+                          _when("🔥 Next burn", st.get("next_burn"), now)) if x]
+
+    d = st.get("last_draw")
+    lines.append("")
+    if not d:
+        lines.append("No draws yet. The first winner is picked at the next draw.")
+    elif not d.get("winner"):
+        lines.append(f"<b>Draw of {e(d.get('day', ''))}</b>: no eligible holders, the prize carries over.")
+    else:
+        chance = d.get("chance")
+        pct = "—" if chance is None else f"{chance * 100:.2f}%" if chance >= 0.0001 else "<0.01%"
+        lines.append(f"<b>Last winner</b> · draw of {e(d.get('day', ''))}")
+        lines.append(f"<code>{e(short(d['winner']))}</code> · chance {pct}")
+        if d.get("payout_tx") and d.get("payout_currency") == "ETH":   # unified format: Paid: <amount> <currency>
+            amt = f"{eth(d['payout_eth'])} ETH · " if d.get("payout_eth") is not None else ""
+            lines.append(f"✅ Paid: {amt}{tx_link(d['payout_tx'])}")
+        elif d.get("payout_tx"):   # token payouts (before the switch to ETH)
+            amt = f"{tokens(d.get('payout_tokens'))} $CrawlScan · " if d.get("payout_tokens") is not None else ""
+            lines.append(f"✅ Paid: {amt}{tx_link(d['payout_tx'])}")
+        else:
+            lines.append("⏳ Payout pending")
+
+    tb, dev = st.get("total_burned"), st.get("burned_by_dev") or {}
+    lines.append("")
+    if tb and tb.get("amount"):
+        pct = f" ({tb['amount'] / tb['minted'] * 100:.2f}% of supply)" if tb.get("minted") else ""
+        lines.append(f"🔥 <b>Burned</b>: {tokens(tb.get('amount_tokens'))} $CrawlScan{pct}")
+    elif dev.get("amount"):
+        lines.append(f"🔥 <b>Burned</b>: {tokens(dev.get('amount_tokens'))} $CrawlScan")
+    else:
+        lines.append("🔥 <b>Burned</b>: nothing yet")
+    lb = st.get("last_burn")
+    if lb:
+        when = f" · {_utc(lb['time'])}" if lb.get("time") else ""
+        lines.append(f"Last burn: {tokens(lb.get('amount_tokens'))} $CrawlScan{when} · {tx_link(lb['tx'])}")
+    return "\n".join(lines)
+
+
+# ---------- alerts: /watch, /watchlist, /unwatch ----------
+ALERTS_SOON = "🔔 Alerts are coming soon."
+WATCH_USAGE = "Usage: /watch &lt;token address&gt;"
+UNWATCH_USAGE = "Usage: /unwatch &lt;token address&gt;"
+WATCH_WHAT = ("I'll message you when something important changes:\n\n"
+              "- the verdict\n- a probably rug warning\n- the biggest operator selling\n- early buyers exiting")
+WATCHLIST_EMPTY = "You're not watching any tokens yet."
+ASK_WATCH = "Send me the token address to watch."
+ASK_WATCH_AGAIN = "That's not a token address. Send me the token address to watch (Robinhood Chain 0x… or Solana)."
+NEW_BUTTON = {"text": "➕ New", "callback_data": "new"}
+
+
+def watch_button(addr):
+    """[Watch] row under the verdict (DMs only, alerts enabled). callback_data ≤ 64 bytes: address ≤ 44 chars."""
+    return [{"text": "🔔 Watch", "callback_data": f"watch:{addr}"}]
+
+
+def expires_in(ts, now):
+    """Time left on a subscription: "6d 23h", "5h", "<1h"."""
+    s = int(ts - now)
+    d, h = s // 86400, s // 3600 % 24
+    if d:
+        return f"{d}d {h}h" if h else f"{d}d"
+    return f"{h}h" if h else "<1h"
+
+
+def _watch_line(w, now):
+    return (f"• <code>{e(w['token'])}</code>\n  {CHAIN_NAME.get(w.get('chain'), e(w.get('chain', '')))} · "
+            f"expires in {expires_in(w['expires_at'], now)}")
+
+
+def watching(r):
+    """/api/alerts/watch response (200) → HTML, full address."""
+    addr = f"<code>{e(r['token'])}</code>"
+    head = (f"🔔 Still watching {addr}, extended to {r['days']} days." if r.get("renewed")
+            else f"🔔 Watching {addr} for {r['days']} days.")
+    return f"{head}\n\n{WATCH_WHAT}\n\nWatching {len(r.get('items') or [])}/{r['limit']} tokens for now."
+
+
+def watch_limit(r, now):
+    """409: already at the token limit."""
+    return "\n".join([f"You're already watching {r['limit']} tokens, the maximum. /unwatch one first:", ""]
+                     + [_watch_line(w, now) for w in r.get("items") or []])
+
+
+def watch_established(addr):
+    return f"🏛 {e(short(addr))} is too established for CrawlScan, so it can't be watched."
+
+
+def watch_active(addr):
+    return f"🌊 {e(short(addr))} has too many trades for a full scan right now, so it can't be watched."
+
+
+def unwatched(r):
+    if r.get("removed"):
+        return f"🔕 Stopped watching {e(short(r['token']))}."
+    return f"You weren't watching {e(short(r['token']))}. /watchlist shows what you watch."
+
+
+def days_left(ts, now):
+    """Days left on a subscription, rounded up: "7 days left", "1 day left"; under an hour → "<1 hour left"."""
+    s = ts - now
+    if s < 3600:
+        return "<1 hour left"
+    d = -(-int(s) // 86400)
+    return f"{d} day{'' if d == 1 else 's'} left"
+
+
+def watchlist_view(r, now, tickers=None, head=None):
+    """Subscription list with buttons: [Remove …] for each (callback rm:<address>) and [➕ New] → (html, buttons).
+    Ticker comes from the /api/alerts/list response (latest token snapshot), otherwise from tickers, {address: ticker} from the bot's scans."""
+    items, tickers = r.get("items") or [], tickers or {}
+    if not items:
+        return ((head + "\n\n" if head else "") + WATCHLIST_EMPTY), {"inline_keyboard": [[NEW_BUTTON]]}
+    lines = [head or f"🔔 <b>Watching {len(items)}/{r['limit']} tokens</b>", ""]
+    rows = []
+    for i, w in enumerate(items, 1):
+        t = w.get("ticker") or tickers.get(w["token"])   # site: ticker from the latest snapshot; otherwise from the bot's scans
+        meta = " · ".join(x for x in (f"${e(t)}" if t else None,
+                                      CHAIN_NAME.get(w.get("chain"), e(w.get("chain", ""))),
+                                      days_left(w["expires_at"], now)) if x)
+        lines += [f"{i}. <code>{e(w['token'])}</code>", f"{meta}", ""]
+        rows.append([{"text": f"🗑 Remove {i}. " + (f"${t}" if t else short(w["token"])),
+                      "callback_data": f"rm:{w['token']}"}])
+    rows.append([NEW_BUTTON])
+    return "\n".join(lines).rstrip(), {"inline_keyboard": rows}
+
+
+def watch_limit_view(r, now, tickers=None):
+    """409 from [➕ New]: limit message plus the list with Remove buttons."""
+    head = f"You're already watching {r['limit']} tokens, the maximum. Remove one to add another:"
+    return watchlist_view(r, now, tickers, head=head)
