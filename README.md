@@ -24,6 +24,38 @@ Telegram bot: [@CrawlScanBot](https://t.me/CrawlScanBot)
 
 </div>
 
+> [!IMPORTANT]
+> ## THIS IS CRAWLSCAN V1, THE FIRST PUBLIC VERSION
+>
+> **This repository is a snapshot of CrawlScan as of October 9, 2026.** The live product at [crawlscan.fun](https://crawlscan.fun) has moved far beyond it.
+>
+> Shortly after this code went public, people started copying it to launch their own projects and monetize them. So from October 10 the development continues in a **private repository**, and new versions will be published here **with a delay**, not on the day they ship.
+>
+> Nothing is hidden. **Every update is announced publicly on X:** [@CrawlScan_](https://x.com/CrawlScan_) and [@0x_Punisher](https://x.com/0x_Punisher). You can also follow the full history on the [timeline at crawlscan.fun](https://crawlscan.fun/#timeline) and check every call on the [Proof of Work page](https://crawlscan.fun/proof).
+>
+> The table below shows what is in this repository and what is already live on the site.
+
+## V1 (this repo) vs what is live now
+
+| Area | V1 in this repo (Oct 9) | Live on crawlscan.fun (private version) |
+| --- | --- | --- |
+| **Chains** | Robinhood Chain, Solana | Robinhood Chain, Solana, BNB Chain, Base |
+| **Launchpads** | Pons, Flap, pump.fun (Bankr in progress) | Pons, Flap, Bankr, Pools, Clanker on Robinhood Chain · pump.fun (including Custom Pairs with tokenized stocks), StonkFun, Bonk.fun on Solana · four.meme, Flap, Clanker on BNB Chain · Clanker on Base |
+| **Operator memory** | Records scans only, not used in verdicts | 200,000+ scans in one shared memory: repeat snipers, rug teams and serial devs are recognized across tokens and chains |
+| **Wallet groups** | Operators and packs inside one token | Plus cabals and smart crews tracked across many tokens |
+| **Launch bundles** | Bundle detection in the current top holders | Plus launch bundles that already split their supply into hundreds of wallets, measured from launch history |
+| **Proof** | Rug Replay | Rug Replay, Gem Replay and a public Proof of Work page with accuracy stats |
+| **Discovery** | none | Launch Radar: a live screen of fresh tokens whose latest scan came out clean, with dumped tokens removed automatically |
+| **Premium for holders** | none | Full wallet check (trades, profit, hold time, sell multiple; Robinhood Chain now, Solana in progress), dev history, cabals and smart crews, priority and unlimited scans |
+| **Holder rewards** | Daily random draw | Gem Hunter: a daily game where 33% of creator fees go to the best token hunters, plus regular burns |
+| **Sharing** | none | Share cards for every scan in random styles, with link previews on X and Telegram |
+| **Telegram bot** | Scans and watchlist alerts | Plus premium inside the bot, wallet cards and share cards |
+| **Languages** | English | 8 languages: English, Chinese, Spanish, French, German, Indonesian, Filipino, Vietnamese |
+| **Accuracy fixes** | none | Smart wallets on Base, Meteora DLMM, vesting streams (Streamflow), live price cross-checks between data sources, correct supply for pump.fun Mayhem tokens, and many more |
+| **Fair use** | Per-address scan limit | Daily free limits, bot protection and priority for real users |
+
+Everything below describes **V1**, the code in this repository.
+
 ## What is CRAWLSCAN?
 
 **CRAWLSCAN is an on-chain token intelligence engine built to detect hidden wallet concentration, coordinated buying and suspicious holder behaviour in seconds.**
