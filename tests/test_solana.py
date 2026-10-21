@@ -219,5 +219,18 @@ class TestSolanaScan(unittest.TestCase):
         self.assertEqual(str(cm.exception), "not a pump.fun token")
 
 
+class TestDexPrograms(unittest.TestCase):
+
+    def test_dex_program_ids_are_addresses(self):
+        for pid, name in sol.DEX.items():
+            self.assertTrue(sol.is_address(pid), f"{name}: {pid} is not a 32-byte address")
+
+    def test_meteora_dlmm_swap_is_trade(self):
+        pid = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+        tx = {"transaction": {"message": {"instructions": [{"programId": pid}]}},
+              "meta": {"innerInstructions": []}}
+        self.assertTrue(sol.is_trade(tx))
+
+
 if __name__ == "__main__":
     unittest.main()
