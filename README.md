@@ -2,7 +2,7 @@
 
 <img src="static/favicon.svg" width="96" alt="CRAWLSCAN">
 
-# CRAWLSCAN
+# CRAWLSCAN (old version)
 
 **Crawlers that catch one wallet wearing many.**
 
